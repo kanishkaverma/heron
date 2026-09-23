@@ -6902,6 +6902,9 @@ impl Shell {
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
         search_query: Option<&str>,
+        // Transcript text that matched when the title and metadata did not.
+        // Only the palette passes this.
+        snippet: Option<SharedString>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -7234,7 +7237,7 @@ impl Shell {
                 show_label,
                 branch.is_some(),
                 change_request.is_some(),
-            )))
+            ) + if snippet.is_some() { 16.0 } else { 0.0 }))
             .flex()
             .flex_col()
             .gap(px(2.0))
@@ -7509,6 +7512,17 @@ impl Shell {
                             })
                         }),
                 )
+            })
+            .when_some(snippet, |row, snippet| {
+                row.child(sidebar_faded_label(
+                    format!("chat-snippet-{content_id}").into(),
+                    true,
+                    div()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .line_height(px(14.0))
+                        .text_color(subline)
+                        .child(popover::search_highlight(snippet, search_query, theme)),
+                ))
             })
             .into_any_element()
     }

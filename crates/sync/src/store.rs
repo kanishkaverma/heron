@@ -96,6 +96,14 @@ const VACUUM_MIN_FREE_DENOMINATOR: i64 = 4;
 /// connection holds a lock.
 const MAINTENANCE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Idempotent and outside `MIGRATIONS`, so it claims no migration version: a
+/// build without it (an older release, or one whose next migration reuses the
+/// slot) neither needs it nor skips a migration because of it. Covering,
+/// because `saved_at` sits after the blob and reading it from the table walks
+/// every snapshot's overflow pages.
+const SNAPSHOT_FRESHNESS_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS snapshots_saved_at ON snapshots(doc_id, saved_at);";
+
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
 ///
 /// Holds warm-open doc snapshots (the DO room is authoritative; these make
@@ -656,6 +664,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
         tx.commit()?;
     }
+    conn.execute_batch(SNAPSHOT_FRESHNESS_INDEX)?;
     Ok(())
 }
 

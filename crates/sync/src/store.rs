@@ -455,6 +455,17 @@ impl DocsStore {
         Ok(())
     }
 
+    /// `saved_at` for every snapshot row, read from the covering index.
+    pub fn snapshot_saved_at(&self) -> Result<std::collections::HashMap<String, i64>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare("SELECT doc_id, saved_at FROM snapshots INDEXED BY snapshots_saved_at")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
     /// Whether a snapshot row exists for `doc_id` — presence only, no blob read.
     pub fn has_snapshot(&self, doc_id: &str) -> Result<bool, StoreError> {
         store_blocking(|| self.has_snapshot_blocking(doc_id))

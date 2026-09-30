@@ -1,11 +1,14 @@
 name: fork release
 
-# Rebuilds the latest zeronsh/zeron release with each PATCHES branch applied
-# and publishes it here as the latest release. Those builds point the in-app
-# updater at this repo, so installed copies keep getting upstream releases
-# without losing the patches. A patch whose marker upstream already contains is
-# skipped; once upstream ships every patch, the build is stock and points back
-# at the official feed.
+# Rebuilds the latest zeronsh/zeron release with the fork's patch stack (the
+# commits on this repo's main that upstream main lacks) and publishes it here
+# as the latest release. Those builds point the in-app updater at this repo, so
+# installed copies keep getting upstream releases without losing the patches.
+# A patch the release already contains drops out; once upstream ships every
+# patch, the build is stock and points back at the official feed.
+#
+# sync/zeron-fork-sync.sh keeps main rebased on upstream main and dispatches
+# this workflow after each push; the daily schedule catches the rest.
 
 on:
   schedule:
@@ -13,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: Rebuild even if this upstream version is already published
+        description: Rebuild even if this upstream version and patch stack are already published
         type: boolean
         default: false
 
@@ -25,27 +28,33 @@ concurrency:
 
 env:
   UPSTREAM: zeronsh/zeron
-  # branch|marker path|marker regex (upstream has the patch)|string the built binary must contain
-  PATCHES: |
-    transcript-search|crates/engine/src/transcript_search.rs|.|SearchTranscriptsRequest
-    perf/cached-command-discovery|crates/engine/src/registry.rs|struct DiscoveryCache|keeping the previous catalog
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
+      stack: ${{ steps.plan.outputs.stack }}
       build: ${{ steps.plan.outputs.build }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
         run: |
           tag=$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)
+          git fetch -q --no-tags "https://github.com/$UPSTREAM.git" "+refs/heads/main:refs/remotes/upstream/main"
+          # Content fingerprint of the patch stack: unchanged by the hourly rebases, changed by a new or edited patch.
+          base=$(git merge-base origin/main upstream/main)
+          stack=$(git log -p --reverse "$base..origin/main" | git patch-id --stable | cut -d' ' -f1 | sha256sum | cut -c1-12)
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
-          if [ "$FORCE" != true ] && gh release view "fork-${tag#v}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "fork-${tag#v} already published"
+          echo "stack=$stack" >>"$GITHUB_OUTPUT"
+          published=$(gh release view "fork-${tag#v}" -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
+          if [ "$FORCE" != true ] && grep -qF "patch stack \`$stack\`" <<<"$published"; then
+            echo "fork-${tag#v} with patch stack $stack already published"
             echo "build=false" >>"$GITHUB_OUTPUT"
           else
             echo "build=true" >>"$GITHUB_OUTPUT"
@@ -57,35 +66,27 @@ jobs:
     runs-on: macos-latest
     env:
       TAG: ${{ needs.plan.outputs.tag }}
+      STACK: ${{ needs.plan.outputs.stack }}
       FEED: https://github.com/${{ github.repository }}/releases/latest/download
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: apply the patches to the upstream release
+      - name: apply the patch stack to the upstream release
         id: src
         run: |
           git config user.name "fork-release"
           git config user.email "fork-release@users.noreply.github.com"
           git fetch --no-tags "https://github.com/$UPSTREAM.git" \
             "+refs/tags/$TAG:refs/tags/$TAG" "+refs/heads/main:refs/remotes/upstream/main"
-          git checkout -q --detach "$TAG"
-          applied="$RUNNER_TEMP/applied"
-          : >"$applied"
-          while IFS='|' read -r branch path marker proof; do
-            [ -n "$branch" ] || continue
-            tip=$(git rev-parse "origin/$branch")
-            if git grep -qE "$marker" "$TAG" -- "$path"; then
-              echo "upstream $TAG already contains $branch; skipping it"
-            else
-              git cherry-pick "upstream/main..$tip"
-              printf '%s|%s|%s\n' "$branch" "$tip" "$proof" >>"$applied"
-            fi
-          done <<<"$PATCHES"
-          if [ -s "$applied" ]; then patched=true; else patched=false; fi
+          git checkout -q -B build origin/main
+          echo "FORK_MAIN=$(git rev-parse --short origin/main)" >>"$GITHUB_ENV"
+          # Patches the release already contains come out empty and are dropped.
+          git rebase --onto "$TAG" "$(git merge-base HEAD upstream/main)"
+          git log --reverse --format='- %s' "$TAG..HEAD" >"$RUNNER_TEMP/patches"
+          if [ -s "$RUNNER_TEMP/patches" ]; then patched=true; else patched=false; fi
           echo "patched=$patched" >>"$GITHUB_OUTPUT"
-          echo "APPLIED=$applied" >>"$GITHUB_ENV"
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           [ "v$version" = "$TAG" ] || { echo "Cargo.toml $version does not match $TAG"; exit 1; }
           echo "VERSION=$version" >>"$GITHUB_ENV"
@@ -110,11 +111,6 @@ jobs:
           [ "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$VERSION" ]
           if [ "$PATCHED" = true ]; then
             [ "$(plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$app/Contents/Info.plist")" = "$FEED" ]
-            bin="$RUNNER_TEMP/zeron-strings"
-            strings "$app/Contents/MacOS/zeron" >"$bin"
-            while IFS='|' read -r branch _ proof; do
-              grep -qF "$proof" "$bin" || { echo "$branch is missing from the binary"; exit 1; }
-            done <"$APPLIED"
           else
             ! plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$app/Contents/Info.plist" 2>/dev/null
           fi
@@ -134,14 +130,13 @@ jobs:
           git tag -f "$release"
           git push -f origin "refs/tags/$release"
           if [ "$PATCHED" = true ]; then
-            patches=$(while IFS='|' read -r branch tip _; do printf -- '- `%s` at %s\n' "$branch" "${tip:0:8}"; done <"$APPLIED")
-            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) plus:
+            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) plus the patches on fork main ($FORK_MAIN), patch stack \`$STACK\`:
 
-          $patches
+          $(cat "$RUNNER_TEMP/patches")
 
           The in-app updater follows this repo's releases."
           else
-            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) unmodified; it already includes every patch. Installing it returns the updater to the official feed."
+            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) unmodified; it already includes every patch (patch stack \`$STACK\`). Installing it returns the updater to the official feed."
           fi
           notes="$what
 

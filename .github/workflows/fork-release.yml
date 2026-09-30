@@ -1,10 +1,11 @@
 name: fork release
 
-# Rebuilds the latest zeronsh/zeron release with the PATCH_BRANCH commits
-# applied and publishes it here as the latest release. Those builds point the
-# in-app updater at this repo, so installed copies keep getting upstream
-# releases without losing the patch. Once upstream ships the patch itself, the
-# build is stock and points back at the official feed.
+# Rebuilds the latest zeronsh/zeron release with each PATCHES branch applied
+# and publishes it here as the latest release. Those builds point the in-app
+# updater at this repo, so installed copies keep getting upstream releases
+# without losing the patches. A patch whose marker upstream already contains is
+# skipped; once upstream ships every patch, the build is stock and points back
+# at the official feed.
 
 on:
   schedule:
@@ -24,8 +25,10 @@ concurrency:
 
 env:
   UPSTREAM: zeronsh/zeron
-  PATCH_BRANCH: transcript-search
-  PATCH_MARKER: crates/engine/src/transcript_search.rs
+  # branch|marker path|marker regex (upstream has the patch)|string the built binary must contain
+  PATCHES: |
+    transcript-search|crates/engine/src/transcript_search.rs|.|SearchTranscriptsRequest
+    perf/cached-command-discovery|crates/engine/src/registry.rs|struct DiscoveryCache|keeping the previous catalog
 
 jobs:
   plan:
@@ -41,8 +44,8 @@ jobs:
         run: |
           tag=$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
-          if [ "$FORCE" != true ] && gh release view "ts-${tag#v}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "ts-${tag#v} already published"
+          if [ "$FORCE" != true ] && gh release view "fork-${tag#v}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "fork-${tag#v} already published"
             echo "build=false" >>"$GITHUB_OUTPUT"
           else
             echo "build=true" >>"$GITHUB_OUTPUT"
@@ -58,26 +61,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.PATCH_BRANCH }}
           fetch-depth: 0
 
-      - name: apply the patch to the upstream release
+      - name: apply the patches to the upstream release
         id: src
         run: |
           git config user.name "fork-release"
           git config user.email "fork-release@users.noreply.github.com"
-          patch=$(git rev-parse HEAD)
           git fetch --no-tags "https://github.com/$UPSTREAM.git" \
             "+refs/tags/$TAG:refs/tags/$TAG" "+refs/heads/main:refs/remotes/upstream/main"
           git checkout -q --detach "$TAG"
-          if git cat-file -e "$TAG:$PATCH_MARKER" 2>/dev/null; then
-            echo "upstream $TAG already contains the patch; building it stock"
-            echo "patched=false" >>"$GITHUB_OUTPUT"
-          else
-            git cherry-pick "upstream/main..$patch"
-            echo "patched=true" >>"$GITHUB_OUTPUT"
-          fi
-          echo "patch=$patch" >>"$GITHUB_OUTPUT"
+          applied="$RUNNER_TEMP/applied"
+          : >"$applied"
+          while IFS='|' read -r branch path marker proof; do
+            [ -n "$branch" ] || continue
+            tip=$(git rev-parse "origin/$branch")
+            if git grep -qE "$marker" "$TAG" -- "$path"; then
+              echo "upstream $TAG already contains $branch; skipping it"
+            else
+              git cherry-pick "upstream/main..$tip"
+              printf '%s|%s|%s\n' "$branch" "$tip" "$proof" >>"$applied"
+            fi
+          done <<<"$PATCHES"
+          if [ -s "$applied" ]; then patched=true; else patched=false; fi
+          echo "patched=$patched" >>"$GITHUB_OUTPUT"
+          echo "APPLIED=$applied" >>"$GITHUB_ENV"
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           [ "v$version" = "$TAG" ] || { echo "Cargo.toml $version does not match $TAG"; exit 1; }
           echo "VERSION=$version" >>"$GITHUB_ENV"
@@ -102,7 +110,11 @@ jobs:
           [ "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$VERSION" ]
           if [ "$PATCHED" = true ]; then
             [ "$(plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$app/Contents/Info.plist")" = "$FEED" ]
-            strings "$app/Contents/MacOS/zeron" | grep -q SearchTranscriptsRequest
+            bin="$RUNNER_TEMP/zeron-strings"
+            strings "$app/Contents/MacOS/zeron" >"$bin"
+            while IFS='|' read -r branch _ proof; do
+              grep -qF "$proof" "$bin" || { echo "$branch is missing from the binary"; exit 1; }
+            done <"$APPLIED"
           else
             ! plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$app/Contents/Info.plist" 2>/dev/null
           fi
@@ -111,21 +123,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PATCHED: ${{ steps.src.outputs.patched }}
-          PATCH: ${{ steps.src.outputs.patch }}
         run: |
           cd target/package
           app="zeron-$VERSION-macos-arm64-app.tar.gz"
           dmg="zeron-$VERSION-macos-arm64.dmg"
           jq -n --arg v "$VERSION" --arg n "$app" --arg s "$(shasum -a 256 "$app" | cut -d' ' -f1)" \
             '{version: $v, files: {($n): {sha256: $s}}}' >manifest.json
-          release="ts-$VERSION"
+          release="fork-$VERSION"
           gh release delete "$release" -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
           git tag -f "$release"
           git push -f origin "refs/tags/$release"
           if [ "$PATCHED" = true ]; then
-            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) plus \`$PATCH_BRANCH\` at ${PATCH:0:8}. The in-app updater follows this repo's releases."
+            patches=$(while IFS='|' read -r branch tip _; do printf -- '- `%s` at %s\n' "$branch" "${tip:0:8}"; done <"$APPLIED")
+            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) plus:
+
+          $patches
+
+          The in-app updater follows this repo's releases."
           else
-            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) unmodified; it already includes the patch. Installing it returns the updater to the official feed."
+            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) unmodified; it already includes every patch. Installing it returns the updater to the official feed."
           fi
           notes="$what
 
@@ -133,4 +149,4 @@ jobs:
 
               xattr -dr com.apple.quarantine /Applications/Zeron.app"
           gh release create "$release" "$dmg" "$app" manifest.json -R "$GITHUB_REPOSITORY" \
-            --verify-tag --latest --title "Zeron $VERSION ($PATCH_BRANCH)" --notes "$notes"
+            --verify-tag --latest --title "Zeron $VERSION (fork)" --notes "$notes"

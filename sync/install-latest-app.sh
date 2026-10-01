@@ -18,7 +18,8 @@ log() { echo "\$(date '+%F %T') \$*"; }
 note() { osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Zeron update"' -e 'end run' "\$1"; }
 pids() { ps -axo pid=,command= | awk -v b="\$BIN" '{pid=\$1; sub(/^ *[0-9]+ /,""); if (\$0==b) print pid}'; }
 running() { [ -n "\$(pids)" ]; }
-finish() { launchctl bootout "gui/\$(id -u)/com.zeron-fork-update" 2>/dev/null; rm -f "\$HOME/Library/LaunchAgents/com.zeron-fork-update.plist"; exit "\$1"; }
+# Delete the plist first: bootout kills this script, so nothing after it runs.
+finish() { rm -f "\$HOME/Library/LaunchAgents/com.zeron-fork-update.plist"; launchctl bootout "gui/\$(id -u)/com.zeron-fork-update" 2>/dev/null; exit "\$1"; }
 log start; sleep 60
 old=\$(plutil -extract CFBundleShortVersionString raw "\$APP/Contents/Info.plist")
 rm -rf "\$HOME/.zeron/updates"/*

@@ -56,3 +56,12 @@ which returns the updater to the official feed.
 A new patch on the same upstream version republishes the same version number, which the
 updater doesn't treat as an update. Install that build by hand, or wait for the next
 upstream release.
+
+## Installing the latest fork build on a Mac
+
+    curl -fsSL https://raw.githubusercontent.com/kanishkaverma/zeron/fork-release/sync/install-latest-app.sh | bash
+
+It downloads the latest `fork-*` release with `gh`, checks it against the manifest, and
+schedules a one-shot LaunchAgent. About a minute later that agent quits Zeron, swaps the
+app, relaunches it, and rolls back if the new build doesn't stay up. Log:
+`~/.local/share/zeron-fork-update/update-app.log`.

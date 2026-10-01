@@ -15,6 +15,9 @@ FORK_URL=${FORK_URL:-https://github.com/kanishkaverma/zeron.git}
 GH_REPO=${GH_REPO-kanishkaverma/zeron}
 CHECK_CMD=${CHECK_CMD:-cargo check -q --locked -p zeron}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$SYNC_DIR/target}
+# Fetch git dependencies with the git CLI and its credential helpers. Cargo's built-in
+# git follows url.insteadOf rewrites to SSH, and launchd has no SSH agent key.
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 repo=$SYNC_DIR/repo
 failure_file=$SYNC_DIR/last-failure

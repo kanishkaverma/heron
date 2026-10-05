@@ -110,6 +110,74 @@ impl AgentAccounts {
         })
     }
 
+    /// OptChat: its own sign-in (`zeron_optchat::auth`) binds the loopback,
+    /// redeems the code and writes the live entry into OptChat's store
+    /// itself, so this flow only relays the url, a pasted code and the
+    /// outcome. The next list snapshots the new entry into a slot.
+    pub(super) async fn start_optchat_login(
+        &self,
+        provider: zeron_optchat::Provider,
+    ) -> Result<AgentLoginStart, EngineError> {
+        // Both of its callbacks are fixed ports; ChatGPT's 1455 is shared with
+        // codex / OpenCode / Pi sign-ins.
+        self.reap_spawned_flows(HarnessId::OptChat);
+        if provider == zeron_optchat::Provider::OpenAI {
+            self.reap_port_flows(OPENAI_LOOPBACK_PORT);
+        }
+        let zeron_optchat::auth::LoginStart {
+            url,
+            mode,
+            callback_port,
+            code,
+            done,
+        } = zeron_optchat::auth::start_login(provider, self.inner.config.optchat_auth_file())
+            .await
+            .map_err(EngineError::Other)?;
+        let login_id = new_id();
+        let task_state = Arc::new(Mutex::new(TaskLoginState {
+            url: Some(url.clone()),
+            paste: Some(code),
+            ..Default::default()
+        }));
+        let outcome_state = task_state.clone();
+        let handle = tokio::spawn(async move {
+            // Dropping a JoinHandle only detaches: cancelling this flow must
+            // stop the sign-in too, or it keeps holding its port.
+            struct AbortOnDrop(tokio::task::AbortHandle);
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let _abort = AbortOnDrop(done.abort_handle());
+            let outcome = match done.await {
+                Ok(result) => result.map(|_account_label| ()),
+                Err(err) => Err(format!("The sign-in stopped: {err}")),
+            };
+            lock(&outcome_state).outcome = Some(outcome);
+        });
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Task {
+                harness: HarnessId::OptChat,
+                started_at: Instant::now(),
+                state: task_state,
+                handle,
+                home: None,
+                port: callback_port,
+            },
+        );
+        Ok(AgentLoginStart {
+            login_id,
+            url,
+            mode: match mode {
+                zeron_optchat::auth::LoginMode::Browser => AgentLoginMode::Browser,
+                zeron_optchat::auth::LoginMode::PasteCode => AgentLoginMode::PasteCode,
+            },
+            callback_port,
+        })
+    }
+
     async fn finish_openai_login(
         &self,
         listener: tokio::net::TcpListener,

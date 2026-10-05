@@ -193,6 +193,14 @@ pub struct AgentAccountsConfig {
     pub pi_agent_dir: PathBuf,
     /// Hermes' `HERMES_HOME` (default `~/.hermes`) — holds `auth.json`.
     pub hermes_home: PathBuf,
+    /// OptChat's home (`{data_dir}/optchat`, the same dir the engine binds
+    /// the harness to) — holds OptChat's own `auth.json`.
+    pub optchat_home: PathBuf,
+}
+
+/// Where OptChat keeps its memory and logins under an engine data dir.
+pub(crate) fn optchat_home(data_dir: &Path) -> PathBuf {
+    data_dir.join("optchat")
 }
 
 impl AgentAccountsConfig {
@@ -226,6 +234,7 @@ impl AgentAccountsConfig {
             opencode_auth_file: stores::default_opencode_auth_file(),
             pi_agent_dir: stores::default_pi_agent_dir(),
             hermes_home: stores::default_hermes_home(),
+            optchat_home: optchat_home(data_dir),
         }
     }
 
@@ -247,7 +256,12 @@ impl AgentAccountsConfig {
             opencode_auth_file: root.join("opencode").join("auth.json"),
             pi_agent_dir: root.join("pi"),
             hermes_home: root.join("hermes"),
+            optchat_home: root.join("optchat"),
         }
+    }
+
+    pub(crate) fn optchat_auth_file(&self) -> PathBuf {
+        self.optchat_home.join("auth.json")
     }
 
     fn claude_creds_file(&self) -> PathBuf {
@@ -457,6 +471,8 @@ struct TaskLoginState {
     outcome: Option<Result<(), String>>,
     /// The device a remote login's callback is forwarded for.
     requester: Option<String>,
+    /// Hands a pasted code to a sign-in that accepts one ([`Self::complete_login`]).
+    paste: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 impl LoginFlow {
@@ -922,7 +938,7 @@ impl AgentAccounts {
         let mut detected_more: Vec<(HarnessId, Detected)> = Vec::new();
         detected_more.extend(self.detect_grok().map(|d| (HarnessId::Grok, d)));
         detected_more.extend(self.detect_devin().map(|d| (HarnessId::Devin, d)));
-        for harness in [HarnessId::Opencode, HarnessId::Pi] {
+        for harness in [HarnessId::Opencode, HarnessId::Pi, HarnessId::OptChat] {
             let (resolved, unresolved) = self.detect_keyed(harness).await;
             detected_more.extend(resolved.into_iter().map(|d| (harness, d)));
             for detected in unresolved {
@@ -953,6 +969,7 @@ impl AgentAccounts {
             HarnessId::Devin,
             HarnessId::Opencode,
             HarnessId::Pi,
+            HarnessId::OptChat,
         ]
         .into_iter()
         .map(|harness| (harness, self.read_slots(harness)))
@@ -1103,7 +1120,7 @@ impl AgentAccounts {
                 self.write_grok_entry(slot.store_key.as_deref(), &slot.credentials)?
             }
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::OptChat => {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
                 })?;
@@ -1200,7 +1217,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.detect_cursor().map(|d| d.account_key),
             HarnessId::Grok => self.detect_grok().map(|d| d.account_key),
             HarnessId::Devin => self.detect_devin().map(|d| d.account_key),
-            HarnessId::Opencode | HarnessId::Pi => self
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::OptChat => self
                 .detect_keyed_entry(harness, store_key?)
                 .await
                 .flatten()
@@ -1214,7 +1231,7 @@ impl AgentAccounts {
     /// never replaced unasked.
     fn has_live_entry(&self, harness: HarnessId, store_key: Option<&str>) -> bool {
         match harness {
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::OptChat => {
                 store_key.is_none_or(|key| self.live_keyed_entry(harness, key).is_some())
             }
             _ => false,
@@ -1242,7 +1259,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
             HarnessId::Grok => self.write_grok_entry(store_key, &slot.credentials)?,
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::OptChat => {
                 if let Some(key) = store_key {
                     self.write_keyed_entry(slot.harness, key, Some(&slot.credentials))?;
                 }
@@ -1312,7 +1329,7 @@ impl AgentAccounts {
                 self.remove_grok_entry(&map_key)?;
             }
             HarnessId::Devin => remove_if_exists(&self.inner.config.devin_credentials_file)?,
-            HarnessId::Opencode | HarnessId::Pi => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::OptChat => {
                 let key = store_key
                     .ok_or_else(|| EngineError::Other("That login names no provider.".into()))?;
                 self.write_keyed_entry(harness, key, None)?;
@@ -1440,6 +1457,17 @@ impl AgentAccounts {
             HarnessId::Pi => match provider.unwrap_or("openai-codex") {
                 "openai-codex" => {
                     self.start_openai_login(HarnessId::Pi, "openai-codex")
+                        .await?
+                }
+                other => return Err(stores::unsupported_login(harness, other)),
+            },
+            HarnessId::OptChat => match provider.unwrap_or("anthropic") {
+                "anthropic" => {
+                    self.start_optchat_login(zeron_optchat::Provider::Anthropic)
+                        .await?
+                }
+                "openai-codex" => {
+                    self.start_optchat_login(zeron_optchat::Provider::OpenAI)
                         .await?
                 }
                 other => return Err(stores::unsupported_login(harness, other)),
@@ -1868,6 +1896,13 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        let task = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::Task { state, .. }) => Some(state.clone()),
+            _ => None,
+        };
+        if let Some(state) = task {
+            return self.complete_task_login(login_id, state, code).await;
+        }
         let (verifier, expected_state) = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude {
                 verifier, state, ..
@@ -1902,6 +1937,47 @@ impl AgentAccounts {
         )
         .await?;
         self.remove_flow(login_id);
+        self.list(false).await
+    }
+
+    /// Hand a pasted code to an engine-driven sign-in that takes one
+    /// (OptChat's), then wait for that sign-in to land or fail.
+    async fn complete_task_login(
+        &self,
+        login_id: &str,
+        state: Arc<Mutex<TaskLoginState>>,
+        code: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(EngineError::Other(
+                "That code looks empty — paste the whole code.".into(),
+            ));
+        }
+        let Some(paste) = lock(&state).paste.take() else {
+            return Err(EngineError::Other(
+                "This sign-in finishes in the browser — there is no code to paste.".into(),
+            ));
+        };
+        // A send error means the sign-in already ended; its outcome says how.
+        let _ = paste.send(code.to_string());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let outcome = loop {
+            if let Some(outcome) = lock(&state).outcome.clone() {
+                break outcome;
+            }
+            if Instant::now() > deadline {
+                self.cancel_login(login_id);
+                return Err(EngineError::Other(
+                    "The sign-in didn't finish — start again.".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        self.remove_flow(login_id);
+        outcome.map_err(|message| {
+            EngineError::Other(zeron_harness::redact::redact_output(&message))
+        })?;
         self.list(false).await
     }
 
@@ -2658,7 +2734,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.cursor_usage(slot).await,
             HarnessId::Grok => self.grok_usage(slot, is_active).await,
             HarnessId::Devin => self.devin_usage(slot).await,
-            HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes => {
+            HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes | HarnessId::OptChat => {
                 self.keyed_usage(harness, slot).await
             }
             _ => Err(ProbeError::NoCredentials {
@@ -3086,7 +3162,7 @@ async fn antigravity_keychain_item(_account: &str) -> bool {
 fn provider_group(harness: HarnessId, store_key: Option<&str>) -> Option<String> {
     matches!(
         harness,
-        HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes
+        HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes | HarnessId::OptChat
     )
     .then(|| store_key.map(str::to_string))
     .flatten()
@@ -3103,6 +3179,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "antigravity",
+        HarnessId::OptChat => "optchat",
         HarnessId::Mock => "mock",
     }
 }
@@ -3534,7 +3611,7 @@ fn usage_error_message(
         ProbeError::Unauthorized { .. }
             if matches!(
                 harness,
-                HarnessId::Codex | HarnessId::Opencode | HarnessId::Pi
+                HarnessId::Codex | HarnessId::Opencode | HarnessId::Pi | HarnessId::OptChat
             ) =>
         {
             "Session expired — switch to it to refresh".to_string()

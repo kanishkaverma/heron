@@ -12888,6 +12888,7 @@ dependencies = [
  "zeron-doc",
  "zeron-harness",
  "zeron-mcp",
+ "zeron-optchat",
  "zeron-preview",
  "zeron-proto",
  "zeron-rpc",

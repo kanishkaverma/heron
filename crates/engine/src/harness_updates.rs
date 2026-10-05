@@ -272,7 +272,7 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: None,
             manual_command: "Update the configured Antigravity ACP server",
         },
-        HarnessId::Mock => ProviderSpec {
+        HarnessId::OptChat | HarnessId::Mock => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Manual,
             update_args: None,
@@ -413,7 +413,8 @@ impl HarnessUpdateCoordinator {
         let order: Vec<_> = registry
             .descriptors()
             .into_iter()
-            .filter(|descriptor| descriptor.id != HarnessId::Mock)
+            // In-process harnesses ship with Zeron; there is no CLI to version.
+            .filter(|descriptor| !matches!(descriptor.id, HarnessId::Mock | HarnessId::OptChat))
             .map(|descriptor| descriptor.id)
             .collect();
         let enabled = registry.enabled_set();

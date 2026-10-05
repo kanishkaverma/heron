@@ -112,6 +112,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "Antigravity",
+        HarnessId::OptChat => "OptChat",
         HarnessId::Mock => "mock",
     }
 }
@@ -869,6 +870,12 @@ impl HarnessesPage {
                         div()
                             .text_color(theme.text_muted.opacity(0.65))
                             .child("Pi RPC · Native connection")
+                            .into_any_element(),
+                    ),
+                    HarnessId::OptChat => meta.push(
+                        div()
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .child("Built into Zeron")
                             .into_any_element(),
                     ),
                     _ => {}

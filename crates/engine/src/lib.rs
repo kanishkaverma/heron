@@ -218,6 +218,13 @@ impl EngineCore {
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
+        let optchat_home = agent_accounts::optchat_home(data_dir);
+        zeron_optchat::bind(zeron_optchat::Binding {
+            credentials: std::sync::Arc::new(zeron_optchat::FileCredentials::new(
+                optchat_home.join("auth.json"),
+            )),
+            home: optchat_home,
+        });
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Providers) rides the

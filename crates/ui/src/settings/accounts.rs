@@ -164,7 +164,7 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 /// command — named in the empty-state copy, zeron settings.agents.tsx
 /// `PROVIDERS`). Every agent with a login of its own is here; what each one
 /// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -174,6 +174,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
     (HarnessId::Opencode, "OpenCode", "opencode auth login"),
     (HarnessId::Pi, "Pi", "pi"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
+    (HarnessId::OptChat, "OptChat", "OptChat"),
 ];
 
 /// Whether `harness` has an Accounts section (and sign-in flow). Pure.
@@ -223,7 +224,7 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
 }
 
 /// One way to add an account: agents that keep a login PER model provider
-/// (OpenCode, Pi, Hermes) sign in to a named provider; the rest have one.
+/// (OpenCode, Pi, Hermes, OptChat) sign in to a named provider; the rest have one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoginOption {
     /// The engine's `provider` param (`None` = the agent's only login).
@@ -244,6 +245,10 @@ pub fn login_options(harness: HarnessId) -> Vec<LoginOption> {
             option("github-copilot", "GitHub Copilot"),
         ],
         HarnessId::Pi => vec![option("openai-codex", "ChatGPT")],
+        HarnessId::OptChat => vec![
+            option("anthropic", "Claude"),
+            option("openai-codex", "ChatGPT"),
+        ],
         HarnessId::Hermes => vec![
             option("openai-codex", "ChatGPT"),
             option("nous", "Nous Portal"),
@@ -313,6 +318,14 @@ fn login_copy(harness: HarnessId, provider: Option<&str>) -> &'static str {
         (HarnessId::Hermes, _) => {
             "Finish signing in in your browser — enter the code shown below. Hermes adds the \
              login to its own credential pool and rotates through it itself."
+        }
+        (HarnessId::OptChat, Some("openai-codex")) => {
+            "Finish signing in to ChatGPT in your browser. OptChat gets its own login, separate \
+             from Codex's, and uses it right away."
+        }
+        (HarnessId::OptChat, _) => {
+            "Finish signing in to Claude in your browser. OptChat gets its own login, separate \
+             from Claude Code's, and uses it right away."
         }
         _ => "Finish signing in in your browser.",
     }
@@ -1486,6 +1499,10 @@ impl AccountsPage {
                 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
         };
         let copy = match login.step {
+            LoginStep::PasteCode { .. } if login.harness == HarnessId::OptChat => {
+                "Your browser opened Claude's sign-in page. Approve access, then paste the \
+                 code Anthropic shows you below. OptChat uses the new login right away."
+            }
             LoginStep::PasteCode { .. } => {
                 "Your browser opened Claude's sign-in page. Approve access, then paste the \
                  code Anthropic shows you below. Your current login is untouched until you \
@@ -1902,6 +1919,7 @@ impl Render for AccountsPage {
             HarnessId::Pi => (crate::icons::PI_MARK, None),
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+            HarnessId::OptChat => crate::pickers::harness_brand_icon(HarnessId::OptChat),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -1939,6 +1957,7 @@ impl Render for AccountsPage {
                         HarnessId::Opencode => "accounts-skeleton-opencode",
                         HarnessId::Pi => "accounts-skeleton-pi",
                         HarnessId::Hermes => "accounts-skeleton-hermes",
+                        HarnessId::OptChat => "accounts-skeleton-optchat",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -2034,8 +2053,8 @@ impl Render for AccountsPage {
                             // Cursor's app login is SEPARATE from `cursor-agent
                             // login` — pointing at the CLI would send users to a
                             // sign-in that does not light this up. Antigravity
-                            // has no CLI login at all.
-                            HarnessId::Cursor | HarnessId::Antigravity => format!(
+                            // and OptChat have no CLI login at all.
+                            HarnessId::Cursor | HarnessId::Antigravity | HarnessId::OptChat => format!(
                                 "{name} isn't connected on this device — connect it to run \
                                  {name} sessions."
                             ),
@@ -2335,7 +2354,12 @@ mod tests {
             "Connect a Antigravity account"
         );
         // Every agent with a login of its own has an Accounts section.
-        for harness in [HarnessId::Opencode, HarnessId::Pi, HarnessId::Hermes] {
+        for harness in [
+            HarnessId::Opencode,
+            HarnessId::Pi,
+            HarnessId::Hermes,
+            HarnessId::OptChat,
+        ] {
             assert!(signs_in(harness), "{harness:?}");
             assert!(reports_usage(harness));
             for option in login_options(harness) {

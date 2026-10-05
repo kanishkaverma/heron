@@ -43,6 +43,12 @@
 //!   active provider's first entry is "in use"), probes usage, and adds
 //!   accounts through `hermes auth add` (device code; Hermes appends to its
 //!   own pool under its own lock). It never rewrites the pool.
+//! - **OptChat** — `<engine data dir>/optchat/auth.json`: Pi's per-provider
+//!   shape (`anthropic`, `openai-codex`), guarded by an `auth.json.lock`
+//!   flock that OptChat's own token refresh also takes. OptChat's logins are
+//!   its own, never Claude Code's or Codex's (refreshing those would revoke
+//!   the CLIs' refresh tokens). Add account = `zeron_optchat::auth`, which
+//!   writes the live entry itself.
 //!
 //! Opaque tokens (Pi's Claude login, Copilot tokens) carry no identity: a
 //! live entry is matched to its slot by token, else identified ONCE per token
@@ -139,6 +145,7 @@ pub(super) fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "pi",
         HarnessId::Hermes => "hermes",
         HarnessId::Antigravity => "Antigravity",
+        HarnessId::OptChat => "OptChat",
         HarnessId::Mock => "mock",
     }
 }
@@ -338,6 +345,10 @@ pub(super) fn keyed_accounts(harness: HarnessId) -> &'static [(&'static str, Ups
             ("openai-codex", Upstream::OpenAi),
             ("anthropic", Upstream::Anthropic),
             ("github-copilot", Upstream::Copilot),
+        ],
+        HarnessId::OptChat => &[
+            ("anthropic", Upstream::Anthropic),
+            ("openai-codex", Upstream::OpenAi),
         ],
         _ => &[],
     }
@@ -826,6 +837,7 @@ impl AgentAccounts {
     fn keyed_file(&self, harness: HarnessId) -> PathBuf {
         match harness {
             HarnessId::Pi => self.inner.config.pi_agent_dir.join("auth.json"),
+            HarnessId::OptChat => self.inner.config.optchat_auth_file(),
             _ => self.inner.config.opencode_auth_file.clone(),
         }
     }
@@ -856,6 +868,7 @@ impl AgentAccounts {
         let file = self.keyed_file(harness);
         let lock = match harness {
             HarnessId::Pi => StoreLock::Dir(lock_path(&file)),
+            HarnessId::OptChat => StoreLock::File(lock_path(&file)),
             _ => StoreLock::File(file.with_file_name("auth.json.zeron-lock")),
         };
         merge_json_entry(&file, store_key, entry, lock)

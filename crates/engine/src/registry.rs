@@ -827,6 +827,9 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
     );
+    // In-process, so nothing to defer: `describe()` reads the descriptor off
+    // the harness itself and construction spawns nothing.
+    registry.register(Arc::new(zeron_optchat::OptChatHarness::new()));
     registry
 }
 
@@ -909,7 +912,8 @@ mod tests {
                 HarnessId::Hermes,
                 HarnessId::Pi,
                 HarnessId::Opencode,
-                HarnessId::Antigravity
+                HarnessId::Antigravity,
+                HarnessId::OptChat
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -972,6 +976,16 @@ mod tests {
         assert_eq!(pi.display_name(), "Pi");
         assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
         assert!(pi.reasoning_levels().is_empty());
+        let optchat = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::OptChat)
+            .unwrap();
+        assert_eq!(optchat.name, "OptChat");
+        assert!(optchat.installed);
+        assert_eq!(optchat.steering_mode, SteeringMode::StepBoundary);
+        assert_eq!(optchat.reasoning_levels, zeron_optchat::REASONING_LEVELS);
+        assert!(registry.enabled_set().contains(&HarnessId::OptChat));
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`

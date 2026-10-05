@@ -167,3 +167,18 @@ pub async fn unload() {
 pub fn load() -> Result<(), String> {
     crate::chat::chat().map(|_| ())
 }
+
+/// `zoom` on the loaded memory, as the tool answers it.
+pub fn zoom(id: u64, n: u64) -> Option<String> {
+    crate::chat::loaded().map(|chat| chat.state().mem.zoom(id, n))
+}
+
+/// Messages not yet summarized at level 0 (the view's unbuilt lines).
+pub fn unsummarized() -> u64 {
+    crate::chat::loaded()
+        .map(|chat| {
+            let state = chat.state();
+            state.mem.len() - state.mem.first_unbuilt()
+        })
+        .unwrap_or(0)
+}

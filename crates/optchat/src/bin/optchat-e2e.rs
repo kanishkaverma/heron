@@ -14,6 +14,8 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("fold-sim") => fold_sim(&args[1..]),
         Some("login") => runtime().and_then(|rt| rt.block_on(login(&args[1..]))),
+        Some("store-check") => store_check(&args[1..]),
+        Some("live") => runtime().and_then(|rt| rt.block_on(live::live(&args[1..]))),
         _ => Err("usage: optchat-e2e <fold-sim | login <anthropic|openai> --home <dir> | live --home <dir>>".into()),
     };
     match result {
@@ -410,4 +412,638 @@ fn fold_sim(args: &[String]) -> Result<(), String> {
     }
     println!("PASS fold-sim (failures 1, 2, 3, 4, 10)");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// store-check: failures 7 and 8, offline
+// ---------------------------------------------------------------------------
+
+fn store_check(args: &[String]) -> Result<(), String> {
+    use std::io::Write as _;
+    use zeron_optchat::store::Store;
+    let home = match flag(args, "--home") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => std::env::temp_dir().join(format!("optchat-store-check-{}", std::process::id())),
+    };
+    let _ = std::fs::remove_dir_all(&home);
+    let (store, mem, _) = Store::open(&home)?;
+    if !mem.is_empty() {
+        return Err("fresh store is not empty".into());
+    }
+    // Failure 8: a second writer on the same chat is refused while the first lives.
+    match Store::open(&home) {
+        Err(e) if e.contains("another process") => println!("ok   second writer refused: {e}"),
+        Err(e) => return Err(format!("second open failed oddly: {e}")),
+        Ok(_) => return Err("a second writer opened the same chat".into()),
+    }
+    for i in 0..3 {
+        store.append_message(&Message::new(i, Kind::User, format!("message {i}\nline two"), "2026-10-05T12:00:00.000-07:00".into()))?;
+    }
+    store.append_node(&Node::new(0, 0, "user: message 0 line two".into()))?;
+    drop(store);
+    // Failure 7: a crash mid-write leaves a torn last line.
+    let day = std::fs::read_dir(home.join("chat/main"))
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .ok_or("no day file")?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&day)
+        .and_then(|mut f| f.write_all(br#"{"i":3,"kind":"user","te"#))
+        .map_err(|e| e.to_string())?;
+    let (store, mem, reports) = Store::open(&home)?;
+    println!("ok   reopened over the torn line: {reports:?}");
+    if mem.len() != 3 || !reports.iter().any(|r| r.contains("torn line")) {
+        return Err(format!("torn line not skipped: {} messages, {reports:?}", mem.len()));
+    }
+    if !reports.iter().any(|r| r.contains("newline")) {
+        return Err("the torn file did not get its final newline".into());
+    }
+    store.append_message(&Message::new(3, Kind::Talk, "after the crash".into(), "2026-10-05T12:00:01.000-07:00".into()))?;
+    drop(store);
+    let (_store, mem, reports) = Store::open(&home)?;
+    if mem.len() != 4 || mem.root[3].text != "after the crash" {
+        return Err(format!("the append after a torn line was lost: {} messages, {reports:?}", mem.len()));
+    }
+    if mem.render_view() != "<chat>\n0+1|user: message 0 line two\n1+1|(not summarized yet: zoom it)\n2+1|(not summarized yet: zoom it)\n3+1|(not summarized yet: zoom it)\n</chat>" {
+        return Err(format!("unexpected view after reload:\n{}", mem.render_view()));
+    }
+    println!("ok   append after the torn line landed on its own line; reload folds 4 messages");
+    let _ = std::fs::remove_dir_all(&home);
+    println!("PASS store-check (failures 7, 8)");
+    Ok(())
+}
+
+mod live {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use futures::StreamExt;
+    use serde_json::{Value, json};
+    use tokio::sync::{mpsc, oneshot};
+    use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+    use zeron_optchat::memory::{Kind, Message, NODE, Node, cut_bytes};
+    use zeron_optchat::{Binding, FileCredentials, OptChatHarness, debug};
+    use zeron_proto::{AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall};
+
+    const SONNET: &str = "claude-sonnet-5-5";
+    const LUNA: &str = "gpt-6-luna";
+    const SEED_NOTES: u64 = 2_400;
+    const TURN_TIMEOUT: Duration = Duration::from_secs(420);
+
+    #[derive(Clone)]
+    enum Action {
+        None,
+        SteerOnTool(String),
+        InterruptOnTool,
+        InterruptAfter(Duration),
+    }
+
+    #[derive(Default, serde::Serialize)]
+    struct TurnLog {
+        name: String,
+        model: String,
+        prompt_bytes: usize,
+        text: String,
+        reasoning_chars: usize,
+        #[serde(skip)]
+        reasoning: String,
+        tools: Vec<Value>,
+        steered: usize,
+        status: String,
+        error: Option<String>,
+        ms: u128,
+        /// Interrupt to Done, when interrupted.
+        stop_ms: Option<u128>,
+        unsummarized_at_start: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Check {
+        failure: String,
+        pass: bool,
+        detail: String,
+    }
+
+    fn check(checks: &mut Vec<Check>, failure: &str, pass: bool, detail: String) {
+        println!("{} {failure}: {detail}", if pass { "PASS" } else { "FAIL" });
+        checks.push(Check {
+            failure: failure.to_string(),
+            pass,
+            detail,
+        });
+    }
+
+    fn request(prompt: &str, model: &str, cwd: &Path) -> RunRequest {
+        RunRequest {
+            prompt: prompt.to_string(),
+            harness: Some(zeron_proto::HarnessId::OptChat),
+            model: Some(model.to_string()),
+            reasoning: Some(ReasoningLevel::Medium),
+            model_options: Default::default(),
+            cwd: cwd.display().to_string(),
+            sandbox: SandboxLevel::DangerFullAccess,
+            auto_approve: true,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+            mcp: None,
+        }
+    }
+
+    /// One run, driven exactly as the engine drives it.
+    async fn turn(name: &str, model: &str, prompt: &str, cwd: &Path, action: Action) -> Result<TurnLog, String> {
+        let harness = OptChatHarness::new();
+        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(16);
+        let interrupt = CancellationToken::new();
+        let controls = RunControls {
+            execution_lease: None,
+            request_input: Box::new(|_| {
+                let (tx, rx) = oneshot::channel();
+                drop(tx);
+                rx
+            }),
+            steering: steer_rx,
+            interrupt: interrupt.clone(),
+        };
+        let mut log = TurnLog {
+            name: name.to_string(),
+            model: model.to_string(),
+            prompt_bytes: prompt.len(),
+            unsummarized_at_start: debug::unsummarized(),
+            ..Default::default()
+        };
+        println!("--- {name} ({model})");
+        let started = Instant::now();
+        let mut stream = harness
+            .run(request(prompt, model, cwd), controls)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut interrupted_at: Option<Instant> = None;
+        let mut acted = false;
+        if let Action::InterruptAfter(after) = action {
+            let interrupt = interrupt.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                interrupt.cancel();
+            });
+            interrupted_at = Some(Instant::now() + after);
+        }
+        loop {
+            let next = tokio::time::timeout(TURN_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| format!("{name}: no event for {TURN_TIMEOUT:?} (run hangs)"))?;
+            let Some(event) = next else {
+                return Err(format!("{name}: stream ended without Done"));
+            };
+            let event = event.map_err(|e| e.to_string())?;
+            match event {
+                AgentEvent::TextDelta { text } => log.text.push_str(&text),
+                AgentEvent::ReasoningDelta { text } => log.reasoning.push_str(&text),
+                AgentEvent::Steered { .. } => log.steered += 1,
+                AgentEvent::ToolCall { id, call } => {
+                    println!("    tool {}", serde_json::to_string(&call).unwrap_or_default().chars().take(160).collect::<String>());
+                    log.tools.push(json!({"id": id, "call": call}));
+                    if !acted && matches!(call, ToolCall::Exec { .. }) {
+                        match &action {
+                            Action::SteerOnTool(text) => {
+                                acted = true;
+                                let _ = steer_tx
+                                    .send(SteerMessage {
+                                        prompt: text.clone(),
+                                        message_id: None,
+                                    })
+                                    .await;
+                            }
+                            Action::InterruptOnTool => {
+                                acted = true;
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                interrupted_at = Some(Instant::now());
+                                interrupt.cancel();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                AgentEvent::Done { status, error, .. } => {
+                    log.status = format!("{status:?}");
+                    log.error = error;
+                    if let Some(at) = interrupted_at
+                        && status == DoneStatus::Interrupted
+                    {
+                        log.stop_ms = Some(at.elapsed().as_millis());
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        log.ms = started.elapsed().as_millis();
+        log.reasoning_chars = log.reasoning.chars().count();
+        println!(
+            "    {} in {} ms: {}",
+            log.status,
+            log.ms,
+            log.text.chars().take(300).collect::<String>().replace('\n', " ")
+        );
+        Ok(log)
+    }
+
+    /// An imported history (SPEC §10) with its tree prebuilt, so the view is
+    /// full-size from the first turn: the cross-turn view breakpoints need a
+    /// view past the 50,000-character mark.
+    fn seed(home: &Path) -> Result<(), String> {
+        let chat = home.join("chat");
+        if chat.join("main").exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(chat.join("main")).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(chat.join("tree")).map_err(|e| e.to_string())?;
+        let services = ["billing", "search", "auth", "ingest", "reports", "mailer", "scheduler", "gateway"];
+        let people = ["Ana", "Bruno", "Chen", "Dalia", "Emeka", "Farah"];
+        let stores = ["Postgres 16", "Redis 7", "SQLite", "ClickHouse", "S3"];
+        let date = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+        let mut main = String::new();
+        let mut texts = Vec::new();
+        for k in 0..SEED_NOTES {
+            let svc = services[(k % 8) as usize];
+            let text = format!(
+                "imported note {k}: the {svc} service keeps its state in {} on port {}; {} decided to {} it in week {} because the old setup {}.",
+                stores[(k % 5) as usize],
+                5000 + k % 900,
+                people[(k % 6) as usize],
+                ["migrate", "shard", "cache", "retire", "audit"][(k % 5) as usize],
+                1 + k % 52,
+                ["dropped writes under load", "cost too much", "was hard to back up", "leaked connections", "had no owner"][(k * 7 % 5) as usize],
+            );
+            let message = Message::new(k, Kind::Note, text, date.clone());
+            texts.push(message.line());
+            main.push_str(&serde_json::to_string(&message).map_err(|e| e.to_string())?);
+            main.push('\n');
+        }
+        // Every node the pump would build, so nothing is due.
+        let mut tree = String::new();
+        let mut level: Vec<String> = texts;
+        let mut l = 0u32;
+        while !level.is_empty() {
+            for (i, text) in level.iter().enumerate() {
+                tree.push_str(&serde_json::to_string(&Node::new(l, i as u64, text.clone())).map_err(|e| e.to_string())?);
+                tree.push('\n');
+            }
+            level = level
+                .chunks_exact(2)
+                .map(|pair| {
+                    let joined = format!("{}\n{}", pair[0], pair[1]);
+                    if joined.len() <= NODE {
+                        joined
+                    } else {
+                        let a = pair[0].replace('\n', " ");
+                        let b = pair[1].replace('\n', " ");
+                        format!("{} / {}", cut_bytes(&a, 250), cut_bytes(&b, 250))
+                    }
+                })
+                .collect();
+            l += 1;
+        }
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        std::fs::write(chat.join("main").join(format!("{day}.jsonl")), main).map_err(|e| e.to_string())?;
+        std::fs::write(chat.join("tree").join(format!("{day}.jsonl")), tree).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn edit_entry(auth: &Path, key: &str, edit: impl FnOnce(&mut Value)) -> Result<Value, String> {
+        let mut store: Value = serde_json::from_slice(&std::fs::read(auth).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let before = store[key].clone();
+        edit(&mut store[key]);
+        std::fs::write(auth, serde_json::to_vec_pretty(&store).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        Ok(before)
+    }
+
+    fn entry(auth: &Path, key: &str) -> Value {
+        std::fs::read(auth)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .map(|v| v[key].clone())
+            .unwrap_or(Value::Null)
+    }
+
+    fn snippet(text: &str, from: usize, len: usize) -> String {
+        text.chars().skip(from).take(len).collect()
+    }
+
+    pub async fn live(args: &[String]) -> Result<(), String> {
+        let home: PathBuf = super::home_arg(args)?;
+        let auth = home.join("auth.json");
+        if entry(&auth, "anthropic").is_null() {
+            return Err(format!(
+                "{} has no anthropic login; run: optchat-e2e login anthropic --home {}",
+                auth.display(),
+                home.display()
+            ));
+        }
+        let has_openai = !entry(&auth, "openai-codex").is_null();
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        seed(&home)?;
+        zeron_optchat::bind(Binding {
+            home: home.clone(),
+            credentials: std::sync::Arc::new(FileCredentials::new(auth.clone())),
+        });
+        let started = Instant::now();
+        let mut turns: Vec<TurnLog> = Vec::new();
+        let mut checks: Vec<Check> = Vec::new();
+        debug::load()?;
+        let first_message = debug::messages().len() as u64;
+        let view0 = debug::live_view().unwrap_or_default();
+        println!("view at start: {} chars, {} lines", view0.chars().count(), view0.lines().count());
+
+        // Failure 8 in the live process: the chat holds its lock.
+        let second = zeron_optchat::store::Store::open(&home);
+        check(&mut checks, "8 single writer", second.is_err(), format!("second Store::open while live: {:?}", second.as_ref().err()));
+        drop(second);
+
+        // T1: a long message whose exact words only a zoom to n = 1 can recover.
+        let items: Vec<String> = (1..=40)
+            .map(|k| {
+                let a = ["amber", "basalt", "cobalt", "dune", "ember", "fjord", "garnet", "harbor"][k % 8];
+                let b = ["kite", "lantern", "meadow", "nickel", "orchid", "pylon", "quartz", "raven"][(k * 3) % 8];
+                format!("{k}. {a}-{b}-{}", 100 + k * 37 % 900)
+            })
+            .collect();
+        let t1_prompt = format!(
+            "Remember this list exactly; I will ask about it later. Reply only with 'noted' and how many items it has.\n{}",
+            items.join("\n")
+        );
+        let t1_id = debug::messages().len() as u64;
+        turns.push(turn("t1-remember", SONNET, &t1_prompt, &workspace, Action::None).await?);
+
+        // T2: tools (multi-step call) after forcing a token refresh (failure 15).
+        let refreshed_before = edit_entry(&auth, "anthropic", |e| e["expires"] = json!(0))?;
+        turns.push(
+            turn(
+                "t2-tools",
+                SONNET,
+                "Using bash, create a file marker.txt in the working directory containing the line 'optchat-e2e', then list the directory and tell me what is there.",
+                &workspace,
+                Action::None,
+            )
+            .await?,
+        );
+        let refreshed_after = entry(&auth, "anthropic");
+        let refreshed = refreshed_after["expires"].as_i64().unwrap_or(0) > chrono::Utc::now().timestamp_millis()
+            && refreshed_after["access"] != refreshed_before["access"];
+        check(&mut checks, "15 refresh on expiry", refreshed, "expired entry was refreshed once and written back".into());
+
+        // T3: steered mid-run (failure 13).
+        let steer = "Also: end your reply with the word PINEAPPLE in capitals.";
+        let t3 = turn(
+            "t3-steered",
+            SONNET,
+            "Use bash to run `sleep 6; echo first-done` and tell me what it printed.",
+            &workspace,
+            Action::SteerOnTool(steer.into()),
+        )
+        .await?;
+        let log = debug::messages();
+        let steer_logged = log.iter().position(|m| m.kind == Kind::User && m.text == steer);
+        let talk_after = steer_logged.is_some_and(|at| log[at..].iter().any(|m| m.kind == Kind::Talk && m.text.contains("PINEAPPLE")));
+        check(
+            &mut checks,
+            "13 steering delivered and logged",
+            t3.steered == 1 && steer_logged.is_some() && talk_after && t3.status == "Completed",
+            format!("Steered events {}, logged as user at {:?}, reply honors it: {talk_after}", t3.steered, steer_logged),
+        );
+        turns.push(t3);
+
+        // T4: interrupted during a tool (failure 17).
+        let t4 = turn(
+            "t4-interrupt-tool",
+            SONNET,
+            "Use bash to run `sleep 120`, then tell me it finished.",
+            &workspace,
+            Action::InterruptOnTool,
+        )
+        .await?;
+        let echo_note = debug::messages().iter().any(|m| m.kind == Kind::Echo && m.text == "(interrupted by the user)");
+        check(
+            &mut checks,
+            "17 interrupt during a tool",
+            t4.status == "Interrupted" && t4.stop_ms.is_some_and(|ms| ms < 5_000) && echo_note,
+            format!("status {}, Done {:?} ms after the interrupt, interruption logged: {echo_note}", t4.status, t4.stop_ms),
+        );
+        turns.push(t4);
+
+        // T5: interrupted while settling (failure 17). A long prompt that a
+        // stopped run leaves unsummarized makes the next run wait in settle.
+        let filler = (0..30).map(|k| format!("Point {k}: the scheduler retries failed jobs with jitter.")).collect::<Vec<_>>().join(" ");
+        let t5a = turn(
+            "t5a-leave-unsummarized",
+            SONNET,
+            &format!("Ignore this for now, I will come back to it. {filler}"),
+            &workspace,
+            Action::InterruptAfter(Duration::from_millis(400)),
+        )
+        .await?;
+        turns.push(t5a);
+        let pending = debug::unsummarized();
+        let settle_prompt = "This message was sent while the memory was settling and then cancelled.";
+        let t5 = turn("t5-interrupt-settle", SONNET, settle_prompt, &workspace, Action::InterruptAfter(Duration::from_millis(300))).await?;
+        let kept = debug::messages().iter().any(|m| m.kind == Kind::User && m.text == settle_prompt);
+        check(
+            &mut checks,
+            "17 interrupt during settle",
+            t5.status == "Interrupted" && t5.stop_ms.is_some_and(|ms| ms < 2_000) && kept && t5.text.is_empty() && pending > 0,
+            format!("{pending} unsummarized at start, status {}, Done {:?} ms after the interrupt, message kept unanswered: {kept}", t5.status, t5.stop_ms),
+        );
+        turns.push(t5);
+
+        // T6: exact recall that needs zoom(id, 1) (failure 2's cost side; SPEC §5.3).
+        let t6 = turn(
+            "t6-zoom",
+            SONNET,
+            "Earlier in this chat I sent you a numbered list to remember. Quote item 17 exactly as I wrote it.",
+            &workspace,
+            Action::None,
+        )
+        .await?;
+        let zoomed_root = t6.tools.iter().any(|t| {
+            t["call"]["name"] == "zoom" && t["call"]["input"]["n"] == json!(1) && t["call"]["input"]["id"] == json!(t1_id)
+        });
+        let item17 = items[16].split_once(". ").map(|x| x.1).unwrap_or_default().to_string();
+        check(
+            &mut checks,
+            "zoom to n=1 answers exact text",
+            zoomed_root && t6.text.contains(&item17),
+            format!("zoom({t1_id}, 1) called: {zoomed_root}; reply contains '{item17}': {}", t6.text.contains(&item17)),
+        );
+        turns.push(t6);
+
+        // T7: one more Claude turn after a forced 401 (failure 15, retry path).
+        let bad = edit_entry(&auth, "anthropic", |e| {
+            e["access"] = json!("sk-ant-oat01-invalid-e2e");
+            e["expires"] = json!(chrono::Utc::now().timestamp_millis() + 3_600_000);
+        })?;
+        let t7 = turn(
+            "t7-after-401",
+            SONNET,
+            "What does marker.txt contain? Check it with a tool, then answer in one line.",
+            &workspace,
+            Action::None,
+        )
+        .await?;
+        let after = entry(&auth, "anthropic");
+        check(
+            &mut checks,
+            "15 401 retries once after refresh",
+            t7.status == "Completed" && after["access"] != json!("sk-ant-oat01-invalid-e2e") && after["refresh"] != bad["refresh"],
+            format!("turn {} with a rejected token; entry rewritten: {}", t7.status, after["access"] != json!("sk-ant-oat01-invalid-e2e")),
+        );
+        turns.push(t7);
+
+        if has_openai {
+            turns.push(
+                turn(
+                    "t8-luna-tools",
+                    LUNA,
+                    "Use bash to print today's date with `date`, then tell me in one line what we have done in this chat today.",
+                    &workspace,
+                    Action::None,
+                )
+                .await?,
+            );
+            turns.push(
+                turn(
+                    "t9-luna-recall",
+                    LUNA,
+                    "Which word did I ask you to end a reply with earlier today? Check the chat if you need to, and run `cat marker.txt` with bash too.",
+                    &workspace,
+                    Action::None,
+                )
+                .await?,
+            );
+        }
+
+        // Let the compactor finish, then drop and reload (failure 10).
+        let idle = debug::wait_idle(Duration::from_secs(300)).await;
+        let live_view = debug::live_view().unwrap_or_default();
+        let messages = debug::messages();
+        debug::unload().await;
+        let reopened = zeron_optchat::store::Store::open(&home).map(|_| ());
+        debug::load()?;
+        let reloaded = debug::live_view().unwrap_or_default();
+        check(
+            &mut checks,
+            "10 reload folds the live view",
+            idle && reloaded == live_view && reopened.is_ok(),
+            format!(
+                "compactor idle {idle}; lock released on unload: {:?}; views equal: {} ({} chars)",
+                reopened.err(),
+                reloaded == live_view,
+                live_view.chars().count()
+            ),
+        );
+
+        let evidence = debug::evidence();
+        check(
+            &mut checks,
+            "4 compactor never sees a placeholder",
+            evidence.compactor_placeholders == 0 && !evidence.compactor_failures.iter().any(|f| f.contains("not summarized")),
+            format!("{} compactor inputs, {} with a placeholder", evidence.compactor_inputs, evidence.compactor_placeholders),
+        );
+        check(
+            &mut checks,
+            "5 no ids in compactor input",
+            evidence.compactor_id_lines == 0 && evidence.compactor_inputs > 0,
+            format!("{} id-shaped lines in {} inputs", evidence.compactor_id_lines, evidence.compactor_inputs),
+        );
+        check(
+            &mut checks,
+            "11 no turn starts unsettled",
+            evidence.unsettled_turns == 0 && evidence.turns > 0,
+            format!("{} of {} turns rendered an unsummarized view", evidence.unsettled_turns, evidence.turns),
+        );
+        let new_messages = &messages[first_message as usize..];
+        let leaked: Vec<String> = turns
+            .iter()
+            .filter(|t| t.reasoning_chars >= 120)
+            .flat_map(|t| [snippet(&t.reasoning, 20, 60), snippet(&t.reasoning, t.reasoning_chars / 2, 60)])
+            .filter(|s| new_messages.iter().any(|m| m.text.contains(s.as_str())))
+            .collect();
+        let thought_turns = turns.iter().filter(|t| t.reasoning_chars >= 120).count();
+        check(
+            &mut checks,
+            "12 thoughts never logged",
+            leaked.is_empty() && thought_turns > 0,
+            format!("{thought_turns} turns streamed thoughts; snippets found in the log: {leaked:?}"),
+        );
+        // Failure 14: in-call steps read the cache; later turns read the view.
+        let turn_requests: Vec<&debug::Request> = evidence.requests.iter().filter(|r| r.kind == debug::RequestKind::Turn).collect();
+        let step_misses: Vec<String> = turn_requests
+            .iter()
+            .filter(|r| r.step > 0 && r.usage.cache_read == 0)
+            .map(|r| format!("call {} step {} ({})", r.call, r.step, r.model))
+            .collect();
+        let steps = turn_requests.iter().filter(|r| r.step > 0).count();
+        check(
+            &mut checks,
+            "14 cache read on every step 2+",
+            step_misses.is_empty() && steps > 0,
+            format!("{steps} later steps; misses: {step_misses:?}"),
+        );
+        let mut first_seen = std::collections::HashSet::new();
+        let cross: Vec<(u64, String, u64, u64)> = turn_requests
+            .iter()
+            .filter(|r| r.step == 0)
+            .filter(|r| !first_seen.insert(r.model.clone()))
+            .map(|r| (r.call, r.model.clone(), r.usage.cache_read, r.usage.prompt()))
+            .collect();
+        let cross_misses: Vec<_> = cross.iter().filter(|c| c.2 == 0).collect();
+        check(
+            &mut checks,
+            "14 cache read across turns (view breakpoints)",
+            cross_misses.is_empty() && !cross.is_empty(),
+            format!("first steps of later turns (call, model, cache_read, prompt): {cross:?}"),
+        );
+        // Failure 16: bad zoom arguments answer, never panic.
+        let total = debug::messages().len() as u64;
+        let bad_args = [(0, 0), (1, 2), (3, 3), (u64::MAX, 1), (0, 1 << 40), (total, 1), (u64::MAX - 1, 2)];
+        let answers: Vec<String> = bad_args.iter().map(|(id, n)| debug::zoom(*id, *n).unwrap_or_default()).collect();
+        check(
+            &mut checks,
+            "16 bad zoom answers 'No line'",
+            answers.iter().zip(&bad_args).all(|(a, (id, n))| *a == format!("No line {id}+{n}.")),
+            format!("{answers:?}"),
+        );
+        let over: usize = evidence.tries.iter().filter(|(_, sizes)| sizes.iter().all(|s| *s > NODE)).count();
+        let shortest_kept = evidence.tries.len();
+        println!("info compactor calls {shortest_kept}, nodes still over {NODE} B after all tries: {over}");
+
+        let report = json!({
+            "home": home,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "models": {"turns": turns.iter().map(|t| t.model.clone()).collect::<std::collections::BTreeSet<_>>(), "compactor": if evidence.requests.iter().any(|r| r.kind == debug::RequestKind::Compact && r.model == SONNET) { SONNET } else { LUNA }},
+            "assertions": checks,
+            "all_pass": checks.iter().all(|c| c.pass),
+            "turns": turns,
+            "requests": evidence.requests,
+            "compactor": {
+                "inputs": evidence.compactor_inputs,
+                "failures": evidence.compactor_failures,
+                "tries": evidence.tries,
+                "over_node_after_tries": over,
+            },
+            "view": {"start_chars": view0.chars().count(), "end_chars": live_view.chars().count(), "end_lines": live_view.lines().count()},
+        });
+        let path = home.join("e2e-report.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        println!("report: {}", path.display());
+        if checks.iter().all(|c| c.pass) {
+            println!("PASS live");
+            Ok(())
+        } else {
+            Err(format!("{} live assertions failed", checks.iter().filter(|c| !c.pass).count()))
+        }
+    }
 }

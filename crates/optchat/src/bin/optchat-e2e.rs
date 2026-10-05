@@ -248,7 +248,7 @@ impl Sim {
             let Some(&(l, i)) = due.first() else { break };
             // Failure 4: the compactor's context never holds a placeholder.
             // Rendering 128 KB per node is the slow part, so sample it.
-            if (self.mem.tree.len() + l as usize) % 61 == 0 {
+            if (self.mem.tree.len() + l as usize).is_multiple_of(61) {
                 let upto = if l == 0 { i } else { (i + 1) << l };
                 self.mem.render_context(upto)?;
             }

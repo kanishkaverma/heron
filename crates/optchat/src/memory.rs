@@ -338,7 +338,7 @@ impl Memory {
     /// SPEC §7.1. Never panics: bad arguments answer `No line id+n.`
     pub fn zoom(&self, id: u64, n: u64) -> String {
         let no = || format!("No line {id}+{n}.");
-        if n == 0 || !n.is_power_of_two() || id % n != 0 {
+        if n == 0 || !n.is_power_of_two() || !id.is_multiple_of(n) {
             return no();
         }
         match id.checked_add(n) {
@@ -365,10 +365,9 @@ impl Memory {
 /// the view. Each piece but the last gets a cache breakpoint.
 pub fn cut_view(view: &str) -> Vec<&str> {
     let mut cuts = Vec::new();
-    let mut chars = 0usize;
     let mut last_newline: Option<usize> = None;
     let mut marks = MARKS.iter().peekable();
-    for (byte, ch) in view.char_indices() {
+    for (chars, (byte, ch)) in view.char_indices().enumerate() {
         while let Some(&&mark) = marks.peek() {
             if chars < mark {
                 break;
@@ -386,7 +385,6 @@ pub fn cut_view(view: &str) -> Vec<&str> {
         if ch == '\n' {
             last_newline = Some(byte + 1);
         }
-        chars += 1;
     }
     let mut pieces = Vec::new();
     let mut from = 0;

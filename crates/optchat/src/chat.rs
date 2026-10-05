@@ -38,6 +38,9 @@ pub(crate) struct Chat {
     pub instructions: Option<String>,
     /// OpenAI routing key: stable per chat so consecutive turns share a cache.
     pub cache_key: String,
+    /// One turn at a time: every Zeron chat on OptChat shares this one log,
+    /// and two calls appending at once would interleave their steps.
+    pub turns: tokio::sync::Mutex<()>,
 }
 
 static CHAT: Mutex<Option<Arc<Chat>>> = Mutex::new(None);
@@ -109,6 +112,7 @@ impl Chat {
             shutdown: CancellationToken::new(),
             instructions,
             cache_key,
+            turns: tokio::sync::Mutex::new(()),
         }))
     }
 

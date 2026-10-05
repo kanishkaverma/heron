@@ -319,6 +319,8 @@ fn fold_sim(args: &[String]) -> Result<(), String> {
     let mut previous: Option<String> = None;
     let mut prefixes = Vec::new();
     let mut render_chars = Vec::new();
+    // Per turn, how many of the previous view's cache pieces survive whole.
+    let mut pieces_read = [0usize; 5];
     let mut max_settled = 0usize;
     let mut reloads = 0;
     for message in messages {
@@ -340,6 +342,9 @@ fn fold_sim(args: &[String]) -> Result<(), String> {
             }
             let view = sim.mem.render_view();
             if let Some(prev) = &previous {
+                let (old, new) = (zeron_optchat::memory::cut_view(prev), zeron_optchat::memory::cut_view(&view));
+                let read = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+                pieces_read[read.min(4)] += 1;
                 prefixes.push(shared_prefix_chars(prev, &view));
                 render_chars.push(view.chars().count());
             }
@@ -399,6 +404,7 @@ fn fold_sim(args: &[String]) -> Result<(), String> {
     println!("max settled view    {max_settled} B");
     println!("turns compared      {}", prefixes.len());
     println!("median shared prefix {median_prefix} chars of a median {median_render}-char render (mean {mean_prefix})");
+    println!("view pieces read    {pieces_read:?} turns reading 0..=4 whole pieces of the previous view");
     println!("reloads matched     {reloads}");
     println!("elapsed             {:.1?}", started.elapsed());
     // Failure 3: consecutive renders share well past half the view.
@@ -541,7 +547,7 @@ mod live {
             prompt: prompt.to_string(),
             harness: Some(zeron_proto::HarnessId::OptChat),
             model: Some(model.to_string()),
-            reasoning: Some(ReasoningLevel::Medium),
+            reasoning: Some(ReasoningLevel::High),
             model_options: Default::default(),
             cwd: cwd.display().to_string(),
             sandbox: SandboxLevel::DangerFullAccess,
@@ -767,6 +773,18 @@ mod live {
         check(&mut checks, "8 single writer", second.is_err(), format!("second Store::open while live: {:?}", second.as_ref().err()));
         drop(second);
 
+        // T0: a problem that makes the model think, so failure 12 has thoughts to look for.
+        turns.push(
+            turn(
+                "t0-think",
+                SONNET,
+                "How many integers from 1 to 500 are divisible by 3 or 5 but not by 7? Work it out carefully, then reply with the number only.",
+                &workspace,
+                Action::None,
+            )
+            .await?,
+        );
+
         // T1: a long message whose exact words only a zoom to n = 1 can recover.
         let items: Vec<String> = (1..=40)
             .map(|k| {
@@ -905,6 +923,29 @@ mod live {
         );
         turns.push(t7);
 
+        // Two runs at once (two Zeron chats on OptChat): one waits for the
+        // other, so the log holds each turn whole, never interleaved.
+        let before = debug::messages().len();
+        let (ta, tb) = tokio::join!(
+            turn("t7a-concurrent", SONNET, "Reply with exactly the word ALPHA and nothing else.", &workspace, Action::None),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                turn("t7b-concurrent", SONNET, "Reply with exactly the word BRAVO and nothing else.", &workspace, Action::None).await
+            },
+        );
+        let (ta, tb) = (ta?, tb?);
+        let segment: Vec<(Kind, String)> = debug::messages()[before..].iter().map(|m| (m.kind, m.text.clone())).collect();
+        let users: Vec<usize> = segment.iter().enumerate().filter(|(_, m)| m.0 == Kind::User).map(|(k, _)| k).collect();
+        let whole = users.len() == 2 && segment[users[0]..users[1]].iter().any(|m| m.0 == Kind::Talk && m.1.contains("ALPHA"));
+        check(
+            &mut checks,
+            "18 concurrent runs never interleave",
+            whole && ta.status == "Completed" && tb.status == "Completed" && tb.text.contains("BRAVO") && tb.reasoning.contains("Another OptChat turn"),
+            format!("log after both: {:?}; second waited: {}", segment.iter().map(|m| m.0.as_str()).collect::<Vec<_>>(), tb.reasoning.contains("Another OptChat turn")),
+        );
+        turns.push(ta);
+        turns.push(tb);
+
         if has_openai {
             turns.push(
                 turn(
@@ -995,19 +1036,27 @@ mod live {
             step_misses.is_empty() && steps > 0,
             format!("{steps} later steps; misses: {step_misses:?}"),
         );
+        // A later turn can read the cache only through a view breakpoint
+        // whose piece it repeats byte for byte (SPEC §8: no breakpoint sits
+        // on the system prompt), so a hit is owed exactly when one survived.
+        let reused: std::collections::HashMap<u64, usize> = evidence.view_pieces_reused.iter().copied().collect();
         let mut first_seen = std::collections::HashSet::new();
-        let cross: Vec<(u64, String, u64, u64)> = turn_requests
+        let cross: Vec<(u64, String, usize, u64, u64)> = turn_requests
             .iter()
             .filter(|r| r.step == 0)
             .filter(|r| !first_seen.insert(r.model.clone()))
-            .map(|r| (r.call, r.model.clone(), r.usage.cache_read, r.usage.prompt()))
+            .map(|r| (r.call, r.model.clone(), reused.get(&r.call).copied().unwrap_or(0), r.usage.cache_read, r.usage.prompt()))
             .collect();
-        let cross_misses: Vec<_> = cross.iter().filter(|c| c.2 == 0).collect();
+        // ChatGPT's Codex endpoint rejects prompt_cache_breakpoint ("not
+        // supported on this model") and its implicit cache only matches a
+        // whole earlier prompt, so only Claude owes a cross-turn read.
+        let owed: Vec<_> = cross.iter().filter(|c| c.2 > 0 && c.1.starts_with("claude-")).collect();
+        let cross_misses: Vec<_> = owed.iter().filter(|c| c.3 == 0).collect();
         check(
             &mut checks,
             "14 cache read across turns (view breakpoints)",
-            cross_misses.is_empty() && !cross.is_empty(),
-            format!("first steps of later turns (call, model, cache_read, prompt): {cross:?}"),
+            cross_misses.is_empty() && !owed.is_empty(),
+            format!("first steps of later turns (call, model, view pieces repeated, cache_read, prompt): {cross:?}; misses where a piece survived: {cross_misses:?}"),
         );
         // Failure 16: bad zoom arguments answer, never panic.
         let total = debug::messages().len() as u64;

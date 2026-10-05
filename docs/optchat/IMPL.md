@@ -90,6 +90,13 @@ include:["reasoning.encrypted_content"], prompt_cache_key, tool_choice:"auto",
 parallel_tool_calls:true, tools, reasoning:{effort, summary:"auto"}`. Try the
 SPEC §8 extras (`prompt_cache_breakpoint`, `reasoning.context:"all_turns"`);
 keep each only if the live endpoint accepts it, and record the result.
+Result (2026-10-05, probed live): `reasoning.context:"all_turns"` is accepted.
+`prompt_cache_breakpoint` exists (`{"mode":"explicit"}` is its only shape) but
+answers 400 "not supported on this model" for both gpt-6-luna and gpt-6-sol,
+so it is not sent. The implicit cache hits when a request repeats a whole
+earlier prompt (each step of a call: verified), and misses when a request
+diverges from it midway, even at a content-part boundary. So on ChatGPT the
+view is cached within a call, not across turns.
 Refresh: `POST https://auth.openai.com/oauth/token` form
 `{grant_type: refresh_token, refresh_token, client_id: app_EMoamEEZ73f0CkXaXp7hrann}`.
 Account id: JWT claim `https://api.openai.com/auth`.`chatgpt_account_id`.
@@ -144,6 +151,8 @@ Compactor: `claude-sonnet-5-5` at medium when Claude is signed in, else
     written back; a 401 retries once after refresh.
 16. Zoom with bad arguments panics instead of answering `No line id+n.`
 17. Interrupt during settle or during a tool leaves the run hanging.
+18. Two runs at once (two Zeron chats on OptChat) interleave their steps in
+    the one log. A run waits for the running one, cancellably.
 
 ## Verification contract
 

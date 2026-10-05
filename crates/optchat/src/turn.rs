@@ -125,6 +125,23 @@ impl Turn {
 
     async fn drive(&mut self, assistant: &mut String) -> Result<(), Stop> {
         let mut queue = vec![std::mem::take(&mut self.prompt)];
+        let chat = self.chat.clone();
+        let _turn = match chat.turns.try_lock() {
+            Ok(held) => held,
+            Err(_) => {
+                self.emit(AgentEvent::ReasoningDelta {
+                    text: "Another OptChat turn is running; this one starts when it ends.\n".into(),
+                });
+                let cancel = self.cancel.clone();
+                tokio::select! {
+                    held = chat.turns.lock() => held,
+                    _ = cancel.cancelled() => {
+                        self.keep_untaken(queue, assistant);
+                        return Err(Stop::Interrupted);
+                    }
+                }
+            }
+        };
         let mut call_no = 0u64;
         loop {
             queue.extend(self.take_steering(assistant));
@@ -138,15 +155,16 @@ impl Turn {
             }
             let texts = std::mem::take(&mut queue);
             // Render BEFORE logging the new messages: they go whole in block 2.
+            call_no = debug::next_call().max(call_no + 1);
             let view = {
                 let state = self.chat.state();
-                debug::note_turn(state.mem.first_unbuilt() == state.mem.len());
-                state.mem.render_view()
+                let view = state.mem.render_view();
+                debug::note_turn(call_no, state.mem.first_unbuilt() == state.mem.len(), &view);
+                view
             };
             for text in &texts {
                 self.chat.log(Kind::User, text).map_err(Stop::Failed)?;
             }
-            call_no = debug::next_call().max(call_no + 1);
             let mut call = Call::new(
                 self.chat.credentials.clone(),
                 self.chat.http.clone(),

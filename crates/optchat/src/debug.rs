@@ -43,6 +43,11 @@ pub struct Evidence {
     /// Failure 11: turns whose view was rendered with an unsummarized line.
     pub unsettled_turns: u64,
     pub turns: u64,
+    /// Per turn call: how many cache pieces of the previous turn's view it
+    /// repeats byte for byte, i.e. how many view breakpoints can hit (SPEC §8).
+    pub view_pieces_reused: Vec<(u64, usize)>,
+    #[serde(skip)]
+    last_view: String,
 }
 
 static EVIDENCE: Mutex<Option<Evidence>> = Mutex::new(None);
@@ -120,10 +125,16 @@ pub(crate) fn note_tries(level: u32, sizes: Vec<usize>) {
     with(|e| e.tries.push((level, sizes)));
 }
 
-pub(crate) fn note_turn(settled: bool) {
+pub(crate) fn note_turn(call: u64, settled: bool, view: &str) {
     with(|e| {
         e.turns += 1;
         e.unsettled_turns += (!settled) as u64;
+        if !e.last_view.is_empty() {
+            let (old, new) = (crate::memory::cut_view(&e.last_view), crate::memory::cut_view(view));
+            let reused = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+            e.view_pieces_reused.push((call, reused));
+        }
+        e.last_view = view.to_string();
     });
 }
 

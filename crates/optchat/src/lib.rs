@@ -6,6 +6,8 @@
 //! `Harness`. The engine supplies the one thing it can't own: live OAuth
 //! tokens, through [`Credentials`], bound once with [`bind`].
 
+pub mod auth;
+
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 

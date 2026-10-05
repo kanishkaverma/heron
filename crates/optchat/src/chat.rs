@@ -19,6 +19,8 @@ pub(crate) struct State {
     pub busy: HashSet<(u32, u64)>,
     /// Nodes whose failure was already reported (reported once each).
     pub failed: HashSet<(u32, u64)>,
+    /// The latest compactor failure still unresolved, for display.
+    pub last_failure: Option<String>,
 }
 
 pub(crate) struct Chat {
@@ -101,6 +103,7 @@ impl Chat {
                 mem,
                 busy: HashSet::new(),
                 failed: HashSet::new(),
+                last_failure: None,
             }),
             changed: watch::channel(0).0,
             shutdown: CancellationToken::new(),

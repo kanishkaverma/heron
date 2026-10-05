@@ -643,9 +643,10 @@ mod live {
         log.ms = started.elapsed().as_millis();
         log.reasoning_chars = log.reasoning.chars().count();
         println!(
-            "    {} in {} ms: {}",
+            "    {} in {} ms{}: {}",
             log.status,
             log.ms,
+            log.error.as_ref().map(|e| format!(" ({e})")).unwrap_or_default(),
             log.text.chars().take(300).collect::<String>().replace('\n', " ")
         );
         Ok(log)
@@ -693,7 +694,9 @@ mod live {
                 tree.push('\n');
             }
             level = level
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     let joined = format!("{}\n{}", pair[0], pair[1]);
                     if joined.len() <= NODE {

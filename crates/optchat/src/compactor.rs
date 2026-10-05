@@ -45,12 +45,19 @@ async fn run(chat: Arc<Chat>, l: u32, i: u64) {
         state.mem.fit(VIEW);
         state.busy.remove(&(l, i));
         state.failed.remove(&(l, i));
+        if state.failed.is_empty() {
+            state.last_failure = None;
+        }
         Ok(())
     });
     match saved {
         Ok(()) => chat.notify(),
         Err(err) => {
-            let first = chat.state().failed.insert((l, i));
+            let first = {
+                let mut state = chat.state();
+                state.last_failure = Some(err.clone());
+                state.failed.insert((l, i))
+            };
             if first {
                 let n = 1u64 << l;
                 tracing::warn!(target: "optchat", "summary of {}+{n} failed (retrying every {RETRY:?}): {err}", i << l);

@@ -132,8 +132,7 @@ impl Turn {
                 return Ok(());
             }
             // SPEC §6: no turn starts while a view line is unsummarized.
-            let cancel = self.cancel.clone();
-            if !self.chat.settle(&cancel).await {
+            if !self.settle().await {
                 self.keep_untaken(queue, assistant);
                 return Err(Stop::Interrupted);
             }
@@ -160,6 +159,40 @@ impl Turn {
             )
             .map_err(Stop::Failed)?;
             self.call(&mut call, call_no, assistant).await?;
+        }
+    }
+
+    /// Settle, telling the user (as a thought: shown, never logged) when
+    /// the wait is noticeable or the compactor is failing.
+    async fn settle(&self) -> bool {
+        let cancel = self.cancel.clone();
+        let settle = self.chat.settle(&cancel);
+        tokio::pin!(settle);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        tick.tick().await;
+        let (mut said_wait, mut said_failure) = (false, None::<String>);
+        loop {
+            tokio::select! {
+                settled = &mut settle => return settled,
+                _ = tick.tick() => {
+                    let (left, failure) = {
+                        let state = self.chat.state();
+                        (state.mem.len() - state.mem.first_unbuilt(), state.last_failure.clone())
+                    };
+                    if !said_wait {
+                        said_wait = true;
+                        self.emit(AgentEvent::ReasoningDelta {
+                            text: format!("Waiting for the memory to summarize the last {left} message(s)…\n"),
+                        });
+                    }
+                    if failure.is_some() && failure != said_failure {
+                        self.emit(AgentEvent::ReasoningDelta {
+                            text: format!("Summarizing failed, retrying every 10 s: {}\n", failure.clone().unwrap_or_default()),
+                        });
+                        said_failure = failure;
+                    }
+                }
+            }
         }
     }
 

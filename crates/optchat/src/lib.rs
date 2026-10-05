@@ -6,7 +6,9 @@
 //! `Harness`. The engine supplies the one thing it can't own: live OAuth
 //! tokens, through [`Credentials`], bound once with [`bind`].
 
+pub mod auth;
 pub mod memory;
+pub mod store;
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -58,7 +60,7 @@ impl FileCredentials {
 #[async_trait]
 impl Credentials for FileCredentials {
     async fn token(&self, provider: Provider) -> Result<Token, String> {
-        Err(format!("Sign in to {provider:?} for OptChat"))
+        auth::file_token(&self.path, provider).await
     }
 }
 

@@ -13,6 +13,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("fold-sim") => fold_sim(&args[1..]),
+        Some("login") => runtime().and_then(|rt| rt.block_on(login(&args[1..]))),
         _ => Err("usage: optchat-e2e <fold-sim | login <anthropic|openai> --home <dir> | live --home <dir>>".into()),
     };
     match result {
@@ -22,6 +23,49 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Runtime::new().map_err(|e| e.to_string())
+}
+
+fn home_arg(args: &[String]) -> Result<std::path::PathBuf, String> {
+    let home = flag(args, "--home").ok_or("--home <dir> is required")?;
+    std::fs::create_dir_all(home).map_err(|e| format!("create {home}: {e}"))?;
+    Ok(std::path::PathBuf::from(home))
+}
+
+// ---------------------------------------------------------------------------
+// login
+// ---------------------------------------------------------------------------
+
+/// Prints `AUTH_URL <url>`, accepts a pasted code or redirect URL on stdin,
+/// waits for the loopback, writes `<home>/auth.json`, prints `SIGNED_IN <label>`.
+async fn login(args: &[String]) -> Result<(), String> {
+    use std::io::Write as _;
+    let provider = match args.first().map(String::as_str) {
+        Some("anthropic") => zeron_optchat::Provider::Anthropic,
+        Some("openai") => zeron_optchat::Provider::OpenAI,
+        _ => return Err("usage: optchat-e2e login <anthropic|openai> --home <dir>".into()),
+    };
+    let home = home_arg(args)?;
+    let start = zeron_optchat::auth::start_login(provider, home.join("auth.json")).await?;
+    println!("AUTH_URL {}", start.url);
+    println!("MODE {:?} PORT {:?}", start.mode, start.callback_port);
+    let _ = std::io::stdout().flush();
+    let code = start.code;
+    // A blocking reader: an EOF (no terminal) leaves the loopback as the only way in.
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok_and(|n| n > 0) && !line.trim().is_empty() {
+            let _ = code.send(line);
+        } else {
+            std::mem::forget(code);
+        }
+    });
+    let label = start.done.await.map_err(|e| e.to_string())??;
+    println!("SIGNED_IN {label}");
+    Ok(())
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {

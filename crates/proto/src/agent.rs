@@ -23,6 +23,10 @@ pub enum HarnessId {
     /// google's antigravity agent over acp (`agy_acp_server`, installed from
     /// its pinned release archive).
     Antigravity,
+    /// OptChat: an in-process agent whose one endless chat is its memory
+    /// (`crates/optchat`). No CLI; it calls the model APIs directly.
+    #[serde(rename = "optchat")]
+    OptChat,
     /// Test harness; never shown in production pickers.
     Mock,
 }

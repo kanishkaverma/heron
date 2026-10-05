@@ -12966,6 +12966,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-optchat"
+version = "0.2.104"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "zeron-harness",
+ "zeron-proto",
+]
+
+[[package]]
 name = "zeron-preview"
 version = "0.2.104"
 dependencies = [

@@ -7,14 +7,24 @@
 //! tokens, through [`Credentials`], bound once with [`bind`].
 
 pub mod auth;
+mod chat;
+mod compactor;
+#[doc(hidden)]
+pub mod debug;
+mod export;
+mod harness;
+pub mod llm;
+pub mod memory;
+pub mod prompts;
+pub mod store;
+mod tools;
+mod turn;
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
-use zeron_harness::{Harness, HarnessError, RunControls};
-use zeron_proto::{AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
+use zeron_proto::ReasoningLevel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provider {
@@ -58,7 +68,7 @@ impl FileCredentials {
 #[async_trait]
 impl Credentials for FileCredentials {
     async fn token(&self, provider: Provider) -> Result<Token, String> {
-        Err(format!("Sign in to {provider:?} for OptChat"))
+        auth::file_token(&self.path, provider).await
     }
 }
 
@@ -97,37 +107,5 @@ pub struct OptChatHarness;
 impl OptChatHarness {
     pub fn new() -> Self {
         Self
-    }
-}
-
-#[async_trait]
-impl Harness for OptChatHarness {
-    fn id(&self) -> HarnessId {
-        HarnessId::OptChat
-    }
-    fn display_name(&self) -> &str {
-        DISPLAY_NAME
-    }
-    fn supports_steering(&self) -> bool {
-        true
-    }
-    fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::StepBoundary
-    }
-    fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &REASONING_LEVELS
-    }
-    fn deterministic_turn_end(&self) -> bool {
-        true
-    }
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(Vec::new())
-    }
-    async fn run(
-        &self,
-        _request: RunRequest,
-        _controls: RunControls,
-    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        Err(HarnessError::Protocol("OptChat is not implemented yet".into()))
     }
 }

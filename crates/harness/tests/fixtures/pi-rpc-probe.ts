@@ -1,5 +1,16 @@
 import { appendFileSync, existsSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+// `todo-script` drives a real `todo` tool (rpiv-todo) one action per model
+// call; the last one names a missing task so the tool answers with an error.
+const TODO_SCRIPT = [
+  {action:'create', subject:'read'},
+  {action:'create', subject:'fix'},
+  {action:'create', subject:'drop'},
+  {action:'update', id:3, status:'deleted'},
+  {action:'update', id:1, status:'completed'},
+  {action:'update', id:2, status:'in_progress', activeForm:'fixing'},
+  {action:'update', id:99, status:'completed'},
+];
 export default function(pi) {
   pi.on('input', event => {
     if (/^(burst-|late-)/.test(event.text)) {
@@ -37,6 +48,14 @@ export default function(pi) {
         if (options?.signal?.aborted || text === 'error') {
           msg.stopReason = options?.signal?.aborted ? 'aborted' : 'error';msg.errorMessage = 'local mock failure';
           stream.push({type:'error',reason:msg.stopReason,error:msg});stream.end();return;
+        }
+        const step = context.messages.length - 1 - context.messages.findLastIndex(m => m.role === 'user');
+        if (text === 'todo-script' && step < TODO_SCRIPT.length * 2) {
+          const call = {type:'toolCall', id:'todo-'+(step/2), name:'todo', arguments:TODO_SCRIPT[step/2]};
+          msg.content.push(call);msg.stopReason = 'toolUse';
+          stream.push({type:'toolcall_start',contentIndex:0,partial:msg});
+          stream.push({type:'toolcall_end',contentIndex:0,toolCall:call,partial:msg});
+          stream.push({type:'done',reason:'toolUse',message:msg});stream.end();return;
         }
         msg.content.push({type:'text',text:''});
         stream.push({type:'text_start',contentIndex:0,partial:msg});

@@ -19,6 +19,13 @@ needs no history, only the latest `ToolCall::Todo` part.
 | Codex | `turn/plan/updated` (`update_plan`), id `LIVE_PLAN_TOOL_ID` | `inProgress` |
 | Codex | legacy `todoList` item | not exposed |
 | Cursor | `updateTodos` | `status` string, when present |
+| Pi | `todo` result `details.tasks` (rpiv-todo), same tool id | `in_progress` |
+
+Pi's `todo` (`@juicesharp/rpiv-todo`) is the exception to whole-list writes: each
+call is one action, so the call starts as a generic card and its result re-emits
+the same id as `ToolCall::Todo` built from `details.tasks`, minus deleted tasks.
+A result with `details.error` or no `tasks` keeps the generic card
+(`crates/harness/src/pi/normalize.rs`).
 
 `TodoItem` is `{ text, done, status? }` (`crates/proto/src/agent.rs`).
 

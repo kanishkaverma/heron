@@ -12919,6 +12919,7 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+ "zeron-doc",
  "zeron-proto",
  "zip",
 ]

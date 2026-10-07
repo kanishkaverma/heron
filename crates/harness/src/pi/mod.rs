@@ -51,6 +51,17 @@ impl PiHarness {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Everything Pi advertises, including the `skill:` aliases skill discovery binds.
+    async fn catalog_for(
+        &self,
+        cwd: &Path,
+    ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+        self.workspace_commands
+            .get(cwd, async {
+                Ok(catalog::commands(&self.probe(cwd, false).await?))
+            })
+            .await
+    }
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
         self
@@ -297,19 +308,35 @@ impl Harness for PiHarness {
         &self,
         cwd: &Path,
     ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
-        self.workspace_commands
-            .get(cwd, async {
-                Ok(catalog::commands(&self.probe(cwd, false).await?))
-            })
-            .await
+        let mut commands = self.catalog_for(cwd).await?;
+        // The skill row runs a wrapped skill (see `skills`); its `/skill:` alias
+        // would otherwise resurface as a second way to skip the wrapper.
+        let wrapped: std::collections::HashSet<String> = commands
+            .iter()
+            .filter_map(|c| c.name.strip_prefix("skill:"))
+            .filter(|name| catalog::wraps_skill(&commands, name))
+            .map(|name| format!("skill:{name}"))
+            .collect();
+        commands.retain(|c| !wrapped.contains(&c.name));
+        Ok(commands)
     }
     async fn skills(
         &self,
         cwd: &Path,
     ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
         let mut skills = crate::skills::discover(HarnessId::Pi, cwd).await?;
-        let commands = self.commands_for(cwd).await?;
+        let commands = self.catalog_for(cwd).await?;
         crate::skills::attach_advertised_commands(HarnessId::Pi, &mut skills, &commands);
+        // Bind a wrapped skill to its wrapper so the menu shows one row and
+        // picking it keeps the wrapper's behaviour.
+        for skill in &mut skills {
+            if catalog::wraps_skill(&commands, &skill.name) {
+                skill.command = Some(zeron_proto::invocation::SkillCommand {
+                    name: skill.name.clone(),
+                    harness: HarnessId::Pi,
+                });
+            }
+        }
         Ok(Some(skills))
     }
     fn fallback_models(&self) -> Vec<Model> {

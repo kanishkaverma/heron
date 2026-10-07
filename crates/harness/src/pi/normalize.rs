@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::collections::HashMap;
-use zeron_proto::{AgentEvent, DoneStatus, ToolCall, ToolDiff};
+use zeron_proto::{AgentEvent, DoneStatus, TodoItem, TodoStatus, ToolCall, ToolDiff};
 
 #[derive(Default)]
 pub(super) struct Normalizer {
@@ -139,6 +139,17 @@ impl Normalizer {
                         _ => None,
                     }
                 });
+                if let Some(items) = info
+                    .as_ref()
+                    .filter(|(name, _)| name == "todo" && frame["isError"] != true)
+                    .and_then(|_| todo_items(&result["details"]))
+                {
+                    // Same id: the fold swaps the generic card for the checklist.
+                    events.push(AgentEvent::ToolCall {
+                        id: id.clone(),
+                        call: ToolCall::Todo { items },
+                    });
+                }
                 events.push(AgentEvent::ToolResult {
                     id,
                     is_error: frame["isError"].as_bool().unwrap_or(false),
@@ -177,6 +188,28 @@ fn cap(text: &str, limit: usize) -> String {
         at -= 1;
     }
     format!("{}\n… [truncated]", &text[..at])
+}
+/// rpiv-todo's `todo` tool takes one action per call, so its arguments are not
+/// the list. Every result carries the whole list in `details.tasks`. A result
+/// with `details.error` or without `tasks` (another extension's `todo`) is not
+/// a checklist and must not replace one; an empty `tasks` (`clear`) does clear it.
+fn todo_items(details: &Value) -> Option<Vec<TodoItem>> {
+    if !details["error"].is_null() {
+        return None;
+    }
+    let tasks = details["tasks"].as_array()?;
+    Some(
+        tasks
+            .iter()
+            .filter(|task| task["status"] != "deleted")
+            .map(|task| {
+                TodoItem::new(
+                    string(task, "subject"),
+                    TodoStatus::parse(string(task, "status")),
+                )
+            })
+            .collect(),
+    )
 }
 fn tool(name: &str, args: &Value) -> ToolCall {
     match name {
@@ -236,6 +269,16 @@ mod tests {
         let events=n.map(&json!({"type":"tool_execution_end","toolCallId":"t","isError":false,"result":{"content":[{"type":"text","text":"ok"}]}}));
         assert!(
             matches!(&events[0],AgentEvent::ToolResult{id,diff:Some(diff),..} if id=="t" && diff.new_text=="new")
+        );
+    }
+    #[test]
+    fn foreign_todo_tool_without_a_task_list_never_clears_the_panel() {
+        let mut n = Normalizer::default();
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"t","toolName":"todo","args":{"item":"x"}}));
+        let events = n.map(&json!({"type":"tool_execution_end","toolCallId":"t","isError":false,"result":{"content":[{"type":"text","text":"ok"}],"details":{}}}));
+        assert!(
+            matches!(&events[..], [AgentEvent::ToolResult { .. }]),
+            "{events:?}"
         );
     }
 }

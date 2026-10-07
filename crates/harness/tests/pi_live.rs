@@ -340,3 +340,137 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
     );
     assert_eq!(wait_probe_lines(&calls, 3).await.len(), 3);
 }
+
+/// Real Pi + the real `@juicesharp/rpiv-todo` extension, driven by the local
+/// mock model's `todo-script`. rpiv-todo's tool is action-based (one create or
+/// update per call), so the checklist lives only in each result's
+/// `details.tasks`; the panel must follow that, not the call's arguments.
+#[tokio::test]
+#[ignore = "requires Pi >= 0.85.1 and @juicesharp/rpiv-todo installed; uses only a local mock provider"]
+async fn real_pi_rpiv_todo_feeds_the_todo_panel() {
+    use zeron_doc::MessagePart;
+    use zeron_proto::{TodoItem, TodoStatus, ToolCall};
+    let package = std::env::var_os("ZERON_PI_RPIV_TODO")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(&std::env::var("HOME").unwrap())
+                .join(".pi/agent/npm/node_modules/@juicesharp/rpiv-todo")
+        });
+    assert!(
+        package.join("package.json").exists(),
+        "install rpiv-todo or set ZERON_PI_RPIV_TODO: {}",
+        package.display()
+    );
+    let (dir, harness) = isolated_pi();
+    let cwd = dir.path();
+    std::fs::write(
+        cwd.join("agent/settings.json"),
+        serde_json::json!({"retry": {"enabled": false}, "packages": [package]}).to_string(),
+    )
+    .unwrap();
+    let (_steer, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        execution_lease: None,
+        steering,
+        interrupt: CancellationToken::new(),
+        request_input: Box::new(|_| oneshot::channel().1),
+    };
+    let request = RunRequest {
+        prompt: "todo-script".into(),
+        harness: None,
+        model: Some("zeron-probe/mock".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.display().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        resume: None,
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+    };
+    // The engine ends the turn at Done; rpiv-todo keeps Pi alive afterwards.
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("native Pi run must settle");
+    if let Some(path) = std::env::var_os("ZERON_E2E_ARTIFACT") {
+        std::fs::write(path, serde_json::to_string_pretty(&events).unwrap()).unwrap();
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { status, .. }
+            if *status == DoneStatus::Completed)),
+        "{events:#?}"
+    );
+
+    // What the panel shows after each call: fold exactly like the engine does,
+    // then take the newest Todo part (todo_panel::latest_todo).
+    let item = |text: &str, status| TodoItem::new(text, status);
+    let pending = TodoStatus::Pending;
+    let expected: [Option<Vec<TodoItem>>; 7] = [
+        Some(vec![item("read", pending)]),
+        Some(vec![item("read", pending), item("fix", pending)]),
+        Some(vec![
+            item("read", pending),
+            item("fix", pending),
+            item("drop", pending),
+        ]),
+        // Deleted tasks leave the list.
+        Some(vec![item("read", pending), item("fix", pending)]),
+        Some(vec![
+            item("read", TodoStatus::Completed),
+            item("fix", pending),
+        ]),
+        Some(vec![
+            item("read", TodoStatus::Completed),
+            item("fix", TodoStatus::InProgress),
+        ]),
+        // A failed update keeps its plain card; the list above stays current.
+        None,
+    ];
+    let mut parts = Vec::new();
+    for event in &events {
+        zeron_doc::fold_event_into_parts(&mut parts, event);
+    }
+    for (step, want) in expected.iter().enumerate() {
+        let id = format!("todo-{step}");
+        let part = parts
+            .iter()
+            .find_map(|p| match p {
+                MessagePart::Tool {
+                    id: pid,
+                    call,
+                    resolved,
+                    ..
+                } if *pid == id => Some((call, *resolved)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{id} never folded: {parts:#?}"));
+        assert!(part.1, "{id} must resolve");
+        match (want, part.0) {
+            (Some(want), ToolCall::Todo { items }) => assert_eq!(items, want, "{id}"),
+            (None, ToolCall::Unknown { name, .. }) => assert_eq!(name, "todo", "{id}"),
+            (want, got) => panic!("{id}: expected {want:?}, folded {got:?}"),
+        }
+    }
+    let panel = parts.iter().rev().find_map(|p| match p {
+        MessagePart::Tool {
+            call: ToolCall::Todo { items },
+            ..
+        } => Some(items.clone()),
+        _ => None,
+    });
+    assert_eq!(panel, expected[5], "panel shows the last good list");
+}

@@ -66,6 +66,22 @@ fn thinking_option(data: &Value) -> Vec<ModelOption> {
         ],
     }]
 }
+/// Commands Zeron runs itself (see [`builtin`]); Pi's RPC catalog omits them.
+pub(super) const BUILTINS: [(&str, &str); 7] = [
+    ("compact", "Compact context"),
+    ("session", "Session statistics"),
+    ("name", "Set session name"),
+    ("export", "Export session to HTML"),
+    ("autocompact", "Toggle automatic compaction"),
+    ("steering", "Steering queue mode"),
+    ("follow-up", "Follow-up queue mode"),
+];
+/// Packages pair a skill with an extension command of the same name that wraps
+/// it (pi-pstack's /bro, /poteto-mode). Zeron's builtins intercept their names,
+/// so they never wrap a skill.
+pub(super) fn wraps_skill(commands: &[SlashCommand], skill: &str) -> bool {
+    commands.iter().any(|c| c.name == skill) && !BUILTINS.iter().any(|(name, _)| *name == skill)
+}
 pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
     let mut commands: Vec<_> = data["commands"]
         .as_array()
@@ -80,15 +96,7 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
             })
         })
         .collect();
-    for (name, description) in [
-        ("compact", "Compact context"),
-        ("session", "Session statistics"),
-        ("name", "Set session name"),
-        ("export", "Export session to HTML"),
-        ("autocompact", "Toggle automatic compaction"),
-        ("steering", "Steering queue mode"),
-        ("follow-up", "Follow-up queue mode"),
-    ] {
+    for (name, description) in BUILTINS {
         if !commands.iter().any(|c| c.name == name) {
             commands.push(SlashCommand {
                 name: name.into(),

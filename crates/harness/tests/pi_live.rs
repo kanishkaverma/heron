@@ -775,3 +775,97 @@ async fn real_pi_tree_jump_in_a_parked_runner() {
         "and so does the next process"
     );
 }
+
+fn id_of(tree: &zeron_proto::SessionTree, text: &str) -> String {
+    tree.entries
+        .iter()
+        .find(|e| e.text == text)
+        .unwrap_or_else(|| panic!("no row {text:?} in {:?}", rows(tree)))
+        .id
+        .clone()
+}
+
+/// Jumps at the edges of a conversation, in a fresh Pi process per turn.
+/// Ways it fails:
+/// - Jumping to the very first message leaves the old turns in the model's
+///   context, or leaves the session unreadable.
+/// - A summarising jump away from a point that holds no conversation, only
+///   the bookkeeping every new Pi process and every jump leaves behind, adds a
+///   "nothing to summarise" summary to the context, or says a summary was made.
+#[tokio::test]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
+async fn real_pi_tree_jumps_to_the_first_message_and_never_summarises_nothing() {
+    let (dir, harness) = isolated_pi();
+    let cwd = dir.path();
+    let mut session = String::new();
+    for prompt in ["one", "two", "three"] {
+        session = turn(
+            &harness,
+            cwd,
+            prompt,
+            (!session.is_empty()).then_some(&*session),
+        )
+        .await
+        .1;
+    }
+    let tree = harness.session_tree(&session, cwd).await.unwrap().unwrap();
+    let (one, two, three) = (
+        id_of(&tree, "one"),
+        id_of(&tree, "two"),
+        id_of(&tree, "MOCK:three"),
+    );
+
+    turn(
+        &harness,
+        cwd,
+        &format!("/zeron-tree-jump {two}"),
+        Some(&session),
+    )
+    .await;
+    let (events, _) = turn(
+        &harness,
+        cwd,
+        &format!("/zeron-tree-jump {three} summarize"),
+        Some(&session),
+    )
+    .await;
+    let said = reply(&events);
+    assert!(
+        !said.contains("summary of the branch"),
+        "claims a summary nobody made: {said}"
+    );
+    let (events, _) = turn(&harness, cwd, "ctx?", Some(&session)).await;
+    assert_eq!(
+        reply(&events).trim(),
+        "MOCK:ctx=one|two|three|ctx?",
+        "nothing was abandoned, so nothing is summarised into the context"
+    );
+    let tree = harness.session_tree(&session, cwd).await.unwrap().unwrap();
+    assert!(
+        tree.entries
+            .iter()
+            .all(|e| e.kind != zeron_proto::TreeEntryKind::Summary),
+        "{:?}",
+        rows(&tree)
+    );
+
+    let (events, _) = turn(
+        &harness,
+        cwd,
+        &format!("/zeron-tree-jump {one}"),
+        Some(&session),
+    )
+    .await;
+    assert!(reply(&events).contains("one"), "{}", reply(&events));
+    let (events, _) = turn(&harness, cwd, "ctx?", Some(&session)).await;
+    assert_eq!(
+        reply(&events).trim(),
+        "MOCK:ctx=ctx?",
+        "the first message is a rewind to an empty conversation"
+    );
+    let tree = harness.session_tree(&session, cwd).await.unwrap().unwrap();
+    assert_eq!(
+        tree.leaf_id.as_deref(),
+        Some(id_of(&tree, "MOCK:ctx=ctx?").as_str())
+    );
+}

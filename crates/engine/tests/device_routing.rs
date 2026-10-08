@@ -32,7 +32,8 @@ use zeron_engine::{
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
     AgentEvent, ChangeRequestState, ChangeRequestSummary, DoneStatus, HarnessId, Model,
-    ReasoningLevel, RunRequest, SandboxLevel, SteeringMode,
+    ReasoningLevel, RunRequest, SandboxLevel, SessionTree, SessionTreeReply, SteeringMode,
+    TreeEntry, TreeEntryKind,
 };
 use zeron_rpc::{
     DeviceFrameHeader, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig, RpcError, RpcReply,
@@ -153,6 +154,23 @@ impl Harness for InstantHarness {
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         Ok(vec![])
+    }
+    async fn session_tree(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) -> Result<Option<SessionTree>, HarnessError> {
+        Ok(Some(SessionTree {
+            leaf_id: Some("only".into()),
+            entries: vec![TreeEntry {
+                id: "only".into(),
+                depth: 0,
+                kind: TreeEntryKind::Assistant,
+                text: format!("{session_id} in {}", cwd.display()),
+                label: None,
+                on_path: true,
+            }],
+        }))
     }
     async fn run(
         &self,
@@ -1846,6 +1864,84 @@ async fn queue_watch_and_single_consumption_route_to_the_remote_chat_host() {
 
     core_a.shutdown().await;
     core_b.shutdown().await;
+}
+
+/// `/tree` on a chat that lives on another device reads that device's session.
+/// Ways it fails:
+/// - `GetSessionTree` is not device-addressable, so the forwarding engine
+///   answers from its own disk (where the chat and its session file are not).
+/// - The host answers with a session or cwd other than the chat's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_tree_of_a_remote_chat_is_read_on_its_host() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().unwrap();
+    let host = assemble(&dirs.path().join("b"), "device-b");
+    host.workspace
+        .create_chat(
+            "remote-chat",
+            None,
+            Some("device-b"),
+            None,
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    host.workspace
+        .set_chat_config(
+            "remote-chat",
+            &zeron_proto::ChatConfig {
+                harness: HarnessId::Mock,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            },
+        )
+        .unwrap();
+    host.workspace
+        .set_chat_harness_session("remote-chat", "pi-session-on-b", "/work/on-b");
+    let _host_relay = host.start_host_relay(&relay_url);
+
+    let viewer = assemble(&dirs.path().join("a"), "device-a");
+    let mut config = LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    config.probe_timeout = Duration::from_secs(5);
+    viewer.set_links(LinkCache::new(config));
+    let client = zeron_rpc::memory_client(viewer.rpc_service());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let reply = loop {
+        match client
+            .call_as::<SessionTreeReply>(
+                methods::GET_SESSION_TREE,
+                serde_json::json!({"chatId": "remote-chat", "targetDeviceId": "device-b"}),
+            )
+            .await
+        {
+            Ok(reply) => break reply,
+            Err(error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "relay never came up: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    let tree = reply.tree.expect("the host's chat has a session tree");
+    assert_eq!(tree.entries[0].text, "pi-session-on-b in /work/on-b");
+
+    let unaddressed = client
+        .call(
+            methods::GET_SESSION_TREE,
+            serde_json::json!({"chatId": "remote-chat"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        unaddressed.to_string().contains("chat not found"),
+        "without a target the viewer's own disk is asked: {unaddressed}"
+    );
+    viewer.shutdown().await;
+    host.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

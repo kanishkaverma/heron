@@ -1,5 +1,8 @@
 // Per-run Zeron bridge for Pi's /tree. Pi's RPC has no navigate command, and
 // only an extension command can reach ctx.navigateTree. No settings are modified.
+const MARKER = "zeron-tree-jump";
+const CONVERSATION = new Set(["message", "custom_message", "branch_summary", "compaction"]);
+
 export default function (pi) {
   const quote = (text) => {
     const flat = String(text).replace(/\s+/g, " ").trim();
@@ -20,22 +23,29 @@ export default function (pi) {
         }
         const entry = id && ctx.sessionManager.getEntry(id);
         if (!entry) throw new Error(`There is no entry ${id ?? ""} in this session.`);
-        const summarize = mode === "summarize";
-        const result = await ctx.navigateTree(id, { summarize });
+        // Every Pi process, and every jump, leaves bookkeeping entries at the
+        // leaf. Leaving only those behind abandons no conversation, and
+        // asking Pi to summarise it yields a summary of nothing.
+        const kept = new Set(ctx.sessionManager.getBranch(id).map((e) => e.id));
+        const left = ctx.sessionManager
+          .getBranch()
+          .filter((e) => !kept.has(e.id) && CONVERSATION.has(e.type));
+        const result = await ctx.navigateTree(id, { summarize: mode === "summarize" && left.length > 0 });
         if (result.cancelled) {
           ctx.ui.notify("The jump was cancelled.", "warning");
           return;
         }
+        const summarized = ctx.sessionManager.getLeafEntry()?.type === "branch_summary";
         // Pi keeps the leaf in memory and resumes at the last entry of the file.
         // Appending one entry at the new leaf makes the jump outlive this process.
-        pi.appendEntry("zeron-tree-jump", { target: id });
+        pi.appendEntry(MARKER, { target: id });
         const message = entry.type === "message" ? entry.message : undefined;
         const where =
           message?.role === "user"
             ? `Went back to before ${quote(textOf(message.content))}. Continue from here, or edit and resend it.`
             : `Continuing from ${quote(message ? textOf(message.content) : entry.type)}.`;
         ctx.ui.notify(
-          summarize ? `${where} A summary of the branch you left is now part of the context.` : where,
+          summarized ? `${where} A summary of the branch you left is now part of the context.` : where,
           "info",
         );
       } catch (error) {

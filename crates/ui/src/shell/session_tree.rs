@@ -20,13 +20,18 @@ pub(super) struct TreePalette {
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
     focus_pending: bool,
-    scroll: gpui::ScrollHandle,
+    pub(super) scroll: gpui::ScrollHandle,
+    /// The cursor still has to be scrolled into view. A scroll handle learns
+    /// its viewport while the list is laid out, and drops a request made
+    /// before that, so the request is repeated until the list has been laid
+    /// out once.
+    reveal: bool,
     load: Load,
     /// The row under the cursor, by id so narrowing the list cannot strand it.
     cursor: Option<String>,
     pub(super) notice: Option<SharedString>,
     enter_press: EnterPress,
-    task: Option<gpui::Task<()>>,
+    _load: gpui::Task<()>,
     _search_events: Subscription,
 }
 
@@ -70,7 +75,7 @@ impl Shell {
                 cx.notify();
             }
         });
-        let task = self.load_session_tree(&chat_id, cx);
+        let load = self.load_session_tree(&chat_id, cx);
         self.tree_palette = Some(TreePalette {
             chat_id,
             search,
@@ -78,21 +83,18 @@ impl Shell {
             previous_focus: window.focused(cx),
             focus_pending: true,
             scroll: gpui::ScrollHandle::new(),
+            reveal: false,
             load: Load::Loading,
             cursor: None,
             notice: None,
             enter_press: EnterPress::default(),
-            task,
+            _load: load,
             _search_events: events,
         });
         cx.notify();
     }
 
-    fn load_session_tree(
-        &mut self,
-        chat_id: &str,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::Task<()>> {
+    fn load_session_tree(&mut self, chat_id: &str, cx: &mut Context<Self>) -> gpui::Task<()> {
         let state = self.state.read(cx);
         let mut params = serde_json::json!({ "chatId": chat_id });
         if let Some(chat) = state.selected_chat_row()
@@ -102,7 +104,7 @@ impl Shell {
         }
         let engine = state.engine().cloned();
         let chat_id = chat_id.to_owned();
-        Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let reply = match engine {
                 Some(engine) => engine
                     .client()
@@ -124,6 +126,7 @@ impl Shell {
                 };
                 palette.load = match reply {
                     Ok(SessionTreeReply { tree: Some(tree) }) => {
+                        palette.reveal = true;
                         palette.cursor = tree
                             .leaf_id
                             .clone()
@@ -138,7 +141,7 @@ impl Shell {
                 cx.notify();
             })
             .ok();
-        }))
+        })
     }
 
     pub(super) fn close_session_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -273,6 +276,18 @@ impl Shell {
         let palette = self.tree_palette.as_mut()?;
         if std::mem::take(&mut palette.focus_pending) {
             window.focus(&palette.search.focus_handle(cx), cx);
+        }
+        let at = cursor
+            .as_ref()
+            .and_then(|c| entries.iter().position(|e| e.id == c.id));
+        if palette.reveal
+            && let Some(at) = at
+        {
+            palette.scroll.scroll_to_item(at);
+            palette.reveal = palette.scroll.bounds().size.height <= px(0.0);
+            if palette.reveal {
+                cx.notify();
+            }
         }
         let search = palette.search.clone();
         let query = search.read(cx).text().to_string();

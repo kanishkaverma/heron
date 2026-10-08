@@ -26,7 +26,10 @@ use zeron_proto::{
     SessionTree, SteeringMode, TreeEntry, TreeEntryKind,
 };
 
-struct FakePi(Arc<Mutex<Vec<RunRequest>>>);
+struct FakePi {
+    runs: Arc<Mutex<Vec<RunRequest>>>,
+    tree: SessionTree,
+}
 
 #[async_trait]
 impl Harness for FakePi {
@@ -54,33 +57,14 @@ impl Harness for FakePi {
         _: &std::path::Path,
     ) -> Result<Option<SessionTree>, HarnessError> {
         assert_eq!(session_id, "pi-session-1");
-        let entry = |id: &str, depth, kind, text: &str, on_path| TreeEntry {
-            id: id.into(),
-            depth,
-            kind,
-            text: text.into(),
-            label: None,
-            on_path,
-        };
-        use TreeEntryKind::{Assistant as A, User as U};
-        Ok(Some(SessionTree {
-            leaf_id: Some("a2".into()),
-            entries: vec![
-                entry("u1", 0, U, "one", true),
-                entry("a1", 0, A, "reply one", true),
-                entry("u2", 1, U, "two (new)", true),
-                entry("a2", 1, A, "reply two (new)", true),
-                entry("u3", 1, U, "two (old)", false),
-                entry("a3", 1, A, "reply two (old)", false),
-            ],
-        }))
+        Ok(Some(self.tree.clone()))
     }
     async fn run(
         &self,
         request: RunRequest,
         _: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        self.0.lock().unwrap().push(request);
+        self.runs.lock().unwrap().push(request);
         Ok(futures::stream::iter([Ok(AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
@@ -102,18 +86,31 @@ fn settle(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestApp
     panic!("timed out waiting for {what}");
 }
 
-#[gpui::test]
-fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+struct Fixture {
+    _dir: tempfile::TempDir,
+    runs: Arc<Mutex<Vec<RunRequest>>>,
+    core: zeron_engine::EngineCore,
+    window: gpui::WindowHandle<Shell>,
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .unwrap();
-    let _guard = runtime.enter();
+        .unwrap()
+}
+
+/// A shell on a Pi chat `c` whose session is `tree`. The caller has entered
+/// a runtime.
+fn fixture(cx: &mut TestAppContext, tree: SessionTree) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let runs = Arc::new(Mutex::new(Vec::new()));
     let registry = zeron_engine::HarnessRegistry::new();
-    registry.register(Arc::new(FakePi(runs.clone())));
+    registry.register(Arc::new(FakePi {
+        runs: runs.clone(),
+        tree,
+    }));
     let core = zeron_engine::EngineCore::assemble(
         &dir.path().join("engine"),
         Arc::new(registry),
@@ -182,6 +179,47 @@ fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
             shell.debug_gate = Some(crate::state::GatePhase::Ready);
         })
         .unwrap();
+    Fixture {
+        _dir: dir,
+        runs,
+        core,
+        window,
+    }
+}
+
+fn six_rows() -> SessionTree {
+    let entry = |id: &str, depth, kind, text: &str, on_path| TreeEntry {
+        id: id.into(),
+        depth,
+        kind,
+        text: text.into(),
+        label: None,
+        on_path,
+    };
+    use TreeEntryKind::{Assistant as A, User as U};
+    SessionTree {
+        leaf_id: Some("a2".into()),
+        entries: vec![
+            entry("u1", 0, U, "one", true),
+            entry("a1", 0, A, "reply one", true),
+            entry("u2", 1, U, "two (new)", true),
+            entry("a2", 1, A, "reply two (new)", true),
+            entry("u3", 1, U, "two (old)", false),
+            entry("a3", 1, A, "reply two (old)", false),
+        ],
+    }
+}
+
+#[gpui::test]
+fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let _guard = runtime.enter();
+    let Fixture {
+        _dir,
+        runs,
+        core,
+        window,
+    } = fixture(cx, six_rows());
     let draw = |cx: &mut TestAppContext| {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap()
@@ -338,5 +376,68 @@ fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
     window
         .update(cx, |shell, _, _| assert!(shell.tree_palette.is_none()))
         .unwrap();
+    runtime.block_on(core.shutdown());
+}
+
+/// A long conversation puts the current position far down the list.
+/// Ways it fails:
+/// - The palette opens at the top with the highlighted current position
+///   scrolled out of sight, so Enter acts on a row nobody can see.
+#[gpui::test]
+fn the_current_position_is_in_view_when_the_palette_opens(cx: &mut TestAppContext) {
+    let runtime = runtime();
+    let _guard = runtime.enter();
+    let mut long = six_rows();
+    long.entries = (0..150)
+        .flat_map(|turn| {
+            let entry = |kind, text: String| TreeEntry {
+                id: format!("{turn}-{text}"),
+                depth: 0,
+                kind,
+                text,
+                label: None,
+                on_path: true,
+            };
+            [
+                entry(TreeEntryKind::User, "question".into()),
+                entry(TreeEntryKind::Assistant, "answer".into()),
+            ]
+        })
+        .collect();
+    long.leaf_id = long.entries.last().map(|entry| entry.id.clone());
+    let rows = long.entries.len();
+    let Fixture {
+        _dir, core, window, ..
+    } = fixture(cx, long);
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap()
+    };
+    window
+        .update(cx, |shell, _, cx| {
+            shell.pending_workspace_command = Some(crate::composer::WorkspaceCommand::Tree);
+            cx.notify();
+        })
+        .unwrap();
+    draw(cx);
+    settle(cx, "the tree to load", |cx| {
+        draw(cx);
+        window
+            .update(cx, |shell, _, cx| shell.tree_entries(cx).len() == rows)
+            .unwrap()
+    });
+    draw(cx);
+    draw(cx);
+    let (top, bottom) = window
+        .update(cx, |shell, _, _| {
+            let scroll = &shell.tree_palette.as_ref().unwrap().scroll;
+            (scroll.top_item(), scroll.bottom_item())
+        })
+        .unwrap();
+    assert!(
+        (top..=bottom).contains(&(rows - 1)),
+        "rows {top}..={bottom} are in view, the current position is row {}",
+        rows - 1
+    );
     runtime.block_on(core.shutdown());
 }

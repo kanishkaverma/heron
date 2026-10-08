@@ -5735,15 +5735,14 @@ impl WorkspaceCommand {
 fn with_workspace_commands(
     mut rows: Vec<InvocationCandidate>,
     in_chat: bool,
-    harness: Option<HarnessId>,
+    tree: bool,
 ) -> Vec<InvocationCandidate> {
     rows.retain(|row| row.workspace_command.is_none());
     for &(command, name, description, needs_chat) in WorkspaceCommand::catalog() {
         if needs_chat && !in_chat {
             continue;
         }
-        // Only Pi sessions are trees.
-        if command == WorkspaceCommand::Tree && harness != Some(HarnessId::Pi) {
+        if command == WorkspaceCommand::Tree && !tree {
             continue;
         }
         // Keep provider commands intact. Explicit Zeron names remain available
@@ -7998,6 +7997,9 @@ impl Composer {
     /// harness's command list on each open, filter locally per keystroke.
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
         let harness = self.pickers.read(cx).resolved(cx).harness;
+        // `/tree` opens the shell's palette on the chat the shell has
+        // selected. A side chat is not that chat.
+        let tree = harness == Some(HarnessId::Pi) && !self.side_chat;
         let preferences =
             crate::settings::current(cx).skill_completion(harness.unwrap_or(HarnessId::Codex));
         let (token, skill, include_skills, commands_allowed) =
@@ -8056,11 +8058,7 @@ impl Composer {
         if harness.is_none() && !skill && commands_allowed {
             self.slash_cache.insert(
                 context.clone(),
-                with_workspace_commands(
-                    vec![],
-                    self.state.read(cx).selected_chat.is_some(),
-                    harness,
-                ),
+                with_workspace_commands(vec![], self.state.read(cx).selected_chat.is_some(), tree),
             );
         }
         if harness.is_none()
@@ -8077,7 +8075,7 @@ impl Composer {
                     with_workspace_commands(
                         vec![],
                         self.state.read(cx).selected_chat.is_some(),
-                        harness,
+                        tree,
                     ),
                 );
                 self.slash.error = Some("Agent command discovery requires a connection".into());
@@ -8140,7 +8138,7 @@ impl Composer {
                             with_workspace_commands(
                                 candidates,
                                 composer.state.read(cx).selected_chat.is_some(),
-                                harness,
+                                tree,
                             )
                         } else {
                             candidates
@@ -8156,7 +8154,7 @@ impl Composer {
                                 with_workspace_commands(
                                     vec![],
                                     composer.state.read(cx).selected_chat.is_some(),
-                                    harness,
+                                    tree,
                                 ),
                             );
                         }
@@ -12366,7 +12364,7 @@ mod tests {
             ],
             vec![],
         );
-        let rows = with_workspace_commands(native, true, None);
+        let rows = with_workspace_commands(native, true, false);
         assert_eq!(rows.len(), 11);
         assert!(rows[0].workspace_command.is_none());
         assert_eq!(rows[0].input_hint.as_deref(), Some("model id"));
@@ -12376,26 +12374,15 @@ mod tests {
             workspace_command_for_text("/zeron:zeron:model", &rows),
             Some(WorkspaceCommand::Model)
         );
-        assert_eq!(with_workspace_commands(rows, true, None).len(), 11);
-        let draft_rows = with_workspace_commands(vec![], false, None);
+        assert_eq!(with_workspace_commands(rows, true, false).len(), 11);
+        let draft_rows = with_workspace_commands(vec![], false, false);
         assert_eq!(draft_rows.len(), 4);
-        let tree = |chat, harness| {
-            workspace_command_for_text("/tree", &with_workspace_commands(vec![], chat, harness))
+        let tree = |chat, tree| {
+            workspace_command_for_text("/tree", &with_workspace_commands(vec![], chat, tree))
         };
-        assert_eq!(
-            tree(true, Some(HarnessId::Pi)),
-            Some(WorkspaceCommand::Tree)
-        );
-        assert_eq!(
-            tree(true, Some(HarnessId::ClaudeCode)),
-            None,
-            "only Pi sessions branch"
-        );
-        assert_eq!(
-            tree(false, Some(HarnessId::Pi)),
-            None,
-            "needs a conversation"
-        );
+        assert_eq!(tree(true, true), Some(WorkspaceCommand::Tree));
+        assert_eq!(tree(true, false), None);
+        assert_eq!(tree(false, true), None, "needs a conversation");
         assert_eq!(workspace_command_for_text("/diff", &draft_rows), None);
         assert_eq!(
             workspace_command_for_text("/model  ", &draft_rows),
@@ -12453,6 +12440,57 @@ mod tests {
             assert!(composer.failure.is_none());
         });
         assert_eq!(actions.borrow().len(), 2);
+    }
+
+    /// `/tree` opens the shell's palette on the chat the shell has selected.
+    /// Ways it fails:
+    /// - A side chat's composer offers `/tree`, so typing it there browses
+    ///   (and jumps) the parent conversation instead of the side chat.
+    /// - Another agent's chat offers it, though only Pi sessions branch.
+    /// - A Pi chat's own composer stops offering it.
+    #[gpui::test]
+    fn tree_is_offered_only_by_a_pi_chats_own_composer(cx: &mut gpui::TestAppContext) {
+        let typed_tree = |harness: &str, side_chat: bool, cx: &mut gpui::TestAppContext| {
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, cx| {
+                state.chats = vec![
+                    serde_json::from_value(serde_json::json!({
+                        "id": "chat", "deviceId": "local", "cwd": "/tmp/chat",
+                        "archived": false, "createdAt": chrono::Utc::now(),
+                        "config": { "harness": harness, "sandbox": "workspace-write" },
+                    }))
+                    .unwrap(),
+                ];
+                state.select_chat(Some("chat".into()), cx);
+            });
+            let composer = cx.new(|cx| {
+                let mut composer = Composer::new(state, cx);
+                if side_chat {
+                    composer.set_side_chat(cx);
+                }
+                composer
+            });
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let captured = seen.clone();
+            let _subscription = cx.update(|cx| {
+                cx.subscribe(&composer, move |_, event: &ComposerEvent, _| {
+                    if let ComposerEvent::WorkspaceCommand(command) = event {
+                        captured.borrow_mut().push(*command);
+                    }
+                })
+            });
+            composer.update(cx, |composer, cx| {
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("/tree", cx));
+                composer.update_slash("/tree", 5, cx);
+                composer.on_submit(cx);
+            });
+            seen.take()
+        };
+        assert_eq!(typed_tree("pi", false, cx), [WorkspaceCommand::Tree]);
+        assert_eq!(typed_tree("pi", true, cx), []);
+        assert_eq!(typed_tree("claude-code", false, cx), []);
     }
 
     #[gpui::test]

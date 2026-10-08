@@ -76,7 +76,7 @@ impl Harness for FakePi {
 }
 
 fn settle(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestAppContext) -> bool) {
-    for _ in 0..300 {
+    for _ in 0..1500 {
         cx.run_until_parked();
         if done(cx) {
             return;
@@ -88,9 +88,16 @@ fn settle(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestApp
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    runs: Arc<Mutex<Vec<RunRequest>>>,
     core: zeron_engine::EngineCore,
     window: gpui::WindowHandle<Shell>,
+}
+
+/// The Pi chat `c` the shell opens on.
+struct PiChat<'a> {
+    cwd: &'a str,
+    model: Option<&'a str>,
+    /// The harness session it has already run, if any.
+    session: Option<&'a str>,
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -101,16 +108,11 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// A shell on a Pi chat `c` whose session is `tree`. The caller has entered
-/// a runtime.
-fn fixture(cx: &mut TestAppContext, tree: SessionTree) -> Fixture {
+/// A shell on `chat`, run by `pi`. The caller has entered a runtime.
+fn fixture(cx: &mut TestAppContext, pi: Arc<dyn Harness>, chat: PiChat) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let runs = Arc::new(Mutex::new(Vec::new()));
     let registry = zeron_engine::HarnessRegistry::new();
-    registry.register(Arc::new(FakePi {
-        runs: runs.clone(),
-        tree,
-    }));
+    registry.register(pi);
     let core = zeron_engine::EngineCore::assemble(
         &dir.path().join("engine"),
         Arc::new(registry),
@@ -119,22 +121,31 @@ fn fixture(cx: &mut TestAppContext, tree: SessionTree) -> Fixture {
     )
     .unwrap();
     core.workspace
-        .create_chat("c", None, Some(&core.device_id), None, Some("/work".into()))
+        .create_chat(
+            "c",
+            None,
+            Some(&core.device_id),
+            None,
+            Some(chat.cwd.into()),
+        )
         .unwrap();
+    core.workspace.rename_chat("c", "A Pi chat").unwrap();
     core.workspace
         .set_chat_config(
             "c",
             &ChatConfig {
                 harness: HarnessId::Pi,
-                model: None,
+                model: chat.model.map(str::to_owned),
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
             },
         )
         .unwrap();
-    core.workspace
-        .set_chat_harness_session("c", "pi-session-1", "/work");
+    if let Some(session) = chat.session {
+        core.workspace
+            .set_chat_harness_session("c", session, chat.cwd);
+    }
 
     cx.executor().allow_parking();
     cx.update(|cx| {
@@ -181,11 +192,23 @@ fn fixture(cx: &mut TestAppContext, tree: SessionTree) -> Fixture {
         .unwrap();
     Fixture {
         _dir: dir,
-        runs,
         core,
         window,
     }
 }
+
+fn fake_pi(tree: SessionTree, runs: &Arc<Mutex<Vec<RunRequest>>>) -> Arc<dyn Harness> {
+    Arc::new(FakePi {
+        runs: runs.clone(),
+        tree,
+    })
+}
+
+const FAKE_CHAT: PiChat = PiChat {
+    cwd: "/work",
+    model: None,
+    session: Some("pi-session-1"),
+};
 
 fn six_rows() -> SessionTree {
     let entry = |id: &str, depth, kind, text: &str, on_path| TreeEntry {
@@ -214,12 +237,8 @@ fn six_rows() -> SessionTree {
 fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
     let runtime = runtime();
     let _guard = runtime.enter();
-    let Fixture {
-        _dir,
-        runs,
-        core,
-        window,
-    } = fixture(cx, six_rows());
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let Fixture { _dir, core, window } = fixture(cx, fake_pi(six_rows(), &runs), FAKE_CHAT);
     let draw = |cx: &mut TestAppContext| {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap()
@@ -408,7 +427,7 @@ fn the_current_position_is_in_view_when_the_palette_opens(cx: &mut TestAppContex
     let rows = long.entries.len();
     let Fixture {
         _dir, core, window, ..
-    } = fixture(cx, long);
+    } = fixture(cx, fake_pi(long, &Default::default()), FAKE_CHAT);
     let draw = |cx: &mut TestAppContext| {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap()
@@ -439,5 +458,239 @@ fn the_current_position_is_in_view_when_the_palette_opens(cx: &mut TestAppContex
         "rows {top}..={bottom} are in view, the current position is row {}",
         rows - 1
     );
+    runtime.block_on(core.shutdown());
+}
+
+/// Real Pi (a local mock provider, no network) behind the real engine and
+/// shell: browse, jump, and see what the conversation and the next turn do.
+fn isolated_pi(dir: &std::path::Path) -> zeron_harness::PiHarness {
+    use std::os::unix::fs::PermissionsExt;
+    let agent = dir.join("agent");
+    std::fs::create_dir_all(agent.join("extensions")).unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        r#"{"retry":{"enabled":false}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        agent.join("extensions/probe.ts"),
+        include_str!("../../../harness/tests/fixtures/pi-rpc-probe.ts"),
+    )
+    .unwrap();
+    let exe = zeron_harness::PiHarness::new()
+        .resolve_executable()
+        .expect("Pi CLI installed");
+    let quote =
+        |p: &std::path::Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+    let wrapper = dir.join("pi-probe");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport PI_CODING_AGENT_DIR={}\nexec {} \"$@\"\n",
+            quote(&agent),
+            quote(&exe)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    zeron_harness::PiHarness::new()
+        .with_executable(wrapper)
+        .with_agent_dir(&agent)
+        .with_session_store(dir.join("index"))
+}
+
+/// The conversation as the chat's transcript holds it: who said what.
+fn transcript(core: &zeron_engine::EngineCore) -> Vec<(zeron_doc::MessageRole, String)> {
+    core.doc_host
+        .open("c")
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap()
+        .into_iter()
+        .map(|entry| {
+            let text = entry
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    zeron_doc::MessagePart::Text { text, .. } => Some(text.trim()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (entry.role, text)
+        })
+        .collect()
+}
+
+/// Ways it fails:
+/// - The jump does not reach Pi as a jump, or Pi never answers, so the
+///   transcript shows nothing of it.
+/// - The transcript does not say where the conversation went.
+/// - The turn after a jump still carries the turns that were left behind, or
+///   the abandoned turns vanish from the palette instead of staying as a branch.
+/// - The message jumped back to does not come back into the composer.
+#[gpui::test]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
+fn a_jump_in_a_real_pi_chat_changes_what_the_next_turn_sees(cx: &mut TestAppContext) {
+    use zeron_doc::MessageRole::{Assistant, User};
+    let runtime = runtime();
+    let _guard = runtime.enter();
+    let work = tempfile::tempdir().unwrap();
+    let Fixture {
+        _dir, core, window, ..
+    } = fixture(
+        cx,
+        Arc::new(isolated_pi(work.path())),
+        PiChat {
+            cwd: work.path().to_str().unwrap(),
+            model: Some("zeron-probe/mock"),
+            session: None,
+        },
+    );
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap()
+    };
+    let say = |cx: &mut TestAppContext, text: &str| {
+        let replies = |core: &zeron_engine::EngineCore| {
+            transcript(core)
+                .iter()
+                .filter(|(role, _)| *role == Assistant)
+                .count()
+        };
+        let before = replies(&core);
+        window
+            .update(cx, |shell, _, cx| {
+                shell
+                    .composer
+                    .update(cx, |composer, cx| composer.send_aside(text.into(), cx))
+            })
+            .unwrap();
+        settle(cx, "the agent to answer", |_| {
+            replies(&core) == before + 1
+                && core
+                    .doc_host
+                    .open("c")
+                    .unwrap()
+                    .doc()
+                    .read_entries()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|entry| entry.status == Some(zeron_doc::MessageStatus::Complete))
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.begin_pending_send("c", "done", chrono::Utc::now());
+                    state.end_pending_send("c", "done");
+                });
+            })
+            .unwrap();
+    };
+    let rows = |cx: &mut TestAppContext| -> Vec<String> {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.tree_entries(cx).into_iter().map(|e| e.text).collect()
+            })
+            .unwrap()
+    };
+    let open_tree = |cx: &mut TestAppContext, rows_expected: usize| {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.pending_workspace_command = Some(crate::composer::WorkspaceCommand::Tree);
+                cx.notify();
+            })
+            .unwrap();
+        draw(cx);
+        settle(cx, "the tree to load", |cx| {
+            draw(cx);
+            window
+                .update(cx, |shell, _, cx| {
+                    shell.tree_entries(cx).len() == rows_expected
+                })
+                .unwrap()
+        });
+    };
+
+    draw(cx);
+    for text in ["one", "two", "three"] {
+        say(cx, text);
+    }
+    open_tree(cx, 6);
+    assert_eq!(
+        rows(cx),
+        ["one", "MOCK:one", "two", "MOCK:two", "three", "MOCK:three"]
+    );
+    let two = window
+        .update(cx, |shell, _, cx| shell.tree_entries(cx)[2].id.clone())
+        .unwrap();
+    // The parked Pi treats output in the first second after a turn as that
+    // turn's tail, so wait the way a person browsing the palette would.
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    cx.simulate_keystrokes(window.into(), "up up up enter");
+    settle(cx, "Pi to answer the jump", |_| {
+        transcript(&core).len() == 8
+    });
+    let timeline = transcript(&core);
+    assert_eq!(
+        timeline[6..],
+        [
+            (User, format!("/zeron-tree-jump {two}")),
+            (
+                Assistant,
+                "Went back to before “two”. Continue from here, or edit and resend it.".into()
+            ),
+        ],
+        "the transcript says where the conversation went"
+    );
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(shell.composer.read(cx).draft_text(cx), "two");
+        })
+        .unwrap();
+    window
+        .update(cx, |shell, _, cx| {
+            shell.state.update(cx, |state, _| {
+                state.begin_pending_send("c", "done", chrono::Utc::now());
+                state.end_pending_send("c", "done");
+            });
+        })
+        .unwrap();
+
+    say(cx, "ctx?");
+    assert_eq!(
+        transcript(&core).last().unwrap().1,
+        "MOCK:ctx=one|ctx?",
+        "the model no longer sees the turns jumped over"
+    );
+    open_tree(cx, 8);
+    assert_eq!(
+        rows(cx),
+        [
+            "one",
+            "MOCK:one",
+            "ctx?",
+            "MOCK:ctx=one|ctx?",
+            "two",
+            "MOCK:two",
+            "three",
+            "MOCK:three"
+        ],
+        "the new branch leads, and the turns left behind stay reachable"
+    );
+
+    let artifact = std::env::var_os("ZERON_E2E_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("zeron-tree-ui-e2e"));
+    std::fs::create_dir_all(&artifact).unwrap();
+    std::fs::write(
+        artifact.join("transcript.txt"),
+        transcript(&core)
+            .iter()
+            .map(|(role, text)| format!("{role:?}: {text}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
     runtime.block_on(core.shutdown());
 }

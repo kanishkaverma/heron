@@ -696,6 +696,8 @@ async fn next_turn(
 ///   as text, or never completes the turn.
 /// - The parked process keeps answering from the old tip while the file says
 ///   otherwise (or the reverse).
+/// - A `/reload` in that process drops Zeron's jump command, so the next jump
+///   reaches the model as text.
 #[tokio::test]
 #[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
 async fn real_pi_tree_jump_in_a_parked_runner() {
@@ -750,6 +752,8 @@ async fn real_pi_tree_jump_in_a_parked_runner() {
     };
     say("two".into()).await;
     assert!(reply(&next_turn(&mut stream).await).contains("MOCK:two"));
+    say("/reload".into()).await;
+    assert!(reply(&next_turn(&mut stream).await).contains("Reloaded"));
 
     let tree = harness.session_tree(&session, cwd).await.unwrap().unwrap();
     let two = tree.entries[2].id.clone();

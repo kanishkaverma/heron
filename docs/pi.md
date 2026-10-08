@@ -56,12 +56,31 @@ Zeron's existing delegation uses a temporary MCP bridge loaded with
 no Pi subagent extension is installed. Image attachments are sent as native
 image blocks; image-only tool results do not yet render inline in Zeron.
 
+`/tree` in a Pi chat opens a palette over the conversation's branches. Zeron
+reads the tree from Pi's session file and shows what Pi's own `/tree` shows by
+default, minus tool results. Pi's RPC has no navigate command and only an
+extension command can call `ctx.navigateTree`, so every run also loads a small
+`--extension` that registers `/zeron-tree-jump <entryId> [summarize]`. The
+command never reaches the slash menu. Jumping to a user message rewinds to just
+before it and returns its text to the composer. Pi keeps the leaf in memory but
+resumes a session at the last entry of its file, so a jump appends one
+`zeron-tree-jump` entry at the new leaf, which is what lets it survive a
+process restart. A summarising jump asks Pi for a summary only when the branch
+it leaves holds conversation, since a new process and every jump leave
+bookkeeping entries at the leaf. The palette is unavailable while a run is
+live, with staged attachments, in a side chat, and in other agents' chats. A
+parked Pi's output in the first second after a turn is dropped as that turn's
+tail, so a jump that quick has no confirmation line, though it still happens.
+
 Validation:
 
 ```sh
 cargo test -p zeron-harness --features native-fixture
+cargo test -p zeron-harness --test pi_session_tree
+cargo test -p zeron-engine --test session_tree
 cargo test -p zeron-engine --lib --test pi_resume --test acp_lifecycle --test message_queue --test e2e
 cargo test -p zeron-harness --test pi_live -- --ignored --nocapture
+cargo test -p zeron-ui --lib -- --test-threads=1 --ignored session_tree
 cargo check -p zeron-ui --tests
 cargo build -p zeron-mobile --features bindgen
 ```

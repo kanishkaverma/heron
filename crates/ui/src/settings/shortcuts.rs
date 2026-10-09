@@ -841,6 +841,46 @@ impl Render for ShortcutsPage {
                         cx.notify();
                     })),
             );
+        let open_links_in_zeron = crate::settings::current(cx).open_web_links_in_zeron;
+        let open_links_row = widgets::card_row(&theme, false)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(widgets::row_title(&theme, "Open links in Zeron"))
+                    .child(widgets::meta_line(
+                        &theme,
+                        vec![
+                            div()
+                                .child("Off opens chat links in your default browser.")
+                                .into_any_element(),
+                        ],
+                    )),
+            )
+            .child(
+                widgets::toggle_switch(&theme, open_links_in_zeron, "open-web-links-in-zeron")
+                    .id("open-web-links-in-zeron-toggle")
+                    .debug_selector(|| "open-web-links-in-zeron-toggle".into())
+                    .tab_index(0)
+                    .role(gpui::Role::Switch)
+                    .aria_label("Open links in Zeron")
+                    .aria_toggled(if open_links_in_zeron {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        crate::settings::update(
+                            crate::settings::SavePolicy::Immediate,
+                            cx,
+                            |settings| settings.open_web_links_in_zeron = !open_links_in_zeron,
+                        );
+                        cx.refresh_windows();
+                        cx.notify();
+                    })),
+            );
         let escape_behavior_row = widgets::card_row(&theme, false)
             .child(
                 div()
@@ -903,6 +943,7 @@ impl Render for ShortcutsPage {
                                             .child(send_behavior_row)
                                             .child(compact_mode_row)
                                             .child(compact_model_picker_row)
+                                            .child(open_links_row)
                                             .child(escape_behavior_row),
                                     )
                                     .child(self.thread_naming.clone()),
@@ -1456,5 +1497,59 @@ mod tests {
             ComposerSendBehavior::ModEnter,
             "mod-shift-enter"
         ));
+    }
+
+    /// The link-destination preference was only reachable from a link's
+    /// context menu. Ways the General switch fails: it is missing; a click
+    /// leaves the preference unchanged; the change is not written to disk;
+    /// it shows a stale value after the link menu changed the preference.
+    #[gpui::test]
+    fn general_page_switch_controls_where_web_links_open(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (_page, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            let mut page = ShortcutsPage::new(
+                state,
+                KeymapConfig::default(),
+                false,
+                ComposerSendBehavior::Enter,
+                false,
+                false,
+                AppshotDestination::Automatic,
+                cx,
+            );
+            page.show_section(false, true);
+            page
+        });
+        let open_in_zeron = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| crate::settings::current(cx).open_web_links_in_zeron)
+        };
+        assert!(open_in_zeron(cx), "Zeron's Browser stays the default");
+        for expected in [false, true] {
+            cx.update(|window, cx| window.draw(cx).clear());
+            let switch = cx.debug_bounds("open-web-links-in-zeron-toggle").unwrap();
+            cx.simulate_click(switch.center(), gpui::Modifiers::default());
+            assert_eq!(open_in_zeron(cx), expected);
+            cx.update(|_, cx| crate::settings::flush(cx));
+            assert_eq!(
+                crate::settings::UiSettings::load(dir.path()).open_web_links_in_zeron,
+                expected
+            );
+        }
+        // The link context menu writes the same preference; the switch follows.
+        cx.update(|_, cx| {
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |s| {
+                s.open_web_links_in_zeron = false;
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let switch = cx.debug_bounds("open-web-links-in-zeron-toggle").unwrap();
+        cx.simulate_click(switch.center(), gpui::Modifiers::default());
+        assert!(open_in_zeron(cx));
     }
 }

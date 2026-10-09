@@ -14,6 +14,7 @@ pub mod invocation;
 pub mod motion;
 pub mod preview;
 pub mod projectless;
+pub mod session_tree;
 pub mod sidebar_pins;
 pub mod view;
 pub mod voice;
@@ -22,6 +23,7 @@ pub mod workspace;
 pub use agent::*;
 pub use entities::*;
 pub use preview::*;
+pub use session_tree::*;
 pub use sidebar_pins::*;
 pub use workspace::*;
 

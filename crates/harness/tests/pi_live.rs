@@ -442,3 +442,230 @@ async fn real_pi_reload_refreshes_commands_without_prompting_the_model() {
     )
     .unwrap();
 }
+
+/// One Zeron turn in a fresh Pi process: Zeron may reap a parked runner at any
+/// time, so every turn here proves what survives a process boundary.
+async fn turn(
+    harness: &PiHarness,
+    cwd: &std::path::Path,
+    prompt: &str,
+    resume: Option<&str>,
+) -> (Vec<AgentEvent>, String) {
+    let (steer, steering) = mpsc::channel(8);
+    drop(steer);
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        steering,
+        interrupt: CancellationToken::new(),
+        request_input: Box::new(|_| oneshot::channel().1),
+        turn: Default::default(),
+    };
+    let request = RunRequest {
+        prompt: prompt.into(),
+        harness: None,
+        model: Some("zeron-probe/mock".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.display().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        resume: resume.map(str::to_owned),
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+    };
+    let events: Vec<AgentEvent> = tokio::time::timeout(
+        Duration::from_secs(30),
+        harness
+            .run(request, controls)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("turn {prompt:?} completes"));
+    let session = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Done {
+                session_id: Some(id),
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("turn {prompt:?} reports its session: {events:?}"));
+    (events, session)
+}
+
+fn reply(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn rows(tree: &zeron_proto::SessionTree) -> Vec<(char, u16, bool, &str)> {
+    use zeron_proto::TreeEntryKind::*;
+    tree.entries
+        .iter()
+        .map(|e| {
+            let kind = match e.kind {
+                User => 'U',
+                Assistant => 'A',
+                Summary => 'S',
+                Compaction => 'C',
+            };
+            (kind, e.depth, e.on_path, e.text.as_str())
+        })
+        .collect()
+}
+
+/// `/tree`: browse a Pi session's tree and jump to a point in it.
+/// Ways it fails:
+/// - The tree is unreadable, loses ids, or shows tool/label/custom entries.
+/// - A fork is not indented, or the branch holding the leaf is not listed first.
+/// - The jump reaches the model as text instead of moving the leaf.
+/// - The jump only moves Pi's in-memory leaf, so the next turn (a new process)
+///   continues from the old tip and the model still sees the abandoned turns.
+/// - Jumping to a user message keeps that message in context instead of
+///   rewinding to before it.
+/// - The internal jump command leaks into the slash menu.
+/// - A summarising jump adds no summary, or the summary never reaches the next
+///   turn's context.
+/// - A jump to an id that is not in the session corrupts it instead of failing.
+#[tokio::test]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
+async fn real_pi_tree_jump_survives_new_processes() {
+    let (dir, harness) = isolated_pi();
+    let cwd = dir.path();
+    let mut session = String::new();
+    for prompt in ["one", "two", "three"] {
+        session = turn(
+            &harness,
+            cwd,
+            prompt,
+            (!session.is_empty()).then_some(&*session),
+        )
+        .await
+        .1;
+    }
+
+    let tree = harness
+        .session_tree(&session, cwd)
+        .await
+        .unwrap()
+        .expect("a Pi session is a tree");
+    assert_eq!(
+        rows(&tree),
+        [
+            ('U', 0, true, "one"),
+            ('A', 0, true, "MOCK:one"),
+            ('U', 0, true, "two"),
+            ('A', 0, true, "MOCK:two"),
+            ('U', 0, true, "three"),
+            ('A', 0, true, "MOCK:three"),
+        ]
+    );
+    assert_eq!(tree.leaf_id.as_deref(), Some(tree.entries[5].id.as_str()));
+
+    let two = tree.entries[2].id.clone();
+    let (events, jumped) = turn(
+        &harness,
+        cwd,
+        &format!("/zeron-tree-jump {two}"),
+        Some(&session),
+    )
+    .await;
+    assert_eq!(jumped, session, "a jump stays in the same session");
+    let said = reply(&events);
+    assert!(!said.contains("MOCK:"), "reached the model: {said}");
+    assert!(said.contains("two"), "names where it went: {said}");
+    for event in &events {
+        if let AgentEvent::AvailableCommands { commands } = event {
+            assert!(
+                !commands.iter().any(|c| c.name.starts_with("zeron-tree")),
+                "internal command leaked into the menu: {commands:?}"
+            );
+        }
+    }
+
+    let (events, _) = turn(&harness, cwd, "ctx?", Some(&session)).await;
+    assert_eq!(
+        reply(&events).trim(),
+        "MOCK:ctx=one|ctx?",
+        "the abandoned turns left the model's context"
+    );
+
+    let tree = harness.session_tree(&session, cwd).await.unwrap().unwrap();
+    assert_eq!(
+        rows(&tree),
+        [
+            ('U', 0, true, "one"),
+            ('A', 0, true, "MOCK:one"),
+            ('U', 1, true, "ctx?"),
+            ('A', 1, true, "MOCK:ctx=one|ctx?"),
+            ('U', 1, false, "two"),
+            ('A', 1, false, "MOCK:two"),
+            ('U', 1, false, "three"),
+            ('A', 1, false, "MOCK:three"),
+        ]
+    );
+    assert_eq!(tree.leaf_id.as_deref(), Some(tree.entries[3].id.as_str()));
+
+    let old_tip = tree.entries[7].id.clone();
+    let (events, _) = turn(
+        &harness,
+        cwd,
+        &format!("/zeron-tree-jump {old_tip} summarize"),
+        Some(&session),
+    )
+    .await;
+    assert!(reply(&events).contains("summary"), "{}", reply(&events));
+    let tree = harness.session_tree(&session, cwd).await.unwrap().unwrap();
+    let summary = tree
+        .entries
+        .iter()
+        .find(|e| e.kind == zeron_proto::TreeEntryKind::Summary)
+        .expect("the abandoned branch was summarised");
+    assert!(summary.on_path && tree.leaf_id.as_deref() == Some(summary.id.as_str()));
+    let (events, _) = turn(&harness, cwd, "ctx?", Some(&session)).await;
+    let context = reply(&events);
+    assert!(
+        context.contains("ctx=one|two|three|") && context.contains("summary"),
+        "the branch followed, plus the summary of the one left: {context}"
+    );
+
+    let (events, _) = turn(
+        &harness,
+        cwd,
+        "/zeron-tree-jump no-such-entry",
+        Some(&session),
+    )
+    .await;
+    assert!(
+        reply(&events).contains("no-such-entry"),
+        "{}",
+        reply(&events)
+    );
+    let (events, _) = turn(&harness, cwd, "ctx?", Some(&session)).await;
+    assert!(
+        reply(&events).contains("ctx=one|two|three|"),
+        "{}",
+        reply(&events)
+    );
+
+    let artifact = std::env::var_os("ZERON_E2E_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("zeron-pi-tree-e2e"));
+    std::fs::create_dir_all(&artifact).unwrap();
+    std::fs::write(
+        artifact.join("tree.json"),
+        serde_json::to_string_pretty(&tree).unwrap(),
+    )
+    .unwrap();
+}

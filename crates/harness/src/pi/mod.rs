@@ -328,6 +328,13 @@ impl Harness for PiHarness {
             })
             .await
     }
+    async fn session_tree(
+        &self,
+        _session_id: &str,
+        _cwd: &Path,
+    ) -> Result<Option<zeron_proto::SessionTree>, HarnessError> {
+        Ok(None)
+    }
     async fn skills(
         &self,
         cwd: &Path,

@@ -4,6 +4,7 @@ mod mcp;
 mod normalize;
 mod rpc;
 mod sessions;
+mod tree;
 mod ui;
 
 use crate::{
@@ -95,7 +96,7 @@ impl PiHarness {
         })
     }
     async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
-        let mut process = self.spawn(cwd, &["--no-session".into()], None)?;
+        let mut process = self.spawn(cwd, &["--no-session".into()], None, false)?;
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let grace = self.kill_grace;
         tokio::spawn(async move {
@@ -117,6 +118,7 @@ impl PiHarness {
         cwd: &Path,
         args: &[String],
         mcp: Option<&zeron_proto::McpServer>,
+        session: bool,
     ) -> Result<Process, HarnessError> {
         let exe = self.resolve_executable()?;
         if self.executable.is_none() {
@@ -142,9 +144,17 @@ impl PiHarness {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let scratch = mcp
-            .map(|config| self::mcp::configure(&mut cmd, config))
+        let scratch = (session || mcp.is_some())
+            .then(|| crate::scratch::ScratchDir::new("pi-extensions"))
             .transpose()?;
+        if let Some(scratch) = &scratch {
+            if session {
+                tree::install(&mut cmd, scratch)?;
+            }
+            if let Some(config) = mcp {
+                self::mcp::configure(&mut cmd, config, scratch)?;
+            }
+        }
         let mut child = Child::new(cmd.spawn()?);
         let tail = crate::StderrTail::default();
         let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
@@ -330,10 +340,17 @@ impl Harness for PiHarness {
     }
     async fn session_tree(
         &self,
-        _session_id: &str,
-        _cwd: &Path,
+        session_id: &str,
+        cwd: &Path,
     ) -> Result<Option<zeron_proto::SessionTree>, HarnessError> {
-        Ok(None)
+        let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
+        let (id, cwd) = (session_id.to_owned(), cwd.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::read_to_string(store.resolve(&id, &cwd)?)?;
+            Ok(Some(tree::parse(&file)))
+        })
+        .await
+        .map_err(|e| HarnessError::Protocol(format!("Pi session read failed: {e}")))?
     }
     async fn skills(
         &self,
@@ -379,7 +396,7 @@ impl Harness for PiHarness {
         if lost_context.is_some() {
             request.resume = None;
         }
-        let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref())?;
+        let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref(), true)?;
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
         let interrupt_grace = self.interrupt_grace;

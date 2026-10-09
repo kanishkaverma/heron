@@ -72,7 +72,9 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
         .into_iter()
         .flatten()
         .filter_map(|v| {
-            let name = v["name"].as_str()?;
+            let name = v["name"]
+                .as_str()
+                .filter(|name| !name.starts_with(super::tree::INTERNAL_COMMAND_PREFIX))?;
             Some(SlashCommand {
                 name: name.into(),
                 description: string(v, "description").into(),

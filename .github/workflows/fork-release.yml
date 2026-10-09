@@ -1,9 +1,10 @@
 name: fork release
 
-# Rebuilds the latest zeronsh/zeron release with the fork's patch stack (the
-# commits on this repo's main that upstream main lacks) and publishes it here
-# as the latest release. Those builds point the in-app updater at this repo, so
-# installed copies keep getting upstream releases without losing the patches.
+# Heron: rebuilds the latest zeronsh/zeron release with the fork's patch stack
+# (the commits on this repo's main that upstream main lacks) and publishes it
+# here as the latest release, named Heron so it can't be mistaken for official
+# Zeron. Those builds point the in-app updater at this repo, so installed
+# copies keep getting upstream releases without losing the patches.
 # A patch the release already contains drops out; once upstream ships every
 # patch, the build is stock and points back at the official feed.
 #
@@ -52,9 +53,9 @@ jobs:
           stack=$(git log -p --reverse "$base..origin/main" | git patch-id --stable | cut -d' ' -f1 | sha256sum | cut -c1-12)
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
           echo "stack=$stack" >>"$GITHUB_OUTPUT"
-          published=$(gh release view "fork-${tag#v}" -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
+          published=$(gh release view "heron-${tag#v}" -R "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true)
           if [ "$FORCE" != true ] && grep -qF "patch stack \`$stack\`" <<<"$published"; then
-            echo "fork-${tag#v} with patch stack $stack already published"
+            echo "heron-${tag#v} with patch stack $stack already published"
             echo "build=false" >>"$GITHUB_OUTPUT"
           else
             echo "build=true" >>"$GITHUB_OUTPUT"
@@ -96,6 +97,24 @@ jobs:
         run: |
           plutil -insert LSEnvironment -json "{\"ZERON_RELEASES_URL\":\"$FEED\"}" dist/macos/Info.plist
 
+      # Same bundle id and file name (Zeron.app), so settings, chats and the
+      # in-app updater carry over. The menu bar shows CFBundleName; Finder, the
+      # Dock and Cmd-Tab show the localized display name, which macOS only uses
+      # while the unlocalized CFBundleDisplayName matches the file name.
+      - name: name the app Heron
+        if: steps.src.outputs.patched == 'true'
+        run: |
+          plutil -replace CFBundleName -string Heron dist/macos/Info.plist
+          plutil -replace CFBundleDisplayName -string Zeron dist/macos/Info.plist
+          plutil -replace LSHasLocalizedDisplayName -bool true dist/macos/Info.plist
+          mkdir -p dist/macos/en.lproj
+          printf '"CFBundleName" = "Heron";\n"CFBundleDisplayName" = "Heron";\n' >dist/macos/en.lproj/InfoPlist.strings
+          anchor='dist/macos/Info.plist" >"$APP/Contents/Info.plist"'
+          [ "$(grep -cF "$anchor" scripts/package-macos.sh)" = 1 ] || { echo "package-macos.sh changed; can't place en.lproj"; exit 1; }
+          awk -v a="$anchor" '{print} index($0, a) {print "mkdir -p \"$APP/Contents/Resources/en.lproj\" && cp \"$ROOT/dist/macos/en.lproj/InfoPlist.strings\" \"$APP/Contents/Resources/en.lproj/\""}' \
+            scripts/package-macos.sh >"$RUNNER_TEMP/package-macos.sh"
+          install -m 755 "$RUNNER_TEMP/package-macos.sh" scripts/package-macos.sh
+
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -111,6 +130,10 @@ jobs:
           [ "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$VERSION" ]
           if [ "$PATCHED" = true ]; then
             [ "$(plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$app/Contents/Info.plist")" = "$FEED" ]
+            [ "$(plutil -extract CFBundleName raw "$app/Contents/Info.plist")" = Heron ]
+            [ "$(plutil -extract LSHasLocalizedDisplayName raw "$app/Contents/Info.plist")" = true ]
+            grep -qF '"CFBundleDisplayName" = "Heron";' "$app/Contents/Resources/en.lproj/InfoPlist.strings"
+            codesign --verify --deep "$app"
           else
             ! plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$app/Contents/Info.plist" 2>/dev/null
           fi
@@ -125,17 +148,19 @@ jobs:
           dmg="zeron-$VERSION-macos-arm64.dmg"
           jq -n --arg v "$VERSION" --arg n "$app" --arg s "$(shasum -a 256 "$app" | cut -d' ' -f1)" \
             '{version: $v, files: {($n): {sha256: $s}}}' >manifest.json
-          release="fork-$VERSION"
+          release="heron-$VERSION"
           gh release delete "$release" -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
           git tag -f "$release"
           git push -f origin "refs/tags/$release"
           if [ "$PATCHED" = true ]; then
-            what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) plus the patches on fork main ($FORK_MAIN), patch stack \`$STACK\`:
+            title="Heron $VERSION"
+            what="Heron is Zeron with our patches. Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) plus the patches on fork main ($FORK_MAIN), patch stack \`$STACK\`:
 
           $(cat "$RUNNER_TEMP/patches")
 
           The in-app updater follows this repo's releases."
           else
+            title="Zeron $VERSION (stock rebuild)"
             what="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) unmodified; it already includes every patch (patch stack \`$STACK\`). Installing it returns the updater to the official feed."
           fi
           notes="$what
@@ -144,4 +169,4 @@ jobs:
 
               xattr -dr com.apple.quarantine /Applications/Zeron.app"
           gh release create "$release" "$dmg" "$app" manifest.json -R "$GITHUB_REPOSITORY" \
-            --verify-tag --latest --title "Zeron $VERSION (fork)" --notes "$notes"
+            --verify-tag --latest --title "$title" --notes "$notes"

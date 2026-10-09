@@ -1,11 +1,14 @@
-# fork-release
+# Heron
 
-Automation for this fork of `zeronsh/zeron`. The fork is two things:
+Heron is our fork of `zeronsh/zeron`: Zeron plus a stack of patches. Builds are named
+Heron in the menu bar, Dock and Finder so they can't be mistaken for official Zeron; the
+bundle id and `Zeron.app` file name stay, so settings and chats carry over. This branch
+(`fork-release`) holds the automation. The fork is two things:
 
 - **`main`** is upstream `main` with our patches on top. That stack of commits is the fork.
   An hourly job keeps it rebased on upstream, so `main` always has both.
-- **Releases** (`fork-<version>`) are each upstream release rebuilt with that stack. The
-  in-app updater follows them.
+- **Releases** (`heron-<version>`, "Heron 0.2.107") are each upstream release rebuilt with
+  that stack. The in-app updater follows them. Older ones are tagged `fork-<version>`.
 
 ## Adding, changing or dropping a patch
 
@@ -57,11 +60,11 @@ A new patch on the same upstream version republishes the same version number, wh
 updater doesn't treat as an update. Install that build by hand, or wait for the next
 upstream release.
 
-## Installing the latest fork build on a Mac
+## Installing the latest Heron build on a Mac
 
-    curl -fsSL https://raw.githubusercontent.com/kanishkaverma/zeron/fork-release/sync/install-latest-app.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/kanishkaverma/heron/fork-release/sync/install-latest-app.sh | bash
 
-It downloads the latest `fork-*` release with `gh`, checks it against the manifest, and
-schedules a one-shot LaunchAgent. About a minute later that agent quits Zeron, swaps the
+It needs a `gh` login. It downloads the latest release with `gh`, checks it against the manifest, and
+schedules a one-shot LaunchAgent. About a minute later that agent quits the app, swaps the
 app, relaunches it, and rolls back if the new build doesn't stay up. Log:
 `~/.local/share/zeron-fork-update/update-app.log`.

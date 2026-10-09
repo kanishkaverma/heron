@@ -11,8 +11,8 @@ set -uo pipefail
 
 SYNC_DIR=${SYNC_DIR:-$HOME/.local/share/zeron-fork-sync}
 UPSTREAM_URL=${UPSTREAM_URL:-https://github.com/zeronsh/zeron.git}
-FORK_URL=${FORK_URL:-https://github.com/kanishkaverma/zeron.git}
-GH_REPO=${GH_REPO-kanishkaverma/zeron}
+FORK_URL=${FORK_URL:-https://github.com/kanishkaverma/heron.git}
+GH_REPO=${GH_REPO-kanishkaverma/heron}
 CHECK_CMD=${CHECK_CMD:-cargo check -q --locked -p zeron}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$SYNC_DIR/target}
 # Fetch git dependencies with the git CLI and its credential helpers. Cargo's built-in
@@ -30,7 +30,7 @@ notify() {
   if [ -n "${NOTIFY_CMD:-}" ]; then
     eval "$NOTIFY_CMD \"\$1\""
   else
-    osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Zeron fork sync"' -e 'end run' "$1"
+    osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Heron sync"' -e 'end run' "$1"
   fi
 }
 

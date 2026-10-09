@@ -590,6 +590,7 @@ impl FilesSurface {
             ComposerInputEvent::Edited => this.on_search_edited(cx),
             ComposerInputEvent::Submitted
             | ComposerInputEvent::ModifiedSubmitted
+            | ComposerInputEvent::AlternateSubmitted
             | ComposerInputEvent::MentionAccept => this.activate_search_result(cx),
             ComposerInputEvent::MentionNavigate(delta) => {
                 let len = this.search_state.visible_len();

@@ -867,6 +867,7 @@ actions!(
         Newline,
         MessageNewlineOrAccept,
         ModifiedSubmit,
+        AlternateSubmit,
         Submit,
         Undo,
         Redo,
@@ -1696,6 +1697,13 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
         }
     }
 
+    // Option+Enter sends the other way while the agent works (steer vs queue).
+    message_bindings.push(KeyBinding::new(
+        "alt-enter",
+        AlternateSubmit,
+        Some(MESSAGE_COMPOSER_CONTEXT),
+    ));
+
     let word_edit_prefix = if cfg!(target_os = "macos") {
         "alt"
     } else {
@@ -1771,6 +1779,8 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
 pub enum ComposerInputEvent {
     Submitted,
     ModifiedSubmitted,
+    /// Option+Enter: the busy-agent delivery Enter does not use.
+    AlternateSubmitted,
     Edited,
     CursorMoved,
     ViewportChanged,
@@ -3577,6 +3587,14 @@ impl ComposerInput {
         }
     }
 
+    fn alternate_submit(&mut self, _: &AlternateSubmit, _: &mut Window, cx: &mut Context<Self>) {
+        match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
+            EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
+            EnterOutcome::Submit => cx.emit(ComposerInputEvent::AlternateSubmitted),
+            EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
+        }
+    }
+
     fn mention_tab(&mut self, _: &MentionTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.mention_has_selection {
             cx.emit(ComposerInputEvent::MentionAccept);
@@ -5262,6 +5280,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::message_newline_or_accept))
             .on_action(cx.listener(Self::modified_submit))
+            .on_action(cx.listener(Self::alternate_submit))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::toggle_dictation_action))
             .on_key_up(cx.listener(Self::on_dictation_key_up))
@@ -6210,6 +6229,7 @@ impl Composer {
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
             ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
+            ComposerInputEvent::AlternateSubmitted => this.submit_with(true, cx),
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
                 this.on_input_edited(cx)
             }
@@ -8653,6 +8673,12 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        self.submit_with(false, cx);
+    }
+
+    /// `alternate` is Option+Enter: while the agent works it delivers the
+    /// other way than Enter (queue instead of steer, or the reverse).
+    fn submit_with(&mut self, alternate: bool, cx: &mut Context<Self>) {
         if self
             .input
             .update(cx, |input, cx| input.finish_dictation(true, cx))
@@ -8696,9 +8722,12 @@ impl Composer {
             SendButtonMode::Stop => {}
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
-            SendButtonMode::Send => self.send(text, false, cx),
-            // Busy: keep the message queued until the current turn ends.
-            SendButtonMode::Queue => self.send(text, true, cx),
+            SendButtonMode::Send => self.send(text, false, false, cx),
+            // Busy: queue the message; steering then hands it to the live turn.
+            SendButtonMode::Queue => {
+                let steer = crate::settings::current(cx).enter_steers_busy_agent != alternate;
+                self.send(text, true, steer, cx)
+            }
         }
     }
 
@@ -8731,7 +8760,7 @@ impl Composer {
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+    fn send(&mut self, text: String, queue: bool, steer: bool, cx: &mut Context<Self>) {
         if !self.check_reference_delivery(&text, cx) {
             return;
         }
@@ -8805,6 +8834,12 @@ impl Composer {
             }
             state.unsaved_side_chat_create(&chat_id)
         });
+        // Rows with attachments need a new request, so they stay queued.
+        let steer = steer
+            && queue
+            && !is_new
+            && self.staged().is_empty()
+            && self.staged_appshots().is_empty();
         if queue && !is_new {
             let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
@@ -9466,6 +9501,9 @@ impl Composer {
                         chat_id: err_chat_id.clone(),
                         message_id: message_id.clone(),
                     });
+                    if steer {
+                        composer.steer_new_queued(err_chat_id.clone(), message_id.clone(), cx);
+                    }
                 }
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
@@ -10517,10 +10555,16 @@ impl Composer {
                             .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
                     .tooltip(crate::settings::widgets::text_tooltip(
-                        if mode == SendButtonMode::Queue {
-                            "Queue message"
-                        } else {
-                            "Send message"
+                        match (mode, crate::settings::current(cx).enter_steers_busy_agent) {
+                            (SendButtonMode::Queue, true) if cfg!(target_os = "macos") => {
+                                "Steer the agent (Option+Enter queues)"
+                            }
+                            (SendButtonMode::Queue, true) => "Steer the agent (Alt+Enter queues)",
+                            (SendButtonMode::Queue, false) if cfg!(target_os = "macos") => {
+                                "Queue message (Option+Enter steers)"
+                            }
+                            (SendButtonMode::Queue, false) => "Queue message (Alt+Enter steers)",
+                            _ => "Send message",
                         },
                     ))
                     .child(
@@ -14523,7 +14567,7 @@ mod tests {
                 })).unwrap()];
                 });
                 assert!(!composer.reference_delivery_supported(cx));
-                composer.send(draft.clone(), false, cx);
+                composer.send(draft.clone(), false, false, cx);
                 assert!(
                     composer
                         .failure
@@ -16218,3 +16262,7 @@ impl Composer {
 #[cfg(test)]
 #[path = "composer_dictation_tests.rs"]
 mod dictation_tests;
+
+#[cfg(test)]
+#[path = "composer_steer_tests.rs"]
+mod steer_tests;

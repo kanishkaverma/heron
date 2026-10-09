@@ -150,6 +150,14 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     attach_parent_console();
+    for (name, value) in paths::build_profile_env(
+        |name| std::env::var_os(name),
+        option_env!("ZERON_BUILD_DATA_DIR_NAME"),
+        option_env!("ZERON_BUILD_IPC_PORT"),
+    ) {
+        // SAFETY: still single-threaded; nothing has read the environment yet.
+        unsafe { std::env::set_var(name, value) };
+    }
     let cli = Cli::parse();
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {

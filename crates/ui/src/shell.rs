@@ -85,6 +85,9 @@ pub(crate) mod project_icon;
 mod pull_request_pane;
 mod session_hover_card;
 mod session_info;
+mod session_tree;
+#[cfg(test)]
+mod session_tree_tests;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
@@ -2143,6 +2146,7 @@ pub struct Shell {
     search_warm: Option<search_warm::SearchWarm>,
     /// Per chat, the files opened in editor tabs, most recent first.
     recent_files: std::collections::HashMap<String, std::collections::VecDeque<String>>,
+    tree_palette: Option<session_tree::TreePalette>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
@@ -2649,6 +2653,7 @@ impl Shell {
             command_palette: None,
             search_warm: None,
             recent_files: std::collections::HashMap::new(),
+            tree_palette: None,
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),

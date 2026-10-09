@@ -43,6 +43,17 @@ impl Store {
         .iter()
         .any(|settings| json_file(settings).get("steeringMode").is_some())
     }
+    /// Pi's `showCacheMissNotices` as Pi would resolve it for `cwd`: project
+    /// settings override global ones, and Pi's own default is off.
+    pub fn cache_notices(&self, cwd: &Path) -> bool {
+        [
+            cwd.join(".pi/settings.json"),
+            self.agent.join("settings.json"),
+        ]
+        .iter()
+        .find_map(|settings| json_file(settings)["showCacheMissNotices"].as_bool())
+        .unwrap_or(false)
+    }
     fn key(&self, id: &str) -> PathBuf {
         self.root
             .join(format!("{:x}.json", Sha256::digest(id.as_bytes())))

@@ -67,6 +67,9 @@ pub mod methods {
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
+    /// A chat's branching conversation tree (Pi `/tree`): `{chatId}` →
+    /// `{tree: SessionTree | null}`; null while its harness has none.
+    pub const GET_SESSION_TREE: &str = "GetSessionTree";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
     /// connection; automatic subscriptions and retries must not call it.

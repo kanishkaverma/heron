@@ -72,6 +72,9 @@ mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
 mod project_icon;
+mod session_tree;
+#[cfg(test)]
+mod session_tree_tests;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
@@ -2031,6 +2034,7 @@ pub struct Shell {
     /// The New project palette's collapsed-breadcrumbs (`…`) menu.
     project_crumb_menu: popover::Popup<()>,
     command_palette: Option<command_palette::CommandPalette>,
+    tree_palette: Option<session_tree::TreePalette>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
@@ -2477,6 +2481,7 @@ impl Shell {
             add_space: None,
             project_crumb_menu: popover::Popup::default(),
             command_palette: None,
+            tree_palette: None,
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),

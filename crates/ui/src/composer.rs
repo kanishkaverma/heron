@@ -5692,6 +5692,7 @@ pub enum WorkspaceCommand {
     Terminal,
     Rename,
     Stop,
+    Tree,
 }
 
 impl WorkspaceCommand {
@@ -5728,6 +5729,7 @@ impl WorkspaceCommand {
 fn with_workspace_commands(
     mut rows: Vec<InvocationCandidate>,
     in_chat: bool,
+    harness: Option<HarnessId>,
 ) -> Vec<InvocationCandidate> {
     rows.retain(|row| row.workspace_command.is_none());
     for &(command, name, description, needs_chat) in WorkspaceCommand::catalog() {
@@ -6592,6 +6594,11 @@ impl Composer {
             self.staged().len() + self.staged_appshots().len(),
             self.staged_comments(cx).len(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn draft_text(&self, cx: &App) -> String {
+        self.input.read(cx).text().to_string()
     }
 
     #[cfg(test)]
@@ -8019,7 +8026,11 @@ impl Composer {
         if harness.is_none() && !skill && commands_allowed {
             self.slash_cache.insert(
                 context.clone(),
-                with_workspace_commands(vec![], self.state.read(cx).selected_chat.is_some()),
+                with_workspace_commands(
+                    vec![],
+                    self.state.read(cx).selected_chat.is_some(),
+                    harness,
+                ),
             );
         }
         if harness.is_none()
@@ -8033,7 +8044,11 @@ impl Composer {
             if !skill && commands_allowed {
                 self.slash_cache.insert(
                     context,
-                    with_workspace_commands(vec![], self.state.read(cx).selected_chat.is_some()),
+                    with_workspace_commands(
+                        vec![],
+                        self.state.read(cx).selected_chat.is_some(),
+                        harness,
+                    ),
                 );
                 self.slash.error = Some("Agent command discovery requires a connection".into());
                 self.refilter_slash(cx);
@@ -8095,6 +8110,7 @@ impl Composer {
                             with_workspace_commands(
                                 candidates,
                                 composer.state.read(cx).selected_chat.is_some(),
+                                harness,
                             )
                         } else {
                             candidates
@@ -8110,6 +8126,7 @@ impl Composer {
                                 with_workspace_commands(
                                     vec![],
                                     composer.state.read(cx).selected_chat.is_some(),
+                                    harness,
                                 ),
                             );
                         }
@@ -12319,7 +12336,7 @@ mod tests {
             ],
             vec![],
         );
-        let rows = with_workspace_commands(native, true);
+        let rows = with_workspace_commands(native, true, None);
         assert_eq!(rows.len(), 11);
         assert!(rows[0].workspace_command.is_none());
         assert_eq!(rows[0].input_hint.as_deref(), Some("model id"));
@@ -12329,9 +12346,26 @@ mod tests {
             workspace_command_for_text("/zeron:zeron:model", &rows),
             Some(WorkspaceCommand::Model)
         );
-        assert_eq!(with_workspace_commands(rows, true).len(), 11);
-        let draft_rows = with_workspace_commands(vec![], false);
+        assert_eq!(with_workspace_commands(rows, true, None).len(), 11);
+        let draft_rows = with_workspace_commands(vec![], false, None);
         assert_eq!(draft_rows.len(), 4);
+        let tree = |chat, harness| {
+            workspace_command_for_text("/tree", &with_workspace_commands(vec![], chat, harness))
+        };
+        assert_eq!(
+            tree(true, Some(HarnessId::Pi)),
+            Some(WorkspaceCommand::Tree)
+        );
+        assert_eq!(
+            tree(true, Some(HarnessId::ClaudeCode)),
+            None,
+            "only Pi sessions branch"
+        );
+        assert_eq!(
+            tree(false, Some(HarnessId::Pi)),
+            None,
+            "needs a conversation"
+        );
         assert_eq!(workspace_command_for_text("/diff", &draft_rows), None);
         assert_eq!(
             workspace_command_for_text("/model  ", &draft_rows),

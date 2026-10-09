@@ -88,6 +88,10 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
         ("autocompact", "Toggle automatic compaction"),
         ("steering", "Steering queue mode"),
         ("follow-up", "Follow-up queue mode"),
+        (
+            "reload",
+            "Reload extensions, skills, prompt templates and context files",
+        ),
     ] {
         if !commands.iter().any(|c| c.name == name) {
             commands.push(SlashCommand {
@@ -120,6 +124,9 @@ pub(super) fn builtin(text: &str, auto: bool) -> Option<Value> {
         "/steering" if !args.is_empty() => json!({"type":"set_steering_mode","mode":args}),
         "/follow-up" if !args.is_empty() => json!({"type":"set_follow_up_mode","mode":args}),
         "/steering" | "/follow-up" => json!({"type":"get_state"}),
+        // Pi's RPC has no reload, but every Zeron turn starts a fresh Pi process,
+        // so this one has already loaded every resource; refresh the menu from it.
+        "/reload" => json!({"type":"get_commands"}),
         _ => return None,
     })
 }

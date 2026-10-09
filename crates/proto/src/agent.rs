@@ -543,6 +543,15 @@ pub enum DoneStatus {
     Errored,
 }
 
+/// How loudly a transcript notice speaks: `Dim` is bookkeeping (a refresh that
+/// kept a cache warm), `Warning` is money or context already lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NoticeTone {
+    Dim,
+    Warning,
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -618,6 +627,13 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+    },
+    /// An informational line between the agent's own parts: not assistant
+    /// prose and not a failure (a cache miss re-billed, a cache refresh paid
+    /// for). Folds into its own transcript part, never into message text.
+    Notice {
+        tone: NoticeTone,
+        text: String,
     },
     #[serde(rename_all = "camelCase")]
     InputRequested {

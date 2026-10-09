@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
+use zeron_proto::{
+    AgentEvent, NoticeTone, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion,
+};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -204,6 +206,15 @@ pub enum MessagePart {
         id: String,
         message: String,
     },
+    /// An informational line between the agent's own parts (a cache miss
+    /// re-billed, a cache refresh paid for). Its text rides the doc's
+    /// `message` field, never `text`: a client that predates the kind falls
+    /// back to printing `text` as prose, so this degrades to an empty part.
+    Notice {
+        id: String,
+        tone: NoticeTone,
+        text: String,
+    },
     /// The seam in a forked chat's transcript: everything above was copied
     /// from `source_chat_id` when the fork was cut, everything below is this
     /// chat's own. Written once by the fork RPC; renders as a labeled
@@ -229,6 +240,7 @@ impl MessagePart {
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. }
+            | MessagePart::Notice { id, .. }
             | MessagePart::Fork { id, .. } => id,
         }
     }
@@ -262,6 +274,7 @@ impl MessagePart {
                 mime_type,
             } => id.len() + path.len() + name.len() + mime_type.len(),
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::Notice { text, .. } => text.len(),
             MessagePart::Fork {
                 source_chat_id,
                 source_title,
@@ -284,6 +297,7 @@ impl MessagePart {
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
 /// - `Error` and `Done{error}` become visible error parts.
+/// - `Notice` becomes its own notice part, never message text.
 pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
@@ -428,6 +442,14 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             out.push(MessagePart::Error {
                 id,
                 message: message.clone(),
+            });
+        }
+        AgentEvent::Notice { tone, text } => {
+            let id = format!("n{}", out.len());
+            out.push(MessagePart::Notice {
+                id,
+                tone: *tone,
+                text: text.clone(),
             });
         }
         AgentEvent::Done { error, .. } => {
@@ -704,6 +726,42 @@ mod tests {
 
     fn text_delta(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
+    }
+
+    /// Ways it can fail: a notice lands in the message text (so it is copied,
+    /// searched and titled as the agent's words), later text joins the notice
+    /// instead of starting its own part, or the tone is lost.
+    #[test]
+    fn notices_fold_into_their_own_part_between_the_agents_text() {
+        let notice = |tone, text: &str| AgentEvent::Notice {
+            tone,
+            text: text.into(),
+        };
+        let mut parts = Vec::new();
+        fold_event_into_parts(&mut parts, &text_delta("Looking"));
+        fold_event_into_parts(
+            &mut parts,
+            &notice(NoticeTone::Warning, "Cache miss: 80k tokens re-billed"),
+        );
+        fold_event_into_parts(&mut parts, &text_delta(" at it"));
+        assert_eq!(
+            parts,
+            vec![
+                MessagePart::Text {
+                    id: "t0".into(),
+                    text: "Looking".into()
+                },
+                MessagePart::Notice {
+                    id: "n1".into(),
+                    tone: NoticeTone::Warning,
+                    text: "Cache miss: 80k tokens re-billed".into()
+                },
+                MessagePart::Text {
+                    id: "t2".into(),
+                    text: " at it".into()
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1298,6 +1298,77 @@ impl Composer {
         }
     }
 
+    /// Hand a row this composer just queued to the live turn, as its Steer
+    /// button would. The row is written on this device first, so a chat hosted
+    /// elsewhere may not have it yet: a `sent: false` reply is retried, and a
+    /// row that never steers simply stays queued, without an error banner.
+    pub(crate) fn steer_new_queued(&mut self, chat_id: String, id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let host = {
+            let state = self.state.read(cx);
+            if state.selected_chat.as_deref() != Some(chat_id.as_str())
+                || !state.chat_host_supports(
+                    &chat_id,
+                    zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+                )
+            {
+                return;
+            }
+            state.selected_chat_row().map(|chat| chat.device_id.clone())
+        };
+        self.state.update(cx, |state, cx| {
+            state.begin_pending_send(&chat_id, &id, chrono::Utc::now());
+            cx.notify();
+        });
+        let mut params = serde_json::json!({ "id": id, "chatId": chat_id });
+        if let Some(host) = host {
+            params["targetDeviceId"] = serde_json::Value::String(host);
+        }
+        cx.spawn(async move |this, cx| {
+            let mut steered = false;
+            for attempt in 0..8u32 {
+                if attempt > 0 {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(250 * u64::from(attempt)))
+                        .await;
+                }
+                match engine
+                    .client()
+                    .call(methods::STEER_QUEUED_MESSAGE_NOW, params.clone())
+                    .await
+                {
+                    Ok(reply)
+                        if queue_mutation_acknowledged(
+                            methods::STEER_QUEUED_MESSAGE_NOW,
+                            &reply,
+                        ) =>
+                    {
+                        steered = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "steering a just-queued message failed");
+                        break;
+                    }
+                }
+            }
+            this.update(cx, |composer, cx| {
+                composer.state.update(cx, |state, cx| {
+                    state.end_pending_send(&chat_id, &id);
+                    if !steered {
+                        state.refresh_selected_queue(cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Cmd/Ctrl+Enter on an empty composer activates the same action shown on
     /// the most recently queued row: steer text, or send attachments with an interrupt.
     /// An edit/review gate or an old chat host makes it a no-op.

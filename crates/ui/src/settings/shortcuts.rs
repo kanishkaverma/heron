@@ -769,6 +769,50 @@ impl Render for ShortcutsPage {
                     .child(widgets::row_title(&theme, "Send messages with")),
             )
             .child(send_behavior_control);
+        let enter_steers = crate::settings::current(cx).enter_steers_busy_agent;
+        let enter_steers_row = widgets::card_row(&theme, false)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(widgets::row_title(&theme, "Enter steers a working agent"))
+                    .child(widgets::meta_line(
+                        &theme,
+                        vec![
+                            div()
+                                .child(if cfg!(target_os = "macos") {
+                                    "Option+Enter queues for after the turn. Off swaps them."
+                                } else {
+                                    "Alt+Enter queues for after the turn. Off swaps them."
+                                })
+                                .into_any_element(),
+                        ],
+                    )),
+            )
+            .child(
+                widgets::toggle_switch(&theme, enter_steers, "enter-steers-busy-agent")
+                    .id("enter-steers-busy-agent-toggle")
+                    .debug_selector(|| "enter-steers-busy-agent-toggle".into())
+                    .tab_index(0)
+                    .role(gpui::Role::Switch)
+                    .aria_label("Enter steers a working agent")
+                    .aria_toggled(if enter_steers {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        crate::settings::update(
+                            crate::settings::SavePolicy::Immediate,
+                            cx,
+                            |settings| settings.enter_steers_busy_agent = !enter_steers,
+                        );
+                        cx.refresh_windows();
+                        cx.notify();
+                    })),
+            );
         let compact_mode_row = widgets::card_row(&theme, false)
             .child(
                 div()
@@ -941,6 +985,7 @@ impl Render for ShortcutsPage {
                                     .child(
                                         widgets::section_card(&theme)
                                             .child(send_behavior_row)
+                                            .child(enter_steers_row)
                                             .child(compact_mode_row)
                                             .child(compact_model_picker_row)
                                             .child(open_links_row)
@@ -1551,5 +1596,48 @@ mod tests {
         let switch = cx.debug_bounds("open-web-links-in-zeron-toggle").unwrap();
         cx.simulate_click(switch.center(), gpui::Modifiers::default());
         assert!(open_in_zeron(cx));
+    }
+
+    /// Ways it fails: the switch is missing; a click does not flip the
+    /// preference; the flip is not written to disk.
+    #[gpui::test]
+    fn general_page_switch_controls_what_enter_does_while_the_agent_works(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (_page, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            let mut page = ShortcutsPage::new(
+                state,
+                KeymapConfig::default(),
+                false,
+                ComposerSendBehavior::Enter,
+                false,
+                false,
+                AppshotDestination::Automatic,
+                cx,
+            );
+            page.show_section(false, true);
+            page
+        });
+        for expected in [false, true] {
+            cx.update(|window, cx| window.draw(cx).clear());
+            let switch = cx.debug_bounds("enter-steers-busy-agent-toggle").unwrap();
+            cx.simulate_click(switch.center(), gpui::Modifiers::default());
+            assert_eq!(
+                cx.update(|_, cx| crate::settings::current(cx).enter_steers_busy_agent),
+                expected
+            );
+            cx.update(|_, cx| crate::settings::flush(cx));
+            assert_eq!(
+                crate::settings::UiSettings::load(dir.path()).enter_steers_busy_agent,
+                expected
+            );
+        }
     }
 }

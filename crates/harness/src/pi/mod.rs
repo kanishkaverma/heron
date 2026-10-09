@@ -1,4 +1,5 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
+mod cache;
 mod catalog;
 mod mcp;
 mod normalize;
@@ -420,6 +421,7 @@ impl Harness for PiHarness {
                 session: String::new(),
                 assistant: uuid::Uuid::new_v4().to_string(),
                 lost_context,
+                parked_notices: Vec::new(),
             };
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
@@ -486,6 +488,9 @@ struct Runner {
     session: String,
     assistant: String,
     lost_context: Option<String>,
+    /// Notices Pi produced while no turn was open. The engine drops events
+    /// from a parked session, so they ride the head of the next turn.
+    parked_notices: Vec<AgentEvent>,
 }
 impl Runner {
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
@@ -493,6 +498,41 @@ impl Runner {
             .send(Ok(event))
             .await
             .map_err(|_| HarnessError::Protocol("Pi event consumer closed".into()))
+    }
+    /// Pi shows cache notices only when `showCacheMissNotices` is set, so the
+    /// same setting decides here, read fresh because a warm session outlives
+    /// a settings edit.
+    async fn notice(&mut self, event: AgentEvent) -> Result<(), HarnessError> {
+        if !self.store.cache_notices(Path::new(&self.request.cwd)) {
+            return Ok(());
+        }
+        if self.active {
+            self.emit(event).await
+        } else {
+            self.parked_notices.push(event);
+            Ok(())
+        }
+    }
+    async fn flush_notices(&mut self) -> Result<(), HarnessError> {
+        for event in std::mem::take(&mut self.parked_notices) {
+            self.emit(event).await?;
+        }
+        Ok(())
+    }
+    /// Seeds the cache comparison with the session's last request, so the
+    /// first turn of a resumed session can be judged as Pi's own TUI would.
+    async fn seed_cache(&mut self, state: &Value) {
+        self.norm.cache = Default::default();
+        let file = state["sessionFile"].as_str().map(PathBuf::from);
+        if let Some(file) = file.filter(|_| {
+            state["messageCount"].as_u64().unwrap_or(0) > 0
+                && self.store.cache_notices(Path::new(&self.request.cwd))
+        }) {
+            self.norm.cache =
+                tokio::task::spawn_blocking(move || cache::Tracker::from_session_file(&file))
+                    .await
+                    .unwrap_or_default();
+        }
     }
     async fn started(&self, model: String) -> Result<(), HarnessError> {
         self.emit(AgentEvent::SessionStarted {
@@ -687,6 +727,8 @@ impl Runner {
         }
         self.auto_compaction = state["autoCompactionEnabled"].as_bool().unwrap_or(true);
         self.norm.window = state["model"]["contextWindow"].as_u64();
+        self.norm.rates(&state["model"]);
+        self.seed_cache(&state).await;
         self.started(state["model"]["id"].as_str().unwrap_or("default").into())
             .await?;
         if let Some(message) = self.lost_context.take() {
@@ -766,6 +808,7 @@ impl Runner {
                 next_assistant_message_id: Some(self.assistant.clone()),
             })
             .await?;
+            self.flush_notices().await?;
         }
         Ok(())
     }
@@ -814,6 +857,7 @@ impl Runner {
             self.store.remember(&self.session, file)?;
         }
         if changed {
+            self.seed_cache(&data).await;
             self.started(data["model"]["id"].as_str().unwrap_or("default").into())
                 .await?;
         }
@@ -821,6 +865,7 @@ impl Runner {
             .as_bool()
             .unwrap_or(self.auto_compaction);
         self.norm.window = data["model"]["contextWindow"].as_u64().or(self.norm.window);
+        self.norm.rates(&data["model"]);
         if data["isStreaming"] != false
             || data["isCompacting"] != false
             || self.pending.values().any(|p| {
@@ -1002,6 +1047,7 @@ impl Runner {
                     .unwrap_or_else(|| "default".into()),
             )
             .await?;
+            self.flush_notices().await?;
         }
         if frame["type"] == "message_start" && frame["message"]["role"] == "user" {
             if self.initial_pending {
@@ -1011,7 +1057,10 @@ impl Runner {
             }
         }
         for event in self.norm.map(&frame) {
-            self.emit(event).await?;
+            match event {
+                AgentEvent::Notice { .. } => self.notice(event).await?,
+                event => self.emit(event).await?,
+            }
         }
         if frame["type"] == "agent_settled" {
             let id = self

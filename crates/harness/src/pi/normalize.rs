@@ -10,6 +10,10 @@ pub(super) struct Normalizer {
     pub error: Option<String>,
     pub aborted: bool,
     pub window: Option<u64>,
+    pub cache: super::cache::Tracker,
+    /// `provider/id` of the selected model and what a cache read costs per
+    /// token: prices a total miss, which has no cache reads to price from.
+    cache_read: Option<(String, f64)>,
 }
 impl Normalizer {
     pub fn reset(&mut self) {
@@ -26,6 +30,22 @@ impl Normalizer {
         } else {
             DoneStatus::Completed
         }
+    }
+    /// Reads the selected model's cache-read price from Pi's `model` object.
+    pub fn rates(&mut self, model: &Value) {
+        self.cache_read = model["cost"]["cacheRead"].as_f64().map(|per_million| {
+            (
+                super::cache::model_key(&model["provider"], &model["id"]),
+                per_million / 1e6,
+            )
+        });
+    }
+    fn cache_read_per_token(&self, message: &Value) -> f64 {
+        let key = super::cache::model_key(&message["provider"], &message["model"]);
+        self.cache_read
+            .as_ref()
+            .filter(|(model, _)| *model == key)
+            .map_or(0.0, |(_, rate)| *rate)
     }
     pub fn map(&mut self, frame: &Value) -> Vec<AgentEvent> {
         let mut events = Vec::new();
@@ -97,7 +117,14 @@ impl Normalizer {
                         window: self.window,
                     });
                 }
+                let miss = self
+                    .cache
+                    .assistant(message, self.cache_read_per_token(message));
+                if !matches!(message["stopReason"].as_str(), Some("error" | "aborted")) {
+                    events.extend(miss.and_then(|miss| miss.notice()));
+                }
             }
+            "entry_appended" => events.extend(self.cache.entry(&frame["entry"])),
             "tool_execution_start" => {
                 let id = string(frame, "toolCallId").to_owned();
                 let name = string(frame, "toolName");
@@ -152,6 +179,13 @@ impl Normalizer {
                         tokens: Some(tokens),
                         window: self.window,
                     });
+                }
+                if frame["result"].is_object() {
+                    self.cache.reset();
+                    events.extend(super::cache::compaction_notice(
+                        "compaction",
+                        &frame["result"]["usage"],
+                    ));
                 }
             }
             "extension_error" => {

@@ -1,8 +1,8 @@
 # Heron
 
 Heron is our fork of `zeronsh/zeron`: Zeron plus a stack of patches. Builds are named
-Heron in the menu bar, Dock and Finder so they can't be mistaken for official Zeron; the
-bundle id and `Zeron.app` file name stay, so settings and chats carry over. This branch
+Heron and install as their own app, `/Applications/Heron.app` (bundle id `sh.heron.app`,
+data in `~/.heron`, engine port 27664), so Heron runs beside an official Zeron install. This branch
 (`fork-release`) holds the automation. The fork is two things:
 
 - **`main`** is upstream `main` with our patches on top. That stack of commits is the fork.

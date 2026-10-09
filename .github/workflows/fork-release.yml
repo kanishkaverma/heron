@@ -97,13 +97,20 @@ jobs:
         run: |
           plutil -insert LSEnvironment -json "{\"ZERON_RELEASES_URL\":\"$FEED\"}" dist/macos/Info.plist
 
-      # Same bundle id and file name (Zeron.app), so settings, chats and the
-      # in-app updater carry over. The menu bar shows CFBundleName; Finder, the
-      # Dock and Cmd-Tab show the localized display name, which macOS only uses
-      # while the unlocalized CFBundleDisplayName matches the file name.
+      # Heron is its own app beside Zeron: its own bundle id, data dir (~/.heron)
+      # and engine port, installed as /Applications/Heron.app. It leaves the
+      # zeron:// links to Zeron. The tarball still holds Zeron.app because the
+      # in-app updater looks for that name. The menu bar shows CFBundleName;
+      # Finder, the Dock and Cmd-Tab show the localized display name (macOS uses
+      # it only while the unlocalized CFBundleDisplayName matches the file name,
+      # and shows the file name otherwise, so it reads Heron either way).
       - name: name the app Heron
         if: steps.src.outputs.patched == 'true'
         run: |
+          echo "ZERON_BUILD_DATA_DIR_NAME=.heron" >>"$GITHUB_ENV"
+          echo "ZERON_BUILD_IPC_PORT=27664" >>"$GITHUB_ENV"
+          plutil -replace CFBundleIdentifier -string sh.heron.app dist/macos/Info.plist
+          plutil -remove CFBundleURLTypes dist/macos/Info.plist
           plutil -replace CFBundleName -string Heron dist/macos/Info.plist
           plutil -replace CFBundleDisplayName -string Zeron dist/macos/Info.plist
           plutil -replace LSHasLocalizedDisplayName -bool true dist/macos/Info.plist
@@ -131,6 +138,10 @@ jobs:
           if [ "$PATCHED" = true ]; then
             [ "$(plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$app/Contents/Info.plist")" = "$FEED" ]
             [ "$(plutil -extract CFBundleName raw "$app/Contents/Info.plist")" = Heron ]
+            [ "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = sh.heron.app ]
+            ! plutil -extract CFBundleURLTypes raw "$app/Contents/Info.plist" 2>/dev/null
+            env -u ZERON_DATA_DIR -u ZERON_IPC_PORT "$app/Contents/MacOS/zeron" status | tee "$RUNNER_TEMP/status"
+            grep -qF "Data dir: $HOME/.heron" "$RUNNER_TEMP/status"
             [ "$(plutil -extract LSHasLocalizedDisplayName raw "$app/Contents/Info.plist")" = true ]
             grep -qF '"CFBundleDisplayName" = "Heron";' "$app/Contents/Resources/en.lproj/InfoPlist.strings"
             codesign --verify --deep "$app"
@@ -165,8 +176,8 @@ jobs:
           fi
           notes="$what
 
-          Apple silicon, ad-hoc signed, not notarized. After a manual install from the dmg run:
+          Apple silicon, ad-hoc signed, not notarized. Heron keeps its own data in ~/.heron and runs beside Zeron. The dmg holds Zeron.app; drag it in, rename it Heron.app, then run:
 
-              xattr -dr com.apple.quarantine /Applications/Zeron.app"
+              xattr -dr com.apple.quarantine /Applications/Heron.app"
           gh release create "$release" "$dmg" "$app" manifest.json -R "$GITHUB_REPOSITORY" \
             --verify-tag --latest --title "$title" --notes "$notes"

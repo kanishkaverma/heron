@@ -5618,6 +5618,7 @@ impl Shell {
     /// the keys it records before they can dispatch.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
         self.command_palette.is_some()
+            || self.tree_palette.is_some()
             || self.voice.read(cx).stage_open
             || self.section_dialog.is_some()
             || self.section_menu.is_some()
@@ -9778,6 +9779,11 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
+        if event.keystroke.key == "escape" && self.tree_palette.is_some() {
+            self.close_session_tree(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if matches!(self.route, Route::Settings(_)) {
             return;
         }
@@ -10113,6 +10119,9 @@ impl Shell {
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         overlays.extend(self.render_section_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
+            overlays.push(overlay);
+        }
+        if let Some(overlay) = self.render_tree_palette(viewport, window, cx) {
             overlays.push(overlay);
         }
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
@@ -12685,6 +12694,7 @@ impl Render for Shell {
                 WorkspaceCommand::Stop => {
                     self.composer.update(cx, |c, cx| c.interrupt_selected(cx))
                 }
+                WorkspaceCommand::Tree => self.open_session_tree(window, cx),
                 _ => {}
             }
         }

@@ -25,17 +25,17 @@ pub(super) struct CommandPalette {
 // X11 suppresses synthetic repeat releases but sends repeated keydowns with
 // is_held=false. Keep our own latch until the physical key is released.
 #[derive(Default)]
-struct EnterPress {
+pub(super) struct EnterPress {
     down: bool,
 }
 
 impl EnterPress {
-    fn press(&mut self, is_held: bool) -> bool {
+    pub(super) fn press(&mut self, is_held: bool) -> bool {
         let was_down = std::mem::replace(&mut self.down, true);
         !was_down && !is_held
     }
 
-    fn release(&mut self) {
+    pub(super) fn release(&mut self) {
         self.down = false;
     }
 }

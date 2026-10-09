@@ -669,3 +669,109 @@ async fn real_pi_tree_jump_survives_new_processes() {
     )
     .unwrap();
 }
+
+async fn next_turn(
+    stream: &mut (impl futures::Stream<Item = Result<AgentEvent, zeron_harness::HarnessError>> + Unpin),
+) -> Vec<AgentEvent> {
+    let mut events = vec![];
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn completes");
+    events
+}
+
+/// A jump sent to a Pi that Zeron keeps parked between turns takes effect in
+/// that same process, and survives into the next one.
+/// Ways it fails:
+/// - The jump, arriving as a steer into an idle runner, reaches the model
+///   as text, or never completes the turn.
+/// - The parked process keeps answering from the old tip while the file says
+///   otherwise (or the reverse).
+#[tokio::test]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
+async fn real_pi_tree_jump_in_a_parked_runner() {
+    let (dir, harness) = isolated_pi();
+    let cwd = dir.path();
+    let (steer, steering) = mpsc::channel(8);
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        steering,
+        interrupt: CancellationToken::new(),
+        request_input: Box::new(|_| oneshot::channel().1),
+        turn: Default::default(),
+    };
+    let request = RunRequest {
+        prompt: "one".into(),
+        harness: None,
+        model: Some("zeron-probe/mock".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.display().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        resume: None,
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+    };
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let say = |text: String| {
+        let steer = steer.clone();
+        async move {
+            steer
+                .send(SteerMessage {
+                    prompt: text,
+                    message_id: None,
+                    attachments: Vec::new(),
+                    config: None,
+                })
+                .await
+                .unwrap();
+        }
+    };
+
+    let first = next_turn(&mut stream).await;
+    let session = match first.last() {
+        Some(AgentEvent::Done {
+            session_id: Some(id),
+            ..
+        }) => id.clone(),
+        other => panic!("first turn ends with its session: {other:?}"),
+    };
+    say("two".into()).await;
+    assert!(reply(&next_turn(&mut stream).await).contains("MOCK:two"));
+
+    let tree = harness.session_tree(&session, cwd).await.unwrap().unwrap();
+    let two = tree.entries[2].id.clone();
+    assert_eq!(tree.entries[2].text, "two");
+    say(format!("/zeron-tree-jump {two}")).await;
+    let jump = reply(&next_turn(&mut stream).await);
+    assert!(jump.contains("two") && !jump.contains("MOCK:"), "{jump}");
+
+    say("ctx?".into()).await;
+    assert_eq!(
+        reply(&next_turn(&mut stream).await).trim(),
+        "MOCK:ctx=one|ctx?",
+        "the parked process continues from the jump"
+    );
+    drop(say);
+    drop(steer);
+    while stream.next().await.is_some() {}
+
+    let (events, _) = turn(&harness, cwd, "ctx?", Some(&session)).await;
+    assert_eq!(
+        reply(&events).trim(),
+        "MOCK:ctx=one|ctx?|ctx?",
+        "and so does the next process"
+    );
+}

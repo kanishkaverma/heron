@@ -244,6 +244,15 @@ pub trait Harness: Send + Sync {
     ) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands().await
     }
+    /// The branching history of `session_id`, for harnesses whose sessions are
+    /// trees. `None` means this harness has no such notion.
+    async fn session_tree(
+        &self,
+        _session_id: &str,
+        _cwd: &std::path::Path,
+    ) -> Result<Option<zeron_proto::SessionTree>, HarnessError> {
+        Ok(None)
+    }
     /// Project-scoped skills; None means this provider does not advertise skills.
     async fn skills(
         &self,

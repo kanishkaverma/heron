@@ -40,7 +40,8 @@ export default function(pi) {
         }
         msg.content.push({type:'text',text:''});
         stream.push({type:'text_start',contentIndex:0,partial:msg});
-        msg.content[0].text = 'MOCK:'+(gate ? batch.join('|') : text);
+        const userTexts = () => context.messages.filter(m => m.role === 'user').map(m => typeof m.content === 'string' ? m.content : m.content.filter(c=>c.type==='text').map(c=>c.text).join(''));
+        msg.content[0].text = 'MOCK:'+(text === 'ctx?' ? 'ctx='+userTexts().join('|') : gate ? batch.join('|') : text);
         stream.push({type:'text_delta',contentIndex:0,delta:msg.content[0].text,partial:msg});
         stream.push({type:'text_end',contentIndex:0,content:msg.content[0].text,partial:msg});
         stream.push({type:'done',reason:'stop',message:msg});stream.end();

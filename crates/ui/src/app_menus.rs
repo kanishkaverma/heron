@@ -160,16 +160,42 @@ fn app_key_bindings(macos: bool) -> Vec<KeyBinding> {
     bindings
 }
 
+/// The bundle's (localized) `CFBundleName`, which AppKit already uses to title
+/// the app menu, so a renamed build's menu items and about panel agree with it.
+/// Unbundled builds have none and say "Zeron".
+pub fn app_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_foundation::{NSBundle, NSString};
+            let name = NSBundle::mainBundle()
+                .objectForInfoDictionaryKey(&NSString::from_str("CFBundleName"))
+                .and_then(|value| value.downcast::<NSString>().ok())
+                .map(|name| name.to_string())
+                .filter(|name| !name.is_empty());
+            if let Some(name) = name {
+                return name;
+            }
+        }
+        "Zeron".to_owned()
+    })
+}
+
 /// The zeron menu bar. macOS renders this natively; mac-only entries are gated
 /// at runtime (`cfg!`) so the whole module compiles and tests on Linux.
 pub fn app_menus() -> Vec<Menu> {
+    app_menus_named(app_name())
+}
+
+fn app_menus_named(name: &str) -> Vec<Menu> {
     let macos = cfg!(target_os = "macos");
 
     // macOS titles the first menu with the bundle/process name regardless of
     // what we pass, but gpui still wants a name.
     let mut app_items = vec![
         // The native AppKit about panel; no equivalent elsewhere yet.
-        MenuItem::action("About Zeron", About).disabled(!macos),
+        MenuItem::action(format!("About {name}"), About).disabled(!macos),
         // Sparkle's placement: directly under About. Other platforms reach
         // the same check from the account menu.
         MenuItem::action("Check for Updates…", CheckForUpdates),
@@ -181,16 +207,16 @@ pub fn app_menus() -> Vec<Menu> {
         app_items.extend([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Zeron", Hide),
+            MenuItem::action(format!("Hide {name}"), Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
         ]);
     }
-    app_items.push(MenuItem::action("Quit Zeron", Quit));
+    app_items.push(MenuItem::action(format!("Quit {name}"), Quit));
 
     let mut menus = vec![
-        Menu::new("Zeron").items(app_items),
+        Menu::new(name.to_owned()).items(app_items),
         // Standard clipboard verbs tied to the composer's existing actions via
         // their native selectors (`OsAction` → cut:/copy:/paste:/selectAll:),
         // so the OS Edit menu routes through the responder chain to the focused
@@ -241,6 +267,32 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Ways it fails: a rebranded bundle (CFBundleName "Heron") still offers
+    /// "About Zeron", "Hide Zeron" or "Quit Zeron" under a menu AppKit titles
+    /// "Heron".
+    #[test]
+    fn app_menu_items_carry_the_bundle_name() {
+        let menus = app_menus_named("Heron");
+        let names: Vec<_> = menus[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(menus[0].name.as_ref(), "Heron");
+        assert!(names.contains(&"About Heron".to_string()), "{names:?}");
+        assert!(names.contains(&"Quit Heron".to_string()), "{names:?}");
+        if cfg!(target_os = "macos") {
+            assert!(names.contains(&"Hide Heron".to_string()), "{names:?}");
+        }
+        assert!(
+            !names.iter().any(|name| name.contains("Zeron")),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -397,7 +449,7 @@ mod about_panel {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
-        let name = NSString::from_str("Zeron");
+        let name = NSString::from_str(super::app_name());
         let version = NSString::from_str(env!("CARGO_PKG_VERSION"));
         // Empty build version: CFBundleVersion equals the marketing version, and
         // AppKit would otherwise render "Version 0.2.61 (0.2.61)".

@@ -72,15 +72,27 @@ live, with staged attachments, in a side chat, and in other agents' chats. A
 parked Pi's output in the first second after a turn is dropped as that turn's
 tail, so a jump that quick has no confirmation line, though it still happens.
 
+Pi's cache notices (a miss re-billed, a cache refresh paid for, a compaction's
+cost) appear as quiet transcript lines, amber for misses and compaction costs.
+They follow Pi's own `showCacheMissNotices` setting, read from project then global
+settings each time a notice is due. The RPC carries only raw usage, so the
+driver repeats Pi's comparison with the previous request. A resumed session reads
+that request from the tail of its JSONL file. The engine keeps a Pi process warm
+between turns, so Pi's `cacheWarming: "idle"` keeps refreshing and billing until the
+engine reaps the process. The engine drops events from a parked session, so the
+driver holds refreshes that land between turns and shows them at the head of the
+next turn.
+
 Validation:
 
 ```sh
 cargo test -p zeron-harness --features native-fixture
 cargo test -p zeron-harness --test pi_session_tree
 cargo test -p zeron-engine --test session_tree
-cargo test -p zeron-engine --lib --test pi_resume --test acp_lifecycle --test message_queue --test e2e
+cargo test -p zeron-engine --lib --test pi_resume --test notice_parts --test acp_lifecycle --test message_queue --test e2e
 cargo test -p zeron-harness --test pi_live -- --ignored --nocapture
 cargo test -p zeron-ui --lib -- --test-threads=1 --ignored session_tree
+cargo test -p zeron-harness --test pi_cache_notices -- --ignored --test-threads=1
 cargo check -p zeron-ui --tests
 cargo build -p zeron-mobile --features bindgen
 ```

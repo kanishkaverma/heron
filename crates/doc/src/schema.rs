@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::{SessionCommandEntry, SessionCommandStatus};
 use crate::constants::{SESSION_SCHEMA_VERSION, TAIL_MESSAGE_COUNT};
 use crate::parts::{MessagePart, MessageStatus, SubagentStatus};
+use zeron_proto::NoticeTone;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DocError {
@@ -98,6 +99,10 @@ struct DocPartJson {
     source_chat_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_title: Option<String>,
+    /// Notice severity (`kind: "notice"`, additive): "warning"; absent is dim.
+    /// The notice text rides `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tone: Option<String>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,6 +218,13 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Notice { id, tone, text } => DocPartJson {
+            id: id.clone(),
+            kind: "notice".into(),
+            message: Some(text.clone()),
+            tone: matches!(tone, NoticeTone::Warning).then(|| "warning".to_owned()),
+            ..Default::default()
+        },
         MessagePart::Fork {
             id,
             source_chat_id,
@@ -273,6 +285,14 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "reasoning" => MessagePart::Reasoning {
             id: p.id,
             text: p.reasoning.unwrap_or_default(),
+        },
+        "notice" => MessagePart::Notice {
+            id: p.id,
+            tone: match p.tone.as_deref() {
+                Some("warning") => NoticeTone::Warning,
+                _ => NoticeTone::Dim,
+            },
+            text: p.message.unwrap_or_default(),
         },
         "fork" => MessagePart::Fork {
             id: p.id,
@@ -868,6 +888,7 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     for (key, value) in [
         ("sourceChatId", &doc_part.source_chat_id),
         ("sourceTitle", &doc_part.source_title),
+        ("tone", &doc_part.tone),
     ] {
         if let Some(value) = value {
             map.insert(key, value.as_str())?;
@@ -1435,7 +1456,7 @@ mod tests {
         assert_eq!(entries[0].role, MessageRole::System);
         assert_eq!(entries[0].parts, vec![seam]);
     }
-    use zeron_proto::{AgentEvent, ToolCall};
+    use zeron_proto::{AgentEvent, NoticeTone, ToolCall};
 
     #[test]
     fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
@@ -1924,6 +1945,60 @@ mod tests {
         let part = &value["messages"][0]["parts"][0];
         assert_eq!(part["kind"], "reasoning");
         assert_eq!(part["reasoning"], "let me think");
+        assert!(part.get("text").is_none(), "{part:?}");
+    }
+
+    /// Ways it can fail: a notice does not survive the doc (it vanishes, or
+    /// comes back with the wrong tone), or an old reader — whose unknown-kind
+    /// fallback prints the `text` field as prose — would show it as the
+    /// agent's words instead of an empty part.
+    #[test]
+    fn notices_stream_into_the_doc_and_stay_invisible_to_old_readers() {
+        let doc = SessionDoc::init("chat-n").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+        let mut folded = Vec::new();
+        for event in [
+            AgentEvent::TextDelta { text: "Hi".into() },
+            AgentEvent::Notice {
+                tone: NoticeTone::Warning,
+                text: "Cache miss after 12m idle: 80k tokens re-billed (~$0.22)".into(),
+            },
+            AgentEvent::Notice {
+                tone: NoticeTone::Dim,
+                text: "Cache warmed: $0.024045".into(),
+            },
+        ] {
+            fold_event_into_parts(&mut folded, &event);
+            writer.sync(&folded).unwrap();
+        }
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].parts, folded);
+        assert_eq!(
+            entries[0].parts[1],
+            MessagePart::Notice {
+                id: "n1".into(),
+                tone: NoticeTone::Warning,
+                text: "Cache miss after 12m idle: 80k tokens re-billed (~$0.22)".into(),
+            }
+        );
+        assert!(matches!(
+            entries[0].parts[2],
+            MessagePart::Notice {
+                tone: NoticeTone::Dim,
+                ..
+            }
+        ));
+
+        let value = doc.doc.get_deep_value().to_json_value();
+        let part = &value["messages"][0]["parts"][1];
+        assert_eq!(part["kind"], "notice");
+        assert_eq!(part["tone"], "warning");
+        assert_eq!(
+            part["message"],
+            "Cache miss after 12m idle: 80k tokens re-billed (~$0.22)"
+        );
         assert!(part.get("text").is_none(), "{part:?}");
     }
 

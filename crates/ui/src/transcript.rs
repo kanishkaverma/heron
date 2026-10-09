@@ -40,7 +40,7 @@ use gpui::{
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
-use zeron_proto::ToolCall;
+use zeron_proto::{NoticeTone, ToolCall};
 
 use crate::markdown::mermaid_cache::{self, MermaidCache};
 use crate::markdown::parser::{
@@ -1077,6 +1077,12 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+    /// A quiet bookkeeping line between the agent's own rows (a cache miss
+    /// re-billed): not the agent's prose and not a failure.
+    Notice {
+        tone: NoticeTone,
+        text: SharedString,
+    },
     /// The fork seam: a labeled divider between copied history and the
     /// chat's own turns.
     ForkMarker {
@@ -1683,6 +1689,26 @@ pub fn rows_for_entry(
                             kind: RowKind::ForkMarker {
                                 source_chat_id: source_chat_id.clone().into(),
                                 source_title: single_line(source_title).into(),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                        });
+                    }
+                    MessagePart::Notice {
+                        id: part_id,
+                        tone,
+                        text,
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(text.as_bytes()) << 1
+                                | matches!(tone, NoticeTone::Warning) as u64,
+                            turn_start: false,
+                            kind: RowKind::Notice {
+                                tone: *tone,
+                                text: single_line(text).into(),
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -7426,6 +7452,7 @@ impl Transcript {
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::Notice { tone, text } => notice_line(*tone, text.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
         // Diagram fences this row just requested start rendering after layout.
@@ -8902,6 +8929,31 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// A harness bookkeeping line: small, muted and one line. A warning takes the
+/// amber of the notice chip, so money already lost reads differently from a
+/// refresh that kept a cache alive.
+fn notice_line(tone: NoticeTone, text: SharedString, theme: &Theme) -> AnyElement {
+    let color = match tone {
+        NoticeTone::Warning => theme.warning_muted,
+        NoticeTone::Dim => theme.text_muted.opacity(0.7),
+    };
+    div()
+        .py(px(4.0))
+        .w_full()
+        .min_w_0()
+        .child(
+            div()
+                .debug_selector(|| "notice-line".into())
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(color)
+                .child(text),
+        )
+        .into_any_element()
+}
+
 /// A quiet fork seam. The source gets its own constrained line so long
 /// titles cannot widen a narrow side-chat pane. No message metadata lane.
 fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
@@ -10291,6 +10343,67 @@ mod tests {
             assert!(reveal.header_started_at.is_none());
             assert!(reveal.starts.iter().all(Option::is_none));
         });
+    }
+
+    /// Ways it can fail: the synced transcript never turns a notice part into
+    /// a row, the row draws nothing, or a long notice wraps into a block that
+    /// reads as content instead of one quiet line.
+    #[gpui::test]
+    fn a_synced_notice_draws_as_one_short_line(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let long = format!(
+            "Cache miss after 12m idle: 80k tokens re-billed (~$0.22) {}",
+            "and then some ".repeat(40)
+        );
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat".into());
+            state.transcript_replayed = true;
+            state.transcript = vec![assistant(
+                "a1",
+                MessageStatus::Complete,
+                vec![
+                    text_part("t0", "Looking"),
+                    notice_part("n1", NoticeTone::Warning, &long),
+                ],
+            )];
+            state.transcript_revision += 1;
+        });
+        transcript.update(cx, |this, cx| this.sync(cx));
+        let ix = transcript.read_with(cx, |this, _| {
+            this.rows
+                .iter()
+                .position(|row| matches!(row.kind, RowKind::Notice { .. }))
+                .expect("the synced transcript has a notice row")
+        });
+
+        struct Probe {
+            transcript: Entity<Transcript>,
+            ix: usize,
+        }
+        impl Render for Probe {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let ix = self.ix;
+                let row = self
+                    .transcript
+                    .update(cx, |this, cx| this.render_row(ix, window, cx));
+                div().w(px(600.0)).child(row)
+            }
+        }
+        let (_, cx) = cx.add_window_view(|_, _| Probe { transcript, ix });
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("notice-line").expect("the notice drew");
+        assert!(
+            bounds.size.height > px(0.0) && bounds.size.height < px(24.0),
+            "a notice is one line, not a block: {bounds:?}"
+        );
+        assert!(bounds.size.width <= px(600.0), "{bounds:?}");
     }
 
     #[gpui::test]
@@ -12212,6 +12325,70 @@ mod tests {
             unreachable!();
         };
         assert_eq!(tools.len(), 2, "the error didn't split the work group");
+    }
+
+    fn notice_part(id: &str, tone: NoticeTone, text: &str) -> MessagePart {
+        MessagePart::Notice {
+            id: id.into(),
+            tone,
+            text: text.into(),
+        }
+    }
+
+    /// Ways it can fail: a notice produces no row, shows as an error chip, is
+    /// folded into the compact work header where nobody sees it, splits the
+    /// compact work group in two, or leaks into the copied message text.
+    #[test]
+    fn notices_are_quiet_rows_that_stay_visible_and_never_enter_the_copy() {
+        let miss = "Cache miss after 12m idle: 80k tokens re-billed (~$0.22)";
+        let entry = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t0", "ls"),
+                notice_part("n1", NoticeTone::Warning, miss),
+                tool_part("t1", "pwd"),
+                notice_part("n2", NoticeTone::Dim, "Cache warmed: $0.024045"),
+                text_part("r0", "the answer"),
+            ],
+        );
+        let shape = |rows: &[&Row]| -> Vec<String> {
+            rows.iter()
+                .map(|row| match &row.kind {
+                    RowKind::ToolGroup { tools, .. } => format!("tools:{}", tools.len()),
+                    RowKind::Notice { tone, text } => format!("{tone:?}:{text}"),
+                    RowKind::Markdown { .. } => "reply".into(),
+                    _ => "other".into(),
+                })
+                .collect()
+        };
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        assert_eq!(
+            shape(&rows.iter().collect::<Vec<_>>()),
+            vec![
+                "tools:1".to_owned(),
+                format!("Warning:{miss}"),
+                "tools:1".to_owned(),
+                "Dim:Cache warmed: $0.024045".to_owned(),
+                "reply".to_owned(),
+            ]
+        );
+        let rows = rows_for_entry(&entry, false, true, &mut parse);
+        let visible = compact_visible(&rows);
+        assert_eq!(
+            shape(&visible),
+            vec![
+                "tools:2".to_owned(),
+                format!("Warning:{miss}"),
+                "Dim:Cache warmed: $0.024045".to_owned(),
+                "reply".to_owned(),
+            ]
+        );
+        assert!(visible[1].compact_fold.is_none());
+        assert_eq!(
+            visible.last().unwrap().copy_text.as_deref(),
+            Some("the answer")
+        );
     }
 
     #[test]

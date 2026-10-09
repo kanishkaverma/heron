@@ -5722,6 +5722,12 @@ impl WorkspaceCommand {
                 true,
             ),
             (Self::Stop, "stop", "Zeron: stop the active run", true),
+            (
+                Self::Tree,
+                "tree",
+                "Zeron: jump to an earlier point in this conversation",
+                true,
+            ),
         ]
     }
 }
@@ -5734,6 +5740,10 @@ fn with_workspace_commands(
     rows.retain(|row| row.workspace_command.is_none());
     for &(command, name, description, needs_chat) in WorkspaceCommand::catalog() {
         if needs_chat && !in_chat {
+            continue;
+        }
+        // Only Pi sessions are trees.
+        if command == WorkspaceCommand::Tree && harness != Some(HarnessId::Pi) {
             continue;
         }
         // Keep provider commands intact. Explicit Zeron names remain available
@@ -6596,9 +6606,29 @@ impl Composer {
         )
     }
 
-    #[cfg(test)]
     pub(crate) fn draft_text(&self, cx: &App) -> String {
         self.input.read(cx).text().to_string()
+    }
+
+    /// Attachments and review comments ride along with the next send.
+    pub(crate) fn holds_staged_extras(&self, cx: &App) -> bool {
+        !self.staged().is_empty()
+            || !self.staged_appshots().is_empty()
+            || !self.staged_comments(cx).is_empty()
+    }
+
+    /// Put `text` in the box for editing and send nothing.
+    pub(crate) fn prefill(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+    }
+
+    /// Send `text` as a message of its own. Whatever is typed stays in the
+    /// box for the next one. Callers check [`Self::holds_staged_extras`]
+    /// first: a send takes the staged attachments and comments with it.
+    pub(crate) fn send_aside(&mut self, text: String, cx: &mut Context<Self>) {
+        let draft = self.draft_text(cx);
+        self.send(text, false, false, cx);
+        self.input.update(cx, |input, cx| input.set_text(draft, cx));
     }
 
     #[cfg(test)]

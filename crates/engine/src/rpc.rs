@@ -1409,6 +1409,7 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::FORK_SIDE_CHAT
+            | methods::GET_SESSION_TREE
             | methods::LIST_HARNESSES
             | methods::INSTALL_HARNESS
             | methods::CANCEL_INSTALL
@@ -2064,6 +2065,40 @@ impl RpcService for EngineRpc {
                 self.doc_host.persist_fork(&target).map_err(failed)?;
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)
+            }
+            methods::GET_SESSION_TREE => {
+                let p: ChatParams = parse_params(params)?;
+                let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(failed)?
+                    .ok_or_else(|| RpcError::BadParams("chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::BadParams("chat belongs to another device".into()));
+                }
+                let session = chat
+                    .harness_session_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty());
+                let (Some(config), Some(session)) = (&chat.config, session) else {
+                    return RpcReply::value(&zeron_proto::SessionTreeReply::default());
+                };
+                let cwd = chat
+                    .harness_session_cwd
+                    .as_deref()
+                    .or(chat.cwd.as_deref())
+                    .unwrap_or("~");
+                let cwd =
+                    crate::repos::expand_home(cwd).map_err(|e| RpcError::Failed(e.to_string()))?;
+                let tree = self
+                    .registry
+                    .resolve(config.harness)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .session_tree(session, std::path::Path::new(&cwd))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&zeron_proto::SessionTreeReply { tree })
             }
             methods::FOCUS_CHAT => {
                 let p: ChatParams = parse_params(params)?;

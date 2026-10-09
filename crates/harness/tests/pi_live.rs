@@ -342,3 +342,103 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
     );
     assert_eq!(wait_probe_lines(&calls, 3).await.len(), 3);
 }
+
+/// `/reload` is a TUI-only built-in that Pi's RPC `get_commands` never lists.
+/// Ways it fails: the menu lacks it; it reaches the model as text ("MOCK:/reload");
+/// the reply is a raw JSON dump; a resource added since the last run stays
+/// missing from the menu; the turn never completes; it shadows an extension's
+/// own `reload` command.
+#[tokio::test]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
+async fn real_pi_reload_refreshes_commands_without_prompting_the_model() {
+    let (dir, harness) = isolated_pi();
+    let cwd = dir.path();
+    let listed = harness.commands_for(cwd).await.unwrap();
+    assert!(listed.iter().any(|c| c.name == "reload"), "{listed:?}");
+    assert!(!listed.iter().any(|c| c.name == "fresh-template"));
+
+    let prompts = cwd.join("agent/prompts");
+    std::fs::create_dir_all(&prompts).unwrap();
+    std::fs::write(
+        prompts.join("fresh-template.md"),
+        "---\ndescription: Added after discovery\n---\nSay hi\n",
+    )
+    .unwrap();
+
+    let (_steer, steering) = mpsc::channel(8);
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        steering,
+        interrupt: CancellationToken::new(),
+        request_input: Box::new(|_| oneshot::channel().1),
+        turn: Default::default(),
+    };
+    drop(_steer);
+    let request = RunRequest {
+        prompt: "/reload".into(),
+        harness: None,
+        model: Some("zeron-probe/mock".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.display().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        resume: None,
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+    };
+    let events: Vec<AgentEvent> = tokio::time::timeout(
+        Duration::from_secs(20),
+        harness
+            .run(request, controls)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect(),
+    )
+    .await
+    .expect("/reload turn completes");
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!text.contains("MOCK:"), "reached the model: {text}");
+    assert!(!text.contains("\"commands\""), "raw JSON reply: {text}");
+    assert!(text.contains("Reloaded"), "{text}");
+    let refreshed = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AvailableCommands { commands } => Some(commands),
+            _ => None,
+        })
+        .last()
+        .unwrap();
+    assert!(
+        refreshed.iter().any(|c| c.name == "fresh-template"),
+        "{refreshed:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+    let artifact = std::env::var_os("ZERON_E2E_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("zeron-pi-reload-e2e"));
+    std::fs::create_dir_all(&artifact).unwrap();
+    std::fs::write(
+        artifact.join("reload-events.txt"),
+        events
+            .iter()
+            .map(|e| format!("{e:?}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+}

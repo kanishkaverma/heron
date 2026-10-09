@@ -236,6 +236,15 @@ fn thinking_selected(request: &RunRequest) -> bool {
             .get("pi_thinking")
             .is_some_and(|v| v == "off")
 }
+fn extension_commands(data: &Value) -> HashSet<String> {
+    data["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["source"] == "extension")
+        .map(|c| string(c, "name").to_owned())
+        .collect()
+}
 fn response_data(frame: Value) -> Result<Value, HarnessError> {
     if frame["success"] == true {
         Ok(frame["data"].clone())
@@ -543,13 +552,7 @@ impl Runner {
             .process
             .query(json!({"type":"get_commands"}), backlog)
             .await?;
-        self.extension_commands = commands["commands"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|c| c["source"] == "extension")
-            .map(|c| string(c, "name").to_owned())
-            .collect();
+        self.extension_commands = extension_commands(&commands);
         self.emit(AgentEvent::AvailableCommands {
             commands: catalog::commands(&commands),
         })
@@ -896,7 +899,17 @@ impl Runner {
                 if epoch == self.epoch {
                     self.initial_pending = false;
                     self.confirm_delivery().await?;
-                    let text = if data.is_null() {
+                    let text = if data["commands"].is_array() {
+                        self.extension_commands = extension_commands(&data);
+                        let commands = catalog::commands(&data);
+                        let text = format!(
+                            "Reloaded extensions, skills, prompt templates and context files ({} commands).",
+                            commands.len()
+                        );
+                        self.emit(AgentEvent::AvailableCommands { commands })
+                            .await?;
+                        text
+                    } else if data.is_null() {
                         "Pi command completed.".into()
                     } else {
                         serde_json::to_string_pretty(&data).unwrap()

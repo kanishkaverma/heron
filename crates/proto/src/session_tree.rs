@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Reply of `GetSessionTree`. A wrapper, because a bare `null` reply is
+/// indistinguishable from no reply on the wire.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionTreeReply {
+    /// `None` when the chat's harness has no session tree, or it has not run.
+    pub tree: Option<SessionTree>,
+}
+
 /// What the picker shows: one row per entry a user can continue from, in
 /// display order (depth-first, the branch holding the leaf listed first).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

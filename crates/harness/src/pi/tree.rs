@@ -8,13 +8,13 @@ use zeron_proto::{SessionTree, TreeEntry, TreeEntryKind};
 const USER_TEXT_CAP: usize = 16 * 1024;
 const PREVIEW_CAP: usize = 240;
 
-/// Prefix of the commands Zeron's own extensions register. They are how Zeron
-/// drives Pi, not something to offer in the slash menu.
-pub(super) const INTERNAL_COMMAND_PREFIX: &str = "zeron-";
+/// The command the extension registers: `/zeron-tree-jump <entryId>
+/// [summarize]`. It is how Zeron drives Pi, not something to offer in the
+/// slash menu.
+pub(super) const JUMP_COMMAND: &str = "zeron-tree-jump";
 
-/// Load the extension that moves the leaf (`/zeron-tree-jump <entryId>
-/// [summarize]`). Pi's RPC has no `navigate_tree`; only an extension command
-/// can call `ctx.navigateTree`.
+/// Load the extension that moves the leaf. Pi's RPC has no `navigate_tree`;
+/// only an extension command can call `ctx.navigateTree`.
 pub(super) fn install(cmd: &mut Command, scratch: &ScratchDir) -> Result<(), HarnessError> {
     let extension = scratch.path().join("zeron-tree.mjs");
     std::fs::write(&extension, include_str!("tree.mjs"))?;

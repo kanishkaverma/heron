@@ -173,11 +173,13 @@ fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
     });
     window
         .update(cx, |shell, _, cx| {
-            shell.state.update(cx, |state, _| {
+            shell.state.update(cx, |state, cx| {
                 state.chats = rows;
                 state.set_test_engine(engine);
                 state.selected_chat = Some("c".into());
+                cx.notify();
             });
+            shell.debug_gate = Some(crate::state::GatePhase::Ready);
         })
         .unwrap();
     let draw = |cx: &mut TestAppContext| {
@@ -224,6 +226,9 @@ fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
             .collect()
     };
 
+    draw(cx);
+    cx.run_until_parked();
+    draw(cx);
     open_tree(cx);
     assert_eq!(visible(cx), ["u1", "a1", "u2", "a2", "u3", "a3"]);
     assert_eq!(cursor(cx).as_deref(), Some("a2"), "starts at where you are");
@@ -262,13 +267,55 @@ fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
         .read_entries()
         .unwrap();
     assert_eq!(transcript[0].role, zeron_doc::MessageRole::User);
+    assert_eq!(
+        transcript[0].parts,
+        [zeron_doc::MessagePart::Text {
+            id: "t0".into(),
+            text: "/zeron-tree-jump u2".into()
+        }],
+        "the jump is a line in the conversation"
+    );
 
-    // A reply, with a summary of the branch left: the draft stays as typed.
+    // The app clears its working indicator when the engine reports the turn
+    // done; this test has no session watcher, so it does the same by hand.
+    let agent_idle = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.begin_pending_send("c", "done", chrono::Utc::now());
+                    state.end_pending_send("c", "done");
+                });
+            })
+            .unwrap()
+    };
+    let type_draft = |cx: &mut TestAppContext, text: &str| {
+        window
+            .update(cx, |shell, _, cx| {
+                shell
+                    .composer
+                    .update(cx, |composer, cx| composer.prefill(text, cx))
+            })
+            .unwrap()
+    };
+
+    // A reply: jump there, and nothing comes back to the composer.
+    agent_idle(cx);
+    type_draft(cx, "");
+    open_tree(cx);
+    cx.simulate_keystrokes(window.into(), "down down enter");
+    settle(cx, "the second jump", |_| prompts().len() == 2);
+    assert_eq!(prompts()[1], "/zeron-tree-jump a3");
+    assert_eq!(draft(cx), "");
+
+    // A user message with something typed already: it stays, and Shift+Enter
+    // asks for a summary of the branch left behind.
+    agent_idle(cx);
+    type_draft(cx, "my draft");
     open_tree(cx);
     cx.simulate_keystrokes(window.into(), "down shift-enter");
-    settle(cx, "the second jump", |_| prompts().len() == 2);
-    assert_eq!(prompts()[1], "/zeron-tree-jump u3 summarize");
-    assert_eq!(draft(cx), "two (new)");
+    settle(cx, "the third jump", |_| prompts().len() == 3);
+    assert_eq!(prompts()[2], "/zeron-tree-jump u3 summarize");
+    assert_eq!(draft(cx), "my draft");
 
     // Not while the agent is working.
     window
@@ -281,7 +328,7 @@ fn tree_palette_jumps_and_hands_the_message_back(cx: &mut TestAppContext) {
     open_tree(cx);
     cx.simulate_keystrokes(window.into(), "up enter");
     cx.run_until_parked();
-    assert_eq!(prompts().len(), 2, "no jump while working");
+    assert_eq!(prompts().len(), 3, "no jump while working");
     window
         .update(cx, |shell, _, _| {
             assert!(shell.tree_palette.as_ref().unwrap().notice.is_some())

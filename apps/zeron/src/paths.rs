@@ -7,6 +7,30 @@ pub fn data_dir() -> PathBuf {
     resolve_data_dir(|name| std::env::var_os(name))
 }
 
+/// Variables a rebranded build (Heron) sets for itself at startup so it runs
+/// beside Zeron on its own data dir and engine port. The build supplies the
+/// defaults (`ZERON_BUILD_DATA_DIR_NAME`, under `$HOME`, and
+/// `ZERON_BUILD_IPC_PORT`); explicitly set variables are left alone.
+pub fn build_profile_env(
+    env: impl Fn(&str) -> Option<OsString>,
+    data_dir_name: Option<&str>,
+    ipc_port: Option<&str>,
+) -> Vec<(&'static str, OsString)> {
+    let mut vars = vec![];
+    if let Some(name) = data_dir_name
+        && env("ZERON_DATA_DIR").is_none()
+        && let Some(home) = env("HOME")
+    {
+        vars.push(("ZERON_DATA_DIR", PathBuf::from(home).join(name).into()));
+    }
+    if let Some(port) = ipc_port
+        && env("ZERON_IPC_PORT").is_none()
+    {
+        vars.push(("ZERON_IPC_PORT", port.into()));
+    }
+    vars
+}
+
 fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
     if let Some(dir) = env("ZERON_DATA_DIR") {
         return PathBuf::from(dir);
@@ -45,6 +69,37 @@ fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ways it fails: a Heron build still opens ~/.zeron or port 27654 (the
+    /// engine lock then refuses it beside Zeron, or its UI attaches to Zeron's
+    /// engine); a stock build gains a default it never had; an explicit
+    /// ZERON_DATA_DIR / ZERON_IPC_PORT is overridden.
+    #[test]
+    fn a_rebranded_build_defaults_to_its_own_profile() {
+        let env = |vars: &[(&'static str, &'static str)]| {
+            let vars = vars.to_vec();
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let home = [("HOME", "/Users/k")];
+        assert!(build_profile_env(env(&home), None, None).is_empty());
+        assert_eq!(
+            build_profile_env(env(&home), Some(".heron"), Some("27664")),
+            vec![
+                ("ZERON_DATA_DIR", OsString::from("/Users/k/.heron")),
+                ("ZERON_IPC_PORT", OsString::from("27664")),
+            ]
+        );
+        let explicit = [
+            ("HOME", "/Users/k"),
+            ("ZERON_DATA_DIR", "/elsewhere"),
+            ("ZERON_IPC_PORT", "1"),
+        ];
+        assert!(build_profile_env(env(&explicit), Some(".heron"), Some("27664")).is_empty());
+    }
 
     fn resolve(vars: &[(&str, &str)]) -> PathBuf {
         resolve_data_dir(|name| {

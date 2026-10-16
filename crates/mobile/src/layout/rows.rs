@@ -441,6 +441,14 @@ impl RowBuilder {
                             let gap = gap_for(&rows, false);
                             rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "exclamationmark.triangle", ColorRole::Danger, message)), gap });
                         }
+                        MessagePart::Notice { id, tone, text } => {
+                            let (icon, color) = match tone {
+                                zeron_proto::NoticeTone::Warning => ("exclamationmark.triangle", ColorRole::Warning),
+                                zeron_proto::NoticeTone::Dim => ("info.circle", ColorRole::TextTertiary),
+                            };
+                            let gap = gap_for(&rows, false);
+                            rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, icon, color, text)), gap });
+                        }
                         MessagePart::Fork { id, source_title, .. } => {
                             let gap = gap_for(&rows, false);
                             let text = format!("Forked from {source_title}");

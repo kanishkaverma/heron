@@ -45,3 +45,8 @@ recreation using --session-id in the same cwd. Any submitted input revokes that
 proof before the write to stdin. Missing history/custom entries never authorize
 recreating the same UUID; an unrestorable session starts a new one with a
 visible "without the previous context" notice, like the other harnesses.
+
+The usage line (usage.rs) is display-only and never gates a turn. Bootstrap and
+each `agent_settled` ask `get_session_stats`; a failed or late reply only drops
+the session figure. Turn figures come from assistant `message_end` usage, so a
+turn can finish before the stats requested at its settle arrive.

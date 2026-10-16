@@ -279,7 +279,7 @@ fn dollars(cost: f64) -> String {
 }
 
 /// Pi's `formatTokens`.
-fn tokens(count: u64) -> String {
+pub(super) fn tokens(count: u64) -> String {
     let c = count as f64;
     match count {
         0..=999 => count.to_string(),

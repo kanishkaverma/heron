@@ -7,6 +7,7 @@ mod rpc;
 mod sessions;
 mod tree;
 mod ui;
+mod usage;
 
 use crate::{
     Harness, HarnessError, RunControls,
@@ -415,6 +416,7 @@ impl Harness for PiHarness {
                 tx,
                 request,
                 norm: Normalizer::default(),
+                usage: Default::default(),
                 active: true,
                 epoch: 0,
                 pending: HashMap::new(),
@@ -463,6 +465,8 @@ enum Pending {
     Command(u64),
     EmptyEntries(u64, String),
     EmptyState(u64, String, bool),
+    /// Session usage for the cost line; never gates a turn.
+    Stats,
 }
 struct Delivery {
     epoch: u64,
@@ -482,6 +486,7 @@ struct Runner {
     tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     request: RunRequest,
     norm: Normalizer,
+    usage: usage::Usage,
     active: bool,
     epoch: u64,
     pending: HashMap<String, Pending>,
@@ -551,6 +556,9 @@ impl Runner {
         }
         self.active = false;
         self.process.dialogs.cancel();
+        if let Some(notice) = self.usage.take_notice() {
+            self.emit(notice).await?;
+        }
         self.emit(AgentEvent::Done {
             status: if self.interrupted {
                 zeron_proto::DoneStatus::Interrupted
@@ -621,6 +629,13 @@ impl Runner {
             commands: catalog::commands(&commands),
         })
         .await?;
+        if let Ok(stats) = self
+            .process
+            .query(json!({"type":"get_session_stats"}), backlog)
+            .await
+        {
+            self.usage.stats(&stats);
+        }
         self.process
             .query(json!({"type":"get_state"}), backlog)
             .await
@@ -963,6 +978,12 @@ impl Runner {
             let Some(pending) = self.pending.remove(string(&frame, "id")) else {
                 return Ok(());
             };
+            if let Pending::Stats = pending {
+                if frame["success"] == true {
+                    self.usage.stats(&frame["data"]);
+                }
+                return Ok(());
+            }
             let data = response_data(frame)?;
             if let Pending::Command(epoch) = pending {
                 if epoch == self.epoch {
@@ -1062,7 +1083,16 @@ impl Runner {
                 event => self.emit(event).await?,
             }
         }
+        if frame["type"] == "message_end" && frame["message"]["role"] == "assistant" {
+            self.usage.assistant(&frame["message"]);
+        }
         if frame["type"] == "agent_settled" {
+            let id = self
+                .process
+                .transport
+                .client
+                .request(json!({"type":"get_session_stats"}))?;
+            self.pending.insert(id, Pending::Stats);
             let id = self
                 .process
                 .transport

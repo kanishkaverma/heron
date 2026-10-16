@@ -158,11 +158,15 @@ async fn one_shot(
     (events, live.session.take().expect("SessionStarted"))
 }
 
+/// Cache notices only: every priced turn also ends with its usage line
+/// (`↑in ↓out …`), which pi_spend_live covers.
 fn notices(events: &[AgentEvent]) -> Vec<(NoticeTone, String)> {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::Notice { tone, text } => Some((*tone, text.clone())),
+            AgentEvent::Notice { tone, text } if !text.starts_with('↑') => {
+                Some((*tone, text.clone()))
+            }
             _ => None,
         })
         .collect()

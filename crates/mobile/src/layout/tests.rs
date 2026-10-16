@@ -648,3 +648,35 @@ fn visual_rows_take_the_height_their_worker_measures() {
     assert!(view.visual("v1".into()).is_some());
     view.close();
 }
+
+#[test]
+fn notices_render_as_their_own_rows_in_order() {
+    use zeron_doc::parts::{MessagePart, MessageStatus};
+    use zeron_doc::schema::{MessageRole, SessionMessageEntry};
+    use zeron_proto::NoticeTone;
+    let notice = |id: &str, tone, text: &str| MessagePart::Notice { id: id.into(), tone, text: text.into() };
+    let mut w = worker(390.0);
+    w.input = TranscriptInput {
+        entries: vec![Arc::new(SessionMessageEntry {
+            id: "a1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![
+                MessagePart::Text { id: "t0".into(), text: "Done.".into() },
+                notice("n1", NoticeTone::Warning, "Cache miss after 7m idle: 30k tokens re-billed (~$0.10)"),
+                notice("n2", NoticeTone::Dim, "↑200 ↓500 · W30k · cache 0% · $0.121 turn · $0.356 session"),
+            ],
+            created_at: 0,
+            device_id: String::new(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })],
+        ..Default::default()
+    };
+    let frame = w.pass();
+    assert_eq!(
+        frame.plain_text(),
+        "Done.\n\nCache miss after 7m idle: 30k tokens re-billed (~$0.10)\n\n↑200 ↓500 · W30k · cache 0% · $0.121 turn · $0.356 session"
+    );
+    assert_eq!(frame.row_count(), 3);
+}

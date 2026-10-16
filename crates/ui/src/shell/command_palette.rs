@@ -5,8 +5,9 @@ use super::*;
 use crate::appearance::AppearanceMode;
 use crate::files::client::{FilesClientError, FilesRequestContext, WorkspaceFilesClient};
 use zeron_proto::{
-    SearchWorkspaceContentRequest, SearchWorkspaceFilesRequest, WorkspaceContentMatch,
-    WorkspaceEntryKind, WorkspaceFileSearchMatch, WorkspaceSearchIndexState, WorkspaceTarget,
+    SearchTranscriptsRequest, SearchWorkspaceContentRequest, SearchWorkspaceFilesRequest,
+    TranscriptSearchHit, WorkspaceContentMatch, WorkspaceEntryKind, WorkspaceFileSearchMatch,
+    WorkspaceSearchIndexState, WorkspaceTarget,
 };
 
 /// Key context of the palette card: its mod-1…4 tab bindings live here.
@@ -21,6 +22,8 @@ const CONTENT_MATCHES_PER_FILE: usize = 3;
 const MIN_WORKSPACE_QUERY_CHARS: usize = 2;
 /// Content search waits for typing to pause; name search does not.
 const CONTENT_DEBOUNCE: Duration = Duration::from_millis(80);
+/// Transcript search waits for typing to pause, like content search.
+const TRANSCRIPT_DEBOUNCE: Duration = Duration::from_millis(80);
 /// Refresh partial results until the host finishes its initial scan,
 /// doubling the wait up to [`CONTENT_INDEX_RETRY_MAX`]: without a content
 /// index every refresh is a full grep, and a large folder can scan for long.
@@ -51,6 +54,12 @@ pub(super) struct CommandPalette {
     files_ready: Option<WorkspaceTarget>,
     /// Content matches in the focused chat's workspace.
     content: WorkspaceQuery<Vec<WorkspaceContentMatch>>,
+    /// Chats whose transcripts matched, best match first. Kept across
+    /// keystrokes until the next reply lands, so rows don't flicker.
+    transcript_hits: Vec<TranscriptSearchHit>,
+    /// Replacing the task drops the previous request, so only the latest
+    /// query lands.
+    transcript_task: Option<Task<()>>,
     _search_events: Subscription,
 }
 
@@ -283,7 +292,11 @@ impl Command {
 #[derive(Clone, Debug, PartialEq)]
 enum RowKind {
     Command(Command),
-    Chat(String),
+    Chat {
+        id: String,
+        /// Set when only the transcript matched, not the title or metadata.
+        snippet: Option<SharedString>,
+    },
     /// A path in the focused chat's workspace.
     File {
         path: String,
@@ -311,7 +324,7 @@ impl PaletteRow {
     fn key(&self) -> RowKey {
         let id = match &self.kind {
             RowKind::Command(command) => format!("command:{}", command.label()),
-            RowKind::Chat(id) => format!("chat:{id}"),
+            RowKind::Chat { id, .. } => format!("chat:{id}"),
             RowKind::File { path, .. } => format!("file:{path}"),
             RowKind::Content(found) => {
                 format!("content:{}:{}:{}", found.path, found.line, found.column)
@@ -463,6 +476,7 @@ impl Shell {
                     palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                 }
                 this.search_palette_workspace(cx);
+                this.search_palette_transcripts(cx);
                 cx.notify();
             }
         });
@@ -480,10 +494,13 @@ impl Shell {
             files: WorkspaceQuery::default(),
             files_ready: None,
             content: WorkspaceQuery::default(),
+            transcript_hits: Vec::new(),
+            transcript_task: None,
             _search_events: events,
         });
         // Load the default Files list (recently changed files) right away.
         self.search_palette_workspace(cx);
+        self.search_palette_transcripts(cx);
         cx.notify();
     }
 
@@ -633,6 +650,56 @@ impl Shell {
         }));
     }
 
+    /// Ask the engine which chats' transcripts match the query: once typing
+    /// pauses, or at once for the empty query, which only refreshes the
+    /// engine's index and lists nothing. An engine without SearchTranscripts
+    /// simply contributes no rows.
+    fn search_palette_transcripts(&mut self, cx: &mut Context<Self>) {
+        let engine = self.state.read(cx).engine().cloned();
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        let query = palette.search.read(cx).text().trim().to_owned();
+        if query.is_empty() {
+            palette.transcript_hits.clear();
+        }
+        let Some(engine) = engine else {
+            palette.transcript_task = None;
+            return;
+        };
+        let delay = if query.is_empty() {
+            Duration::ZERO
+        } else {
+            TRANSCRIPT_DEBOUNCE
+        };
+        palette.transcript_task = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let request = SearchTranscriptsRequest {
+                query: query.clone(),
+                limit: THREADS_TAB_LIMIT as u16,
+            };
+            let Ok(params) = serde_json::to_value(&request) else {
+                return;
+            };
+            let hits = engine
+                .client()
+                .call_as::<Vec<TranscriptSearchHit>>(methods::SEARCH_TRANSCRIPTS, params)
+                .await;
+            if query.is_empty() {
+                return;
+            }
+            this.update(cx, |shell, cx| {
+                if let Some(palette) = shell.command_palette.as_mut() {
+                    palette.transcript_hits = hits.unwrap_or_default();
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
     /// The open palette's sections for its tab and query.
     fn palette_sections(&self, cx: &App) -> Vec<PaletteSection> {
         let Some(palette) = &self.command_palette else {
@@ -648,20 +715,14 @@ impl Shell {
                     .map(RowKind::Command),
             )
         };
-        let threads = |limit| {
-            PaletteSection::new(
-                Section::Threads,
-                self.thread_matches(&query, limit, cx)
-                    .into_iter()
-                    .map(RowKind::Chat),
-            )
-        };
+        let threads =
+            |limit| PaletteSection::new(Section::Threads, self.thread_rows(&query, limit, cx));
         let recent_threads = |limit| {
             PaletteSection::new(
                 Section::RecentThreads,
                 self.recent_threads(limit, cx)
                     .into_iter()
-                    .map(RowKind::Chat),
+                    .map(|id| RowKind::Chat { id, snippet: None }),
             )
         };
         // Files opened here first, then the workspace's recently changed
@@ -752,6 +813,37 @@ impl Shell {
             .into_iter()
             .take(limit)
             .map(|chat| chat.id.clone())
+            .collect()
+    }
+
+    /// Thread rows for a non-empty `query`: the metadata matches, then the
+    /// chats whose transcript alone matched, each with its snippet.
+    fn thread_rows(&self, query: &str, limit: usize, cx: &App) -> Vec<RowKind> {
+        let state = self.state.read(cx);
+        let metadata = self
+            .thread_matches(query, limit, cx)
+            .into_iter()
+            .map(|id| (id, None));
+        let transcripts = self
+            .command_palette
+            .iter()
+            .flat_map(|palette| &palette.transcript_hits)
+            .filter(|hit| {
+                state
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == hit.chat_id && chat.is_top_level())
+            })
+            .map(|hit| {
+                let snippet = SharedString::from(transcript::single_line(&hit.snippet));
+                (hit.chat_id.clone(), Some(snippet))
+            });
+        let mut seen = std::collections::HashSet::new();
+        metadata
+            .chain(transcripts)
+            .filter(|(id, _)| seen.insert(id.clone()))
+            .take(limit)
+            .map(|(id, snippet)| RowKind::Chat { id, snippet })
             .collect()
     }
 
@@ -872,7 +964,7 @@ impl Shell {
             RowKind::Command(Command::Settings) => self.open_last_settings(cx),
             RowKind::Command(Command::Theme(_)) => unreachable!(),
             RowKind::Command(Command::ArchiveThread) => self.archive_selected_chat(cx),
-            RowKind::Chat(id) => self.open_chat(id, cx),
+            RowKind::Chat { id, .. } => self.open_chat(id, cx),
             RowKind::File { path, is_dir } => {
                 self.open_palette_path(path, is_dir, None, window, cx)
             }
@@ -1066,7 +1158,7 @@ impl Shell {
                     )
                     .into_any_element()
             }
-            RowKind::Chat(id) => {
+            RowKind::Chat { id, snippet } => {
                 let state = self.state.read(cx);
                 let chat = state.chats.iter().find(|chat| &chat.id == id)?;
                 // Project-less sessions name only their device.
@@ -1115,6 +1207,7 @@ impl Shell {
                     None,
                     false,
                     Some(query),
+                    snippet.clone(),
                     theme,
                     cx,
                 )
@@ -1199,7 +1292,7 @@ impl Shell {
                 el.child(palette_empty(
                     &theme,
                     "No results",
-                    "Try a command, chat title, project, or device.",
+                    "Try a command, chat title, project, device, or words from a chat.",
                 ))
             });
         let body = palette_results_fade(body, &scroll);
@@ -1522,7 +1615,7 @@ mod tests {
             .into_iter()
             .flat_map(|section| section.rows)
             .filter_map(|row| match row.kind {
-                RowKind::Chat(id) => Some(id),
+                RowKind::Chat { id, .. } => Some(id),
                 _ => None,
             })
             .collect()
@@ -1736,7 +1829,10 @@ mod tests {
                 assert_eq!(sections[2].0, Section::RecentThreads);
                 assert_eq!(
                     sections[2].1,
-                    [RowKind::Chat("newer".into()), RowKind::Chat("older".into())]
+                    ["newer", "older"].map(|id| RowKind::Chat {
+                        id: id.into(),
+                        snippet: None
+                    })
                 );
             })
             .unwrap();
@@ -1931,10 +2027,13 @@ mod tests {
                 methods::WARM_WORKSPACE_SEARCH => {
                     engine.reply(&request, serde_json::json!({ "state": warm }))
                 }
-                methods::SEARCH_WORKSPACE_FILES => engine.reply(&request, serde_json::json!([])),
+                methods::SEARCH_WORKSPACE_FILES | methods::SEARCH_TRANSCRIPTS => {
+                    engine.reply(&request, serde_json::json!([]))
+                }
                 _ => engine.reply(&request, content_answer(Vec::new(), false)),
             }
-            if method != methods::SEARCH_WORKSPACE_CONTENT {
+            if method != methods::SEARCH_WORKSPACE_CONTENT && method != methods::SEARCH_TRANSCRIPTS
+            {
                 methods_seen.push(method);
             }
         }
@@ -2590,6 +2689,188 @@ mod tests {
             .unwrap();
     }
 
+    fn transcript_hit(chat: &str, snippet: &str) -> serde_json::Value {
+        serde_json::json!({ "chatId": chat, "snippet": snippet })
+    }
+
+    /// The Threads section's chats with their transcript snippets.
+    fn threads_shown(
+        window: gpui::WindowHandle<Shell>,
+        cx: &mut TestAppContext,
+    ) -> Vec<(String, Option<String>)> {
+        palette_section(window, Section::Threads, cx)
+            .map(|section| {
+                section
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| match row.kind {
+                        RowKind::Chat { id, snippet } => Some((id, snippet.map(String::from))),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Typing against a fake engine. A chat whose title and metadata miss the
+    /// query but whose transcript matches follows the metadata matches with a
+    /// one-line snippet. Hits stay up until the next reply lands, a replaced
+    /// query's reply never shows, and emptying the query drops them.
+    #[gpui::test]
+    fn transcript_only_matches_follow_metadata_matches_with_a_snippet(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, false);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.apply_chats(vec![
+                        titled("ramen-notes", "Ramen notes", false, 0),
+                        titled("offsite", "Team offsite", false, 1),
+                        titled("cleanup", "Friday cleanup", false, 2),
+                        chat("worker", Some("offsite"), false, 3),
+                    ]);
+                });
+            })
+            .unwrap();
+
+        let warm = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0]["params"]["query"], "");
+        engine.reply(
+            &warm[0],
+            serde_json::json!([transcript_hit("offsite", "x")]),
+        );
+        cx.run_until_parked();
+        assert!(
+            window
+                .read_with(cx, |shell, _| shell
+                    .command_palette
+                    .as_ref()
+                    .unwrap()
+                    .transcript_hits
+                    .is_empty())
+                .unwrap()
+        );
+
+        type_query(window, "ra", cx);
+        type_query(window, "ramen", cx);
+        cx.run_until_parked();
+        assert!(
+            engine.requests.try_recv().is_err(),
+            "the request is debounced"
+        );
+        let asked = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0]["params"]["query"], "ramen");
+        assert_eq!(asked[0]["params"]["limit"], THREADS_TAB_LIMIT);
+        engine.reply(
+            &asked[0],
+            serde_json::json!([
+                transcript_hit("offsite", "find a vegetarian\n  ramen place"),
+                transcript_hit("ramen-notes", "summarize the ramen agenda"),
+                transcript_hit("worker", "ramen for the worker"),
+                transcript_hit("gone", "ramen in a deleted chat"),
+            ]),
+        );
+        cx.run_until_parked();
+        let both = [
+            ("ramen-notes".to_string(), None),
+            (
+                "offsite".to_string(),
+                Some("find a vegetarian ramen place".to_string()),
+            ),
+        ];
+        assert_eq!(threads_shown(window, cx), both);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.select_palette_tab(Tab::Threads, cx)
+            })
+            .unwrap();
+        assert_eq!(threads_shown(window, cx), both);
+        window
+            .update(cx, |shell, _, cx| shell.select_palette_tab(Tab::All, cx))
+            .unwrap();
+
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("chat-snippet-offsite").is_some());
+        assert!(visual.debug_bounds("chat-snippet-ramen-notes").is_none());
+
+        type_query(window, "rame", cx);
+        cx.run_until_parked();
+        assert_eq!(threads_shown(window, cx), both);
+        let asked = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        assert_eq!(asked[0]["params"]["query"], "rame");
+        engine.reply(&asked[0], serde_json::json!([]));
+        cx.run_until_parked();
+        assert_eq!(
+            threads_shown(window, cx),
+            [("ramen-notes".to_string(), None)]
+        );
+
+        type_query(window, "helm", cx);
+        let stale = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        assert_eq!(stale[0]["params"]["query"], "helm");
+        type_query(window, "configmap", cx);
+        engine.reply(
+            &stale[0],
+            serde_json::json!([transcript_hit("offsite", "the helm rollout")]),
+        );
+        cx.run_until_parked();
+        assert!(threads_shown(window, cx).is_empty());
+        let latest = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0]["params"]["query"], "configmap");
+        engine.reply(
+            &latest[0],
+            serde_json::json!([transcript_hit("cleanup", "the helm configmap is stale")]),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            threads_shown(window, cx),
+            [(
+                "cleanup".to_string(),
+                Some("the helm configmap is stale".to_string())
+            )]
+        );
+
+        type_query(window, "ramen", cx);
+        let asked = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        engine.fail(&asked[0], "unknown method: SearchTranscripts");
+        cx.run_until_parked();
+        assert_eq!(
+            threads_shown(window, cx),
+            [("ramen-notes".to_string(), None)]
+        );
+
+        type_query(window, "configmap", cx);
+        let asked = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        engine.reply(
+            &asked[0],
+            serde_json::json!([transcript_hit("cleanup", "the helm configmap is stale")]),
+        );
+        cx.run_until_parked();
+        assert_eq!(threads_shown(window, cx).len(), 1);
+        type_query(window, "", cx);
+        window
+            .read_with(cx, |shell, _| {
+                assert!(
+                    shell
+                        .command_palette
+                        .as_ref()
+                        .unwrap()
+                        .transcript_hits
+                        .is_empty()
+                )
+            })
+            .unwrap();
+        let warm = engine.take(methods::SEARCH_TRANSCRIPTS, cx);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0]["params"]["query"], "");
+    }
+
     /// A shell with the real app keymap and two sidebar sessions.
     fn keyed_palette_window(
         cx: &mut TestAppContext,
@@ -2706,7 +2987,10 @@ mod tests {
         let chats = |ids: &[&str]| {
             PaletteSection::new(
                 Section::Threads,
-                ids.iter().map(|id| RowKind::Chat((*id).into())),
+                ids.iter().map(|id| RowKind::Chat {
+                    id: (*id).into(),
+                    snippet: None,
+                }),
             )
         };
         let before = [chats(&["a", "b", "c"])];

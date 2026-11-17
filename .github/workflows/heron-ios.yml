@@ -18,10 +18,6 @@ on:
     paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 
-concurrency:
-  group: heron-ios-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
@@ -32,6 +28,10 @@ jobs:
   device:
     name: iPhone build (unsigned archive)
     runs-on: macos-latest
+    # A cold Rust core takes most of an hour: a newer push waits, never cancels it.
+    concurrency:
+      group: heron-device-${{ github.ref }}
+      cancel-in-progress: false
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -99,6 +99,9 @@ jobs:
   simulator:
     name: Verify in the iOS Simulator
     runs-on: macos-latest
+    concurrency:
+      group: heron-sim-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4

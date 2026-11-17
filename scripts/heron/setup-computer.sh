@@ -29,6 +29,21 @@ fi
 cp "$SRC/AGENTS.md" "$DEST/AGENTS.md"
 cp "$SRC/.pi/extensions/heron/index.ts" "$SRC/.pi/extensions/heron/runner.mjs" "$DEST/.pi/extensions/heron/"
 mkdir -p "$HOME/.heron/threads"
+# Pi loads a folder's .pi/extensions only once the folder is trusted.
+python3 - "$DEST" <<'PY'
+import json, os, sys
+dest = os.path.realpath(sys.argv[1])
+path = os.path.join(os.environ.get("PI_CODING_AGENT_DIR") or os.path.expanduser("~/.pi/agent"), "trust.json")
+try:
+    trust = json.load(open(path))
+except Exception:
+    trust = {}
+if not any(v and (dest == k or dest.startswith(k.rstrip("/") + "/")) for k, v in trust.items()):
+    trust[dest] = True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(trust, open(path, "w"), indent=2)
+    print("trusted", dest, "for Pi")
+PY
 ls -la "$DEST" "$DEST/.pi/extensions/heron"
 
 echo "== Zeron idle window: ${IDLE_MS} ms"

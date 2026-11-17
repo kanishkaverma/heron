@@ -64,7 +64,7 @@ fi
 cat "$DEST/.pi/settings.json" 2>/dev/null || echo "No working model found: Heron will use Pi's default here."
 
 echo "== heron-keeper"
-cp "$HERE/heron/keeper/heron-keeper.py" "$HOME/.heron/heron-keeper.py"
+cp "$HERE/heron/keeper/heron-keeper.py" "$HERE/heron/keeper/pi_sync.py" "$HOME/.heron/"
 NODE_DIR="$(dirname "$(command -v node || echo /opt/homebrew/bin/node)")"
 case "$(uname)" in
   Darwin)

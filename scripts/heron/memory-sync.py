@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Sync Heron's memory (~/.heron/memory) between the Heron computers with
-Syncthing, privately over the tailnet (no global discovery, no relays).
+"""Sync Heron's memory (~/.heron/memory) and its background tasks
+(~/.heron/threads) between the Heron computers with Syncthing, privately over
+the tailnet (no global discovery, no relays).
 
   memory-sync.py init                   make this computer's Syncthing identity; print its device id
   memory-sync.py peers '<json>'         share the folder with these peers and (re)start the service
@@ -19,8 +20,14 @@ import xml.etree.ElementTree as ET
 
 HOME = os.path.expanduser("~")
 ST_HOME = os.path.join(HOME, ".heron", "syncthing")
-FOLDER = os.path.join(HOME, ".heron", "memory")
-FOLDER_ID = "heron-memory"
+# id, label, path, ignore patterns (what stays on each computer)
+FOLDERS = [
+    ("heron-memory", "Heron memory", os.path.join(HOME, ".heron", "memory"), []),
+    ("heron-threads", "Heron tasks", os.path.join(HOME, ".heron", "threads"),
+     ["session", "events.jsonl", "stderr.log", "*.tmp", "(?d).DS_Store"]),
+    ("heron-shared", "Heron shared Pi setup", os.path.join(HOME, ".heron", "shared"),
+     ["node_modules", "*.incoming", ".*.json.tmp", "(?d).DS_Store"]),
+]
 PORT = 22001
 GUI = "127.0.0.1:8385"
 
@@ -44,7 +51,8 @@ def init():
     if not os.path.exists(os.path.join(ST_HOME, "config.xml")):
         subprocess.run([syncthing(), "generate", f"--home={ST_HOME}", "--no-port-probing"],
                        check=True, capture_output=True, text=True)
-    os.makedirs(FOLDER, exist_ok=True)
+    for _, _, path, _ in FOLDERS:
+        os.makedirs(path, exist_ok=True)
     print(device_id())
 
 
@@ -77,16 +85,20 @@ def peers(spec):
         ET.SubElement(d, "address").text = p["address"]
         ET.SubElement(d, "paused").text = "false"
         ET.SubElement(d, "autoAcceptFolders").text = "false"
-    folder = ET.Element("folder", id=FOLDER_ID, label="Heron memory", path=FOLDER, type="sendreceive",
-                        rescanIntervalS="60", fsWatcherEnabled="true", fsWatcherDelayS="1",
-                        ignorePerms="false", autoNormalize="true")
-    ET.SubElement(folder, "filesystemType").text = "basic"
-    for did in [me] + [p["id"] for p in peers]:
-        ET.SubElement(folder, "device", id=did, introducedBy="")
-    ET.SubElement(folder, "minDiskFree", unit="%").text = "1"
-    ET.SubElement(folder, "maxConflicts").text = "10"
     first_device = root.find("device")
-    root.insert(list(root).index(first_device), folder)
+    for fid, label, fpath, ignores in FOLDERS:
+        os.makedirs(fpath, exist_ok=True)
+        if ignores:
+            open(os.path.join(fpath, ".stignore"), "w").write("\n".join(ignores) + "\n")
+        folder = ET.Element("folder", id=fid, label=label, path=fpath, type="sendreceive",
+                            rescanIntervalS="60", fsWatcherEnabled="true", fsWatcherDelayS="1",
+                            ignorePerms="false", autoNormalize="true")
+        ET.SubElement(folder, "filesystemType").text = "basic"
+        for did in [me] + [p["id"] for p in peers]:
+            ET.SubElement(folder, "device", id=did, introducedBy="")
+        ET.SubElement(folder, "minDiskFree", unit="%").text = "1"
+        ET.SubElement(folder, "maxConflicts").text = "10"
+        root.insert(list(root).index(first_device), folder)
     gui = sub(root, "gui", enabled="true", tls="false")
     sub(gui, "address", GUI)
     opts = sub(root, "options")
@@ -99,9 +111,8 @@ def peers(spec):
                      ("autoUpgradeIntervalH", "0")]:
         sub(opts, tag, val)
     tree.write(path, encoding="utf-8", xml_declaration=True)
-    os.makedirs(FOLDER, exist_ok=True)
     service()
-    print(f"{me}: sharing {FOLDER} with {', '.join(p['name'] for p in peers)}")
+    print(f"{me}: sharing {', '.join(f[2] for f in FOLDERS)} with {', '.join(p['name'] for p in peers)}")
 
 
 def service():
@@ -124,7 +135,14 @@ def service():
 """)
         uid = os.getuid()
         subprocess.run(["launchctl", "bootout", f"gui/{uid}/com.kanishkaverma.heron-syncthing"], capture_output=True)
-        subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist], check=True)
+        # bootout returns before the job is gone; bootstrap too soon fails (5).
+        import time
+        for _ in range(10):
+            time.sleep(1)
+            if subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist], capture_output=True).returncode == 0:
+                break
+        else:
+            subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/com.kanishkaverma.heron-syncthing"], check=True)
     else:
         unit_dir = os.path.join(HOME, ".config/systemd/user")
         os.makedirs(unit_dir, exist_ok=True)

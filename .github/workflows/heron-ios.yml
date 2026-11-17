@@ -1,0 +1,200 @@
+name: Heron iOS
+
+# Builds Heron (this fork's one-chat iOS app) and checks it works.
+#
+#   device     the iPhone build: an unsigned Release archive, uploaded as the
+#              `heron-ios-archive` artifact. scripts/heron/install-on-iphone.sh
+#              signs it with your own Apple team and installs it.
+#   simulator  Heron's unit tests and its UI flow (one chat, no session list,
+#              send → streamed reply) on the Rust core's offline demo
+#              workspace, with screenshots uploaded as `heron-screenshots`.
+#
+# The Rust core (crates/mobile) is built in its own step and cached by the
+# hash of the Rust sources, so a Swift-only change skips it.
+
+on:
+  push:
+    branches: [heron]
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+concurrency:
+  group: heron-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CORE_HASH_FILES: Cargo.lock Cargo.toml crates scripts/ios/build-core.sh
+
+jobs:
+  device:
+    name: iPhone build (unsigned archive)
+    runs-on: macos-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode 26
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$xcode/Contents/Developer" xcodebuild -version
+
+      - name: Rust core cache key
+        id: key
+        run: echo "hash=$(git ls-files -s $CORE_HASH_FILES | shasum -a 256 | cut -c1-40)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Rust core
+        id: core
+        uses: actions/cache/restore@v4
+        with:
+          path: target/ios-core/iphoneos
+          key: heron-core-iphoneos-${{ steps.key.outputs.hash }}
+
+      - name: Rust toolchain + iOS target
+        if: steps.core.outputs.cache-hit != 'true'
+        run: |
+          rustup update stable --no-self-update
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-ios
+
+      - name: Build the Rust core (release profile)
+        if: steps.core.outputs.cache-hit != 'true'
+        run: CONFIGURATION=Release scripts/ios/build-core.sh iphoneos
+
+      - name: Save the Rust core
+        if: steps.core.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: target/ios-core/iphoneos
+          key: heron-core-iphoneos-${{ steps.key.outputs.hash }}
+
+      - name: Archive Heron
+        working-directory: apps/ios
+        env:
+          ZERON_SKIP_CORE: 1
+        run: |
+          log="$RUNNER_TEMP/archive.log"
+          if xcodebuild -project Zeron.xcodeproj -scheme Zeron -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Heron.xcarchive" archive \
+            CODE_SIGNING_ALLOWED=NO CURRENT_PROJECT_VERSION=${{ github.run_number }} > "$log" 2>&1
+          then status=0; else status=$?; fi
+          grep -E "error:|\*\* ARCHIVE" "$log" || true
+          if [ "$status" != 0 ]; then tail -80 "$log"; exit "$status"; fi
+          app="$RUNNER_TEMP/Heron.xcarchive/Products/Applications/Zeron.app"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' -c 'Print :CFBundleDisplayName' "$app/Info.plist"
+
+      - name: Zip the archive
+        run: ditto -c -k --keepParent "$RUNNER_TEMP/Heron.xcarchive" "$RUNNER_TEMP/Heron.xcarchive.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heron-ios-archive
+          path: ${{ runner.temp }}/Heron.xcarchive.zip
+          retention-days: 30
+
+  simulator:
+    name: Verify in the iOS Simulator
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode 26 + an iPhone simulator
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$xcode/Contents/Developer"
+          xcodebuild -version
+          python3 - <<'PYTHON'
+          import json, os, subprocess
+          devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "--json"]))["devices"]
+          def version(runtime):
+              return [int(p) for p in runtime.split("iOS-")[-1].split("-") if p.isdigit()]
+          iphones = [d for runtime, group in sorted(devices.items(), key=lambda kv: version(kv[0]), reverse=True)
+                     if "iOS" in runtime for d in group if d["name"].startswith("iPhone")]
+          pro = [d for d in iphones if "Pro" in d["name"] and "Max" not in d["name"]]
+          pick = (pro or iphones)[0]
+          print("Simulator:", pick["name"], pick["udid"])
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write("IOS_SIMULATOR_ID=" + pick["udid"] + "\n")
+          PYTHON
+
+      - name: Rust core cache key
+        id: key
+        run: echo "hash=$(git ls-files -s $CORE_HASH_FILES | shasum -a 256 | cut -c1-40)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Rust core
+        id: core
+        uses: actions/cache/restore@v4
+        with:
+          path: target/ios-core/iphonesimulator
+          key: heron-core-sim-${{ steps.key.outputs.hash }}
+
+      - name: Rust toolchain + simulator target
+        if: steps.core.outputs.cache-hit != 'true'
+        run: |
+          rustup update stable --no-self-update
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-ios-sim
+
+      # The dev profile, as upstream's simulator tests: about half the build time.
+      - name: Build the Rust core for the simulator
+        if: steps.core.outputs.cache-hit != 'true'
+        run: |
+          IPHONEOS_DEPLOYMENT_TARGET=26.0 cargo build --locked -p zeron-mobile --lib --target aarch64-apple-ios-sim
+          mkdir -p target/ios-core/iphonesimulator/include
+          cp target/aarch64-apple-ios-sim/debug/libzeron_mobile.a target/ios-core/iphonesimulator/
+          cp apps/ios/CoreFFI/zeron_coreFFI.h target/ios-core/iphonesimulator/include/zeron_coreFFI.h
+          cp apps/ios/CoreFFI/module.modulemap target/ios-core/iphonesimulator/include/module.modulemap
+
+      - name: Save the Rust core
+        if: steps.core.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: target/ios-core/iphonesimulator
+          key: heron-core-sim-${{ steps.key.outputs.hash }}
+
+      - name: Heron unit + UI tests
+        working-directory: apps/ios
+        env:
+          ZERON_SKIP_CORE: 1
+        run: |
+          log="$RUNNER_TEMP/test.log"
+          if xcodebuild -project Zeron.xcodeproj -scheme Zeron \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
+            -resultBundlePath "$RUNNER_TEMP/heron-tests.xcresult" \
+            -only-testing:ZeronTests/HeronTests \
+            -only-testing:ZeronUITests/HeronFlowTests \
+            CODE_SIGNING_ALLOWED=NO test > "$log" 2>&1
+          then status=0; else status=$?; fi
+          grep -E "Test Case|error:|\*\* TEST" "$log" || true
+          if [ "$status" != 0 ]; then tail -80 "$log"; fi
+          exit "$status"
+
+      - name: Export screenshots
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/screenshots"
+          if [ -d "$RUNNER_TEMP/heron-tests.xcresult" ]; then
+            xcrun xcresulttool export attachments --path "$RUNNER_TEMP/heron-tests.xcresult" \
+              --output-path "$RUNNER_TEMP/screenshots" || true
+            ls -la "$RUNNER_TEMP/screenshots"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: heron-screenshots
+          path: ${{ runner.temp }}/screenshots
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: heron-test-results
+          path: ${{ runner.temp }}/heron-tests.xcresult
+          if-no-files-found: ignore

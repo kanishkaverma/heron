@@ -14,7 +14,7 @@ name: Heron iOS
 
 on:
   push:
-    branches: [heron]
+    branches: [main]
     paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 

@@ -37,6 +37,14 @@ enum Heron {
         UserDefaults.standard.set(id, forKey: "heron.chat.\(device)")
     }
 
+    /// A computer named on launch (`-heron-computer <name or id>`): set up
+    /// installs pick the computer without a tap.
+    static var launchComputer: String? {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: "-heron-computer"), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+
     static func forget() {
         if let device = deviceId { setChatId(nil, on: device) }
         deviceId = nil
@@ -107,12 +115,9 @@ enum HeronStep: Equatable {
     /// remembered choices.
     static func next(_ world: HeronWorld, savedDevice: String?, savedChat: String?) -> HeronStep {
         guard world.synced else { return .waitForSync }
-        let device: String
-        if let saved = savedDevice, world.devices.contains(where: { $0.id == saved }) {
-            device = saved
-        } else if world.devices.count == 1 {
-            device = world.devices[0].id
-        } else {
+        // Never picked for you: the device list fills in over a moment after
+        // signing in, so "only one computer" can be a list still arriving.
+        guard let device = savedDevice, world.devices.contains(where: { $0.id == device }) else {
             return .pickComputer(world.devices)
         }
         // The chat this phone made or opened before.

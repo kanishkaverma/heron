@@ -11,6 +11,7 @@ final class HeronRootController: UIViewController, AppRouter {
     private var poll: Timer?
     private var working = false
     private(set) var chatId: String?
+    private var pendingComputer = Heron.launchComputer
 
     init(app: AppModel) {
         self.app = app
@@ -35,6 +36,11 @@ final class HeronRootController: UIViewController, AppRouter {
             self?.resolve()
         }
         status.onRetry = { [weak self] in self?.resolve() }
+        status.onChooseComputer = { [weak self] in
+            guard let self else { return }
+            Heron.deviceId = nil
+            self.resolve()
+        }
         status.onSignOut = { [weak self] in self?.app.signOut() }
         appToken = app.observe { [weak self] in self?.resolveIfWaiting() }
         resolve()
@@ -72,6 +78,12 @@ final class HeronRootController: UIViewController, AppRouter {
         guard !working, chatId == nil else { return }
         if app.isDemo { return openDemo() }
         guard let world = world() else { return }
+        // `-heron-computer <name or id>`: chosen on launch, once it's listed.
+        if let wanted = pendingComputer?.lowercased(),
+           let device = world.devices.first(where: { $0.id.lowercased() == wanted || $0.name.lowercased() == wanted }) {
+            pendingComputer = nil
+            if Heron.deviceId != device.id { Heron.deviceId = device.id }
+        }
         let step = HeronStep.next(world, savedDevice: Heron.deviceId, savedChat: Heron.deviceId.flatMap(Heron.chatId(on:)))
         let deviceName = { (id: String) in world.devices.first { $0.id == id }?.name ?? "your computer" }
         switch step {
@@ -123,6 +135,12 @@ final class HeronRootController: UIViewController, AppRouter {
                 return
             }
             let folder = Heron.folder(inHome: listing.path)
+            // The folder holds who Heron is (AGENTS.md, its extension): no
+            // folder, no Heron there yet.
+            guard listing.entries.contains(where: { $0.isDir && $0.name.lowercased() == Heron.folderName }) else {
+                status.show(.problem("Heron isn't set up on \(name) yet (no \(folder)). Run scripts/heron/setup-computer.sh there, or choose another computer."))
+                return
+            }
             guard await app.createProject(deviceId: deviceId, path: folder, gitDetected: false) != nil else {
                 status.show(.problem("Couldn't use \(folder) on \(name). Create that folder (with Heron's AGENTS.md) and try again."))
                 return
@@ -211,12 +229,14 @@ final class HeronStatusViewController: UIViewController, UITableViewDataSource, 
     var onPick: ((String) -> Void)?
     var onRetry: (() -> Void)?
     var onSignOut: (() -> Void)?
+    var onChooseComputer: (() -> Void)?
 
     private let mark = UIImageView(image: UIImage(systemName: "bird.fill"))
     private let titleLabel = UILabel()
     private let message = UILabel()
     private let spinner = UIActivityIndicatorView(style: .medium)
     private let retry = UIButton(configuration: .bordered())
+    private let choose = UIButton(configuration: .borderless())
     private let table = UITableView(frame: .zero, style: .insetGrouped)
     private var devices: [HeronWorld.Device] = []
     private var state: State?
@@ -239,7 +259,9 @@ final class HeronStatusViewController: UIViewController, UITableViewDataSource, 
         message.accessibilityIdentifier = "heron-status"
         retry.configuration?.title = "Try Again"
         retry.addAction(UIAction { [weak self] _ in self?.onRetry?() }, for: .touchUpInside)
-        let stack = UIStackView(arrangedSubviews: [mark, titleLabel, spinner, message, retry])
+        choose.configuration?.title = "Choose Another Computer"
+        choose.addAction(UIAction { [weak self] _ in self?.onChooseComputer?() }, for: .touchUpInside)
+        let stack = UIStackView(arrangedSubviews: [mark, titleLabel, spinner, message, retry, choose])
         stack.axis = .vertical
         stack.alignment = .center
         stack.spacing = 12
@@ -279,18 +301,21 @@ final class HeronStatusViewController: UIViewController, UITableViewDataSource, 
             spinner.startAnimating()
             spinner.isHidden = false
             retry.isHidden = true
+            choose.isHidden = true
             devices = []
         case .pick(let list):
             message.text = "Which computer should Heron live on? Pick one that stays on: Heron works there, even in the background."
             spinner.stopAnimating()
             spinner.isHidden = true
             retry.isHidden = true
+            choose.isHidden = true
             devices = list
         case .problem(let text):
             message.text = text
             spinner.stopAnimating()
             spinner.isHidden = true
             retry.isHidden = false
+            choose.isHidden = false
             devices = []
         }
         table.isHidden = devices.isEmpty

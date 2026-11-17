@@ -30,9 +30,12 @@ final class HeronTests: XCTestCase {
         XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-gone", savedChat: nil), .pickComputer([air, mac]))
     }
 
-    func testOneComputerIsPickedForYou() {
+    /// Even one computer is asked about: right after signing in the list may
+    /// still be arriving.
+    func testAsksEvenWithOneComputer() {
         let world = HeronWorld(synced: true, devices: [air], projects: [], chats: [])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: nil, savedChat: nil), .createProject(deviceId: "dev-air"))
+        XCTAssertEqual(HeronStep.next(world, savedDevice: nil, savedChat: nil), .pickComputer([air]))
+        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: nil), .createProject(deviceId: "dev-air"))
     }
 
     func testMakesTheChatInTheHeronFolder() {
@@ -56,7 +59,7 @@ final class HeronTests: XCTestCase {
             chat("c-other", title: "Something else", created: 0),
             chat("c-heron", archived: true, created: 3),
         ])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: nil, savedChat: nil), .open(chatId: "c-heron", deviceId: "dev-air", unarchive: true))
+        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: nil), .open(chatId: "c-heron", deviceId: "dev-air", unarchive: true))
     }
 
     func testChatsOnAnotherComputerDontCount() {

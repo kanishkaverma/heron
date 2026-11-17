@@ -17,32 +17,62 @@ TEAM="${HERON_TEAM:-Q49ZKW8324}"
 RUN="${1:-}"
 WORK="$(mktemp -d /tmp/heron-install.XXXXXX)"
 
-if [ -z "$RUN" ]; then
+if [ -n "${HERON_ARCHIVE:-}" ]; then
+  ditto "$HERON_ARCHIVE" "$WORK/Heron.xcarchive"
+  RUN=local
+elif [ -z "$RUN" ]; then
   RUN="$(gh run list -R "$REPO" -w "Heron iOS" -s success -L 20 --json databaseId,headBranch -q '[.[] | select(.headBranch == "main")][0].databaseId')"
 fi
 [ -n "$RUN" ] || { echo "No successful Heron iOS run on main yet." >&2; exit 1; }
 echo "== Run $RUN"
-gh run download "$RUN" -R "$REPO" -n heron-ios-archive -D "$WORK"
-ditto -x -k "$WORK/Heron.xcarchive.zip" "$WORK"
+if [ "$RUN" != local ]; then
+  gh run download "$RUN" -R "$REPO" -n heron-ios-archive -D "$WORK"
+  ditto -x -k "$WORK/Heron.xcarchive.zip" "$WORK"
+fi
 ARCHIVE="$WORK/Heron.xcarchive"
 
 echo "== Signing for team $TEAM"
-OPTIONS="$WORK/ExportOptions.plist"
-plutil -create xml1 "$OPTIONS"
-plutil -insert method -string debugging "$OPTIONS"
-plutil -insert signingStyle -string automatic "$OPTIONS"
-plutil -insert teamID -string "$TEAM" "$OPTIONS"
-plutil -insert compileBitcode -bool false "$OPTIONS"
-plutil -insert thinning -string "<none>" "$OPTIONS"
-xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$WORK/export" \
-  -exportOptionsPlist "$OPTIONS" -allowProvisioningUpdates > "$WORK/export.log" 2>&1 || {
-  tail -40 "$WORK/export.log"; exit 1; }
-IPA="$(ls "$WORK"/export/*.ipa | head -1)"
-echo "signed: $IPA"
+# Signed here with codesign: this Mac's Apple Development certificate and the
+# team profiles for Heron's two bundle ids (Xcode's export wants cloud-managed
+# certificates, which not every team has). The profiles are made once per Mac
+# by scripts/heron/make-profiles.sh.
+APP="$WORK/Payload/$(basename "$ARCHIVE"/Products/Applications/*.app)"
+mkdir -p "$WORK/Payload"
+ditto "$ARCHIVE"/Products/Applications/*.app "$APP"
+profile_for() {
+  local id="$1" f
+  for f in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"/* "$HOME/Library/MobileDevice/Provisioning Profiles"/*; do
+    [ -f "$f" ] || continue
+    security cms -D -i "$f" > "$WORK/p.plist" 2>/dev/null || continue
+    [ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$WORK/p.plist" 2>/dev/null)" = "$TEAM.$id" ] || continue
+    [ "$(date -j -f '%a %b %d %T %Z %Y' "$(/usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$WORK/p.plist")" +%s 2>/dev/null || echo 0)" -gt "$(date +%s)" ] || continue
+    echo "$f"; return 0
+  done
+  echo "No profile for $id: run scripts/heron/make-profiles.sh" >&2; return 1
+}
+IDENTITY="$(security find-identity -v -p codesigning | awk -v team="$TEAM" '/Apple Development/ {print $2; exit}')"
+sign() { # sign <bundle> <bundle id>
+  local bundle="$1" id="$2" profile ent
+  profile="$(profile_for "$id")"
+  cp "$profile" "$bundle/embedded.mobileprovision"
+  ent="$WORK/$id.entitlements"
+  security cms -D -i "$profile" > "$WORK/p.plist"
+  /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$WORK/p.plist" > "$ent"
+  codesign --force --sign "$IDENTITY" --entitlements "$ent" --timestamp=none --generate-entitlement-der "$bundle"
+}
+find "$APP" -depth \( -name "*.framework" -o -name "*.dylib" \) | while read -r lib; do
+  codesign --force --sign "$IDENTITY" --timestamp=none "$lib"
+done
+for ext in "$APP"/PlugIns/*.appex; do
+  [ -d "$ext" ] && sign "$ext" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ext/Info.plist")"
+done
+sign "$APP" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+codesign --verify --deep --strict "$APP"
+echo "signed: $APP"
 
 DEVICE="${HERON_DEVICE:-$(xcrun devicectl list devices 2>/dev/null | awk '/iPhone/ && /available|connected/ && /physical/ {for (i=1;i<=NF;i++) if ($i ~ /^[0-9A-F-]{36}$/) {print $i; exit}}')}"
 [ -n "$DEVICE" ] || { echo "No paired iPhone found (xcrun devicectl list devices)." >&2; exit 1; }
 echo "== Installing on $DEVICE"
-xcrun devicectl device install app --device "$DEVICE" "$IPA"
+xcrun devicectl device install app --device "$DEVICE" "$APP"
 xcrun devicectl device process launch --device "$DEVICE" com.kanishkaverma.heron || true
 echo "Heron is on your iPhone."

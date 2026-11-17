@@ -514,7 +514,15 @@ impl RowBuilder {
                         }
                         MessagePart::Error { id, message } => {
                             let gap = gap_for(&rows, false);
-                            rows.push(Placed { core: Arc::new(notice_row(ctx, &entry.id, id, message)), gap });
+                            // Heron: a Pi session that can't be reopened here means the
+                            // chat moved to another computer (heron-keeper), which then
+                            // catches up from the transcript. Expected, not an error.
+                            if message.starts_with("Pi could not restore session") {
+                                let text = "Continued on another computer";
+                                rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "arrow.triangle.swap", ColorRole::TextTertiary, text, WhiteSpace::Normal)), gap });
+                            } else {
+                                rows.push(Placed { core: Arc::new(notice_row(ctx, &entry.id, id, message)), gap });
+                            }
                         }
                         MessagePart::Fork { id, source_title, .. } => {
                             let gap = gap_for(&rows, false);

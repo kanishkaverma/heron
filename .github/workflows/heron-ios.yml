@@ -34,7 +34,7 @@ jobs:
       cancel-in-progress: false
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Xcode 26
         run: |
@@ -48,7 +48,7 @@ jobs:
 
       - name: Restore the Rust core
         id: core
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: target/ios-core/iphoneos
           key: heron-core-iphoneos-${{ steps.key.outputs.hash }}
@@ -66,7 +66,7 @@ jobs:
 
       - name: Save the Rust core
         if: steps.core.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: target/ios-core/iphoneos
           key: heron-core-iphoneos-${{ steps.key.outputs.hash }}
@@ -90,7 +90,7 @@ jobs:
       - name: Zip the archive
         run: ditto -c -k --keepParent "$RUNNER_TEMP/Heron.xcarchive" "$RUNNER_TEMP/Heron.xcarchive.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: heron-ios-archive
           path: ${{ runner.temp }}/Heron.xcarchive.zip
@@ -104,7 +104,7 @@ jobs:
       cancel-in-progress: true
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Xcode 26 + an iPhone simulator
         run: |
@@ -132,7 +132,7 @@ jobs:
 
       - name: Restore the Rust core
         id: core
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: target/ios-core/iphonesimulator
           key: heron-core-sim-${{ steps.key.outputs.hash }}
@@ -156,7 +156,7 @@ jobs:
 
       - name: Save the Rust core
         if: steps.core.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: target/ios-core/iphonesimulator
           key: heron-core-sim-${{ steps.key.outputs.hash }}
@@ -188,14 +188,14 @@ jobs:
             ls -la "$RUNNER_TEMP/screenshots"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: heron-screenshots
           path: ${{ runner.temp }}/screenshots
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: heron-test-results

@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""heronctl: one way to look at, deploy to and test every Heron computer.
+
+  heronctl status                     every computer at a glance (read-only)
+  heronctl diff                       which installed files differ from this checkout
+  heronctl deploy [--dry-run]         install this checkout's Heron files, restart the keepers
+  heronctl logs [-f] [-n N]           keeper logs of every computer, prefixed
+  heronctl wait REGEX… [--timeout S]  until keeper log lines match every regex (instead of sleep + tail)
+  heronctl tasks [--all]              the background-task board
+  heronctl task start TITLE BRIEF     put a dev task on the board (no chat, no report to anyone)
+  heronctl task show|stop|rm ID       its state, log and result; stop it; remove it (dev tasks only)
+  heronctl chat where                 which computer runs the Heron chat
+  heronctl chat read [-n N] [--live]  the last messages
+  heronctl chat send TEXT [--wait S] [--live] [--on HOST]
+                                      message the dev chat ("Heron dev"); --live: the real one
+  heronctl chat cleanup               archive the dev chat
+  heronctl kill HOST [--hard]         take a computer's Zeron down (--hard: keeper, sync, task runs too)
+  heronctl revive [HOST…]             bring back what `kill` took down (default: everything killed)
+  heronctl test-mode on|off|status    short failover timings on every computer, and back
+
+Every command takes --hosts air,zeph,mbp to narrow it. Computers and how to
+reach them: HOSTS below, overridden per computer by ~/.heron/hosts.json
+(a list of {"name", "ssh", ...}). The computer you are on is used directly.
+
+Remote work is a Python script piped to `ssh HOST python3 -`, so nothing is
+ever quoted for a remote shell (the MacBook's login shell is fish).
+Standard library only; runs on macOS's /usr/bin/python3 (3.9).
+"""
+import argparse
+import base64
+import concurrent.futures
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("HERON_ROOT") or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HOME = os.path.expanduser("~")
+
+# name: what you type; device: its name in Zeron (the keeper's priority list);
+# ssh: the ssh target; hostnames: how it names itself (to spot "this computer").
+HOSTS = [
+    {"name": "air", "device": "nishka-server", "ssh": "air", "hostnames": ["nishka-server", "openclaw"]},
+    {"name": "zeph", "device": "zeph", "ssh": "zeph", "hostnames": ["zeph", "zeph-1"]},
+    {"name": "mbp", "device": "Kanishka\u2019s MacBook Pro", "ssh": "mbp", "hostnames": ["kanishkas-macbook-pro"]},
+]
+
+# What a deploy installs: source in this checkout -> path under ~ on every computer.
+FILES = [
+    ("heron/agent/AGENTS.md", "heron/AGENTS.md", 0o644),
+    ("heron/agent/.pi/extensions/heron/index.ts", "heron/.pi/extensions/heron/index.ts", 0o644),
+    ("heron/agent/.pi/extensions/heron/runner.mjs", "heron/.pi/extensions/heron/runner.mjs", 0o644),
+    ("heron/agent/memo-fix", ".heron/memo-fix", 0o755),
+    ("heron/keeper/heron-keeper.py", ".heron/heron-keeper.py", 0o644),
+    ("heron/keeper/pi_sync.py", ".heron/pi_sync.py", 0o644),
+    ("scripts/heron/memory-sync.py", ".heron/memory-sync.py", 0o755),
+]
+
+# Short timings for failover tests. Zeron's lastSeenAt beats every ~15 s, so
+# 45 s is three missed beats: lower and a healthy computer looks offline.
+TEST_MODE = {"offline_secs": 45, "failback_quiet_secs": 60, "interval_secs": 5}
+DEV_CHAT = "Heron dev"
+LIVE_CHAT = "Heron"
+
+# ------------------------------------------------------------------ remote
+#
+# REMOTE runs on the target computer. The call is appended as JSON; the
+# reply is one JSON line on stdout after the marker.
+
+MARK = "@@heronctl@@"
+REMOTE = r'''
+import base64, datetime, glob, hashlib, json, os, platform, shutil, signal, subprocess, sys, time
+HOME = os.path.expanduser("~")
+H = os.path.join(HOME, ".heron")
+os.environ["PATH"] = os.pathsep.join([os.path.join(HOME, ".local", "bin"), os.path.join(HOME, ".bun", "bin"),
+                                      "/opt/homebrew/bin", "/usr/local/bin", os.environ.get("PATH", "")])
+MAC = platform.system() == "Darwin"
+UID = os.getuid()
+LABELS = {"keeper": "com.kanishkaverma.heron-keeper", "syncthing": "com.kanishkaverma.heron-syncthing", "zeron": "sh.zeron.app"}
+UNITS = {"keeper": "heron-keeper.service", "syncthing": "heron-syncthing.service", "zeron": "zeron.service"}
+KILLED = os.path.join(H, "killed-by-heronctl.json")
+
+def sh(*args, **kw):
+    return subprocess.run(list(args), capture_output=True, text=True, timeout=kw.get("timeout", 30))
+
+def read_json(path, default=None):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return default
+
+def write_json(path, value):
+    tmp = path + ".tmp"
+    json.dump(value, open(tmp, "w"), indent=2)
+    os.replace(tmp, path)
+
+def plist(name):
+    return os.path.join(HOME, "Library", "LaunchAgents", LABELS[name] + ".plist")
+
+def zeron_is_app():
+    """On a Mac without the headless engine, Zeron is the desktop app."""
+    return MAC and not os.path.exists(plist("zeron"))
+
+def svc_running(name):
+    if not MAC:
+        return sh("systemctl", "--user", "is-active", UNITS[name]).stdout.strip() == "active"
+    if name == "zeron" and zeron_is_app():
+        return sh("pgrep", "-f", "Zeron.app/Contents/MacOS/").returncode == 0
+    return "state = running" in sh("launchctl", "print", "gui/%d/%s" % (UID, LABELS[name])).stdout
+
+def svc_stop(name):
+    if not MAC:
+        return sh("systemctl", "--user", "stop", UNITS[name]).returncode == 0
+    if name == "zeron" and zeron_is_app():
+        sh("osascript", "-e", 'quit app "Zeron"')
+        return True
+    sh("launchctl", "bootout", "gui/%d/%s" % (UID, LABELS[name]))
+    return True
+
+def svc_start(name):
+    if not MAC:
+        return sh("systemctl", "--user", "start", UNITS[name]).returncode == 0
+    if name == "zeron" and zeron_is_app():
+        return sh("open", "-ga", "Zeron").returncode == 0
+    for _ in range(12):  # bootout returns before the job is gone; bootstrap too soon fails
+        sh("launchctl", "bootstrap", "gui/%d" % UID, plist(name))
+        if svc_running(name):
+            return True
+        time.sleep(1)
+    return False
+
+def svc_restart(name):
+    if not MAC:
+        return sh("systemctl", "--user", "restart", UNITS[name]).returncode == 0
+    return sh("launchctl", "kickstart", "-k", "gui/%d/%s" % (UID, LABELS[name])).returncode == 0
+
+def sha(path):
+    try:
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except Exception:
+        return None
+
+def log_tail(n=400):
+    try:
+        with open(os.path.join(H, "keeper.log"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 60000))
+            return f.read().decode("utf8", "replace").splitlines()[-n:]
+    except Exception:
+        return []
+
+def facts(dests):
+    lines = log_tail()
+    starts = [i for i, l in enumerate(lines) if "heron-keeper started" in l]
+    errors = [l for l in lines[starts[-1] if starts else 0:] if " error:" in l or "unreachable" in l]
+    def recent(line):  # the keeper logs decisions only, so an old error may be long over
+        try:
+            return (datetime.datetime.now() - datetime.datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")).total_seconds() < 600
+        except ValueError:
+            return True
+    errors = [l for l in errors if recent(l)]
+    conflicts = []
+    for root in ("memory", "threads", "shared"):
+        conflicts += glob.glob(os.path.join(H, root, "**", "*sync-conflict*"), recursive=True)
+    pi = sh("pi", "--version").stdout.strip().splitlines()
+    skills = set()
+    for d in (os.path.join(HOME, ".pi", "agent", "skills"), os.path.join(HOME, ".agents", "skills")):
+        for p in glob.glob(os.path.join(d, "*")):
+            skills.add(os.path.basename(p))
+    runs = []
+    for p in glob.glob(os.path.join(H, "runs", "*.json")):
+        r = read_json(p, {})
+        try:
+            os.kill(r.get("pid") or -1, 0)
+            runs.append(os.path.basename(p)[:-5])
+        except Exception:
+            pass
+    st = os.statvfs(HOME)
+    return {
+        "hostname": platform.node(), "os": platform.system(),
+        "services": {n: svc_running(n) for n in ("zeron", "keeper", "syncthing")},
+        "pi": pi[-1] if pi else None, "skills": len(skills),
+        "models": read_json(os.path.join(H, "models.json"), []),
+        "keeper_config": read_json(os.path.join(H, "keeper.json"), {}),
+        "killed": read_json(KILLED),
+        "conflicts": sorted(os.path.relpath(c, H) for c in conflicts),
+        "hashes": {d: sha(os.path.join(HOME, d)) for d in dests},
+        "log_last": lines[-1] if lines else None,
+        "log_last_error": errors[-1] if errors else None,
+        "runs": runs,
+        "disk_free_gb": round(st.f_bavail * st.f_frsize / 1e9, 1),
+    }
+
+def install(payload, restart, dry):
+    changed = []
+    for dest, (data, mode) in sorted(payload.items()):
+        path = os.path.join(HOME, dest)
+        new = base64.b64decode(data)
+        if hashlib.sha256(new).hexdigest() == sha(path):
+            continue
+        changed.append(dest)
+        if dry:
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and dest.endswith("AGENTS.md"):
+            shutil.copy2(path, path + ".bak-" + time.strftime("%Y%m%d%H%M%S"))
+        tmp = path + ".heronctl.tmp"
+        open(tmp, "wb").write(new)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    restarted = False
+    if changed and restart and not dry and any(d.startswith(".heron/heron-keeper") or d.startswith(".heron/pi_sync") for d in changed):
+        restarted = svc_restart("keeper")
+        time.sleep(3)
+    return {"changed": changed, "restarted": restarted, "keeper": svc_running("keeper"),
+            "log_last": (log_tail(1) or [None])[-1]}
+
+def kill(hard, dry):
+    names = ["zeron", "keeper", "syncthing"] if hard else ["zeron"]
+    was = [n for n in names if svc_running(n)]
+    if dry:
+        return {"would_stop": was, "would_kill_runs": hard}
+    prev = read_json(KILLED, {"stopped": []})
+    write_json(KILLED, {"stopped": sorted(set(prev["stopped"]) | set(was)), "at": time.time(), "hard": hard})
+    killed = 0
+    if hard:  # first, and only the task runs this keeper started: their pids are in ~/.heron/runs
+        svc_stop("keeper")  # or it restarts them
+        for p in glob.glob(os.path.join(H, "runs", "*.json")):
+            pid = (read_json(p, {}) or {}).get("pid")
+            try:
+                os.kill(pid, 0)
+                killed += 1
+                os.killpg(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    for n in was:
+        svc_stop(n)
+    time.sleep(1)
+    return {"stopped": was, "runs_killed": killed, "still_running": [n for n in names if svc_running(n)]}
+
+def revive(dry):
+    marker = read_json(KILLED)
+    if not marker:
+        return {"started": [], "note": "nothing here was killed by heronctl"}
+    order = [n for n in ("zeron", "syncthing", "keeper") if n in marker["stopped"]]
+    if dry:
+        return {"would_start": order}
+    failed = [n for n in order if not svc_start(n)]
+    time.sleep(2)
+    down = [n for n in order if not svc_running(n)]
+    if not down:
+        os.remove(KILLED)
+    return {"started": [n for n in order if n not in down], "failed": sorted(set(failed + down))}
+
+def testmode(action, values):
+    path = os.path.join(H, "keeper.json")
+    saved = os.path.join(H, "keeper.json.before-test-mode")
+    cfg = read_json(path, {}) or {}
+    if action == "on":
+        if not os.path.exists(saved):
+            write_json(saved, cfg)
+        cfg.update(values)
+        write_json(path, cfg)
+    elif action == "off" and os.path.exists(saved):
+        before = read_json(saved, {}) or {}
+        if before:
+            write_json(path, before)
+        elif os.path.exists(path):
+            os.remove(path)
+        os.remove(saved)
+    return {"test_mode": os.path.exists(saved), "keeper_config": read_json(path, {}) or {}}
+
+def zeron_exe():
+    app = "/Applications/Zeron.app/Contents/MacOS/zeron"
+    return app if os.path.exists(app) else (shutil.which("zeron") or os.path.join(HOME, ".local", "bin", "zeron"))
+
+class Mcp:
+    def __init__(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ZERON_CHAT")}
+        self.p = subprocess.Popen([zeron_exe(), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, env=env)
+        self.n = 0
+        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                "clientInfo": {"name": "heronctl", "version": "1"}})
+        self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        self.p.stdin.flush()
+    def rpc(self, method, params):
+        self.n += 1
+        self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params}) + "\n")
+        self.p.stdin.flush()
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("zeron mcp closed (is Zeron running here?)")
+            msg = json.loads(line)
+            if msg.get("id") == self.n:
+                if "error" in msg:
+                    raise RuntimeError(json.dumps(msg["error"]))
+                return msg["result"]
+    def tool(self, name, args=None):
+        res = self.rpc("tools/call", {"name": name, "arguments": args or {}})
+        text = "".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
+        if res.get("isError"):
+            raise RuntimeError(text)
+        return json.loads(text)
+
+def find_chat(mcp, title, archived=False):
+    chats = mcp.tool("list_chats", {"limit": 500, "include_archived": archived})["chats"]
+    mine = [c for c in chats if not c.get("parentChatId") and c.get("title") == title
+            and (c.get("cwd") or "") in ("~/heron", "~/heron/")]
+    mine.sort(key=lambda c: (bool(c.get("archived")), c.get("createdAt") or ""))
+    return mine[0] if mine else None
+
+def chat(action, title, text=None, wait=0, limit=6, create=False):
+    mcp = Mcp()
+    try:
+        devices = mcp.tool("list_devices")["devices"]
+        names = {d["id"]: d["name"] for d in devices}
+        me = next(d for d in devices if d.get("local"))
+        c = find_chat(mcp, title)
+        if action == "where":
+            now = datetime.datetime.now(datetime.timezone.utc)
+            age = lambda d: int((now - datetime.datetime.fromisoformat(d["lastSeenAt"].replace("Z", "+00:00"))).total_seconds()) if d.get("lastSeenAt") else None
+            return {"chat": c and {k: c.get(k) for k in ("id", "model", "sessionStatus", "lastMessageAt", "lastMessagePreview")},
+                    "host": c and names.get(c["deviceId"], c["deviceId"]),
+                    "devices": [{"name": d["name"], "seen_secs_ago": age(d), "version": d.get("version"), "local": d.get("local")} for d in devices]}
+        if action == "cleanup":
+            if c:
+                mcp.tool("archive_chat", {"chat": c["id"], "archived": True})
+            return {"archived": c and c["id"]}
+        if not c and create:
+            made = mcp.tool("create_chat", {"kind": "chat", "device": me["id"], "harness": "pi", "cwd": "~/heron", "title": title})
+            c = {"id": made["chatId"], "deviceId": me["id"]}
+        if not c:
+            raise RuntimeError("no chat titled %r" % title)
+        out = {"chat": c["id"], "host": names.get(c["deviceId"], c["deviceId"])}
+        if action == "send":
+            t0 = time.time()
+            args = {"chat": c["id"], "text": text, "wait": bool(wait)}
+            if wait:
+                args["timeout_secs"] = int(wait)
+            out["sent"] = mcp.tool("send_message", args)
+            out["secs"] = round(time.time() - t0, 1)
+            limit = 2
+        msgs = mcp.tool("read_chat", {"chat": c["id"], "limit": limit}).get("messages", [])
+        out["messages"] = [{k: m.get(k) for k in ("role", "createdAtIso", "status", "text", "errors", "tools") if m.get(k)} for m in msgs]
+        return out
+    finally:
+        mcp.p.terminate()
+
+def task(action, tid=None, title=None, brief=None):
+    root = os.path.join(H, "threads")
+    if action == "start":
+        import random, re
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:24]
+        tid = "dev-%s-%s" % (slug, "".join(random.choice("abcdefghijkmnpqrstuvwxyz23456789") for _ in range(4)))
+        d = os.path.join(root, tid)
+        os.makedirs(os.path.join(d, "work"))
+        src = open(os.path.join(HOME, "heron", ".pi", "extensions", "heron", "index.ts")).read()
+        m = re.search(r"const BRIEF = `(.*?)`;", src, re.S)
+        open(os.path.join(d, "brief.md"), "w").write(m.group(1) if m else "")
+        now = int(time.time() * 1000)
+        # chat "heronctl-dev": no chat is told about this task's report
+        write_json(os.path.join(d, "spec.json"), {"id": tid, "title": title, "task": brief, "model": None, "createdAt": now,
+                                                  "chat": "heronctl-dev", "from": platform.node()})
+        write_json(os.path.join(d, "request.json"), {"req": 1, "mode": "fresh", "prompt": brief, "at": now})
+        return {"id": tid}
+    d = os.path.join(root, tid)
+    if not tid.startswith("dev-") and action in ("stop", "rm"):
+        raise RuntimeError("only dev- tasks (made by heronctl) can be stopped or removed here")
+    if not os.path.isdir(d):
+        raise RuntimeError("no task %s" % tid)
+    if action == "stop":
+        write_json(os.path.join(d, "stop.json"), {"req": read_json(os.path.join(d, "request.json"), {}).get("req"), "at": int(time.time() * 1000)})
+        return {"stopping": tid}
+    if action == "rm":
+        shutil.rmtree(d)
+        return {"removed": tid}
+    text = lambda f, n: "\n".join(open(os.path.join(d, f), errors="replace").read().splitlines()[-n:]) if os.path.exists(os.path.join(d, f)) else ""
+    results = sorted(glob.glob(os.path.join(d, "result*.md")))
+    return {"status": read_json(os.path.join(d, "status.json"), {}), "lease": read_json(os.path.join(d, "lease.json"), {}),
+            "log": text("log.md", 12), "result": open(results[-1], errors="replace").read()[-3000:] if results else "",
+            "work": sorted(os.listdir(os.path.join(d, "work"))) if os.path.isdir(os.path.join(d, "work")) else []}
+
+def tasks():
+    out = []
+    for d in sorted(glob.glob(os.path.join(H, "threads", "*", ""))):
+        spec, req = read_json(d + "spec.json"), read_json(d + "request.json")
+        if not spec or not req:
+            continue
+        st, lease = read_json(d + "status.json", {}), read_json(d + "lease.json", {})
+        out.append({"id": os.path.basename(d.rstrip("/")), "title": spec.get("title"), "req": req.get("req"),
+                    "state": st.get("state") if st.get("req") == req.get("req") else "waiting",
+                    "owner": lease.get("ownerName"), "attempt": lease.get("attempt"), "moved_from": lease.get("movedFrom"),
+                    "notified": os.path.exists(d + "notified-%s" % req.get("req")),
+                    "created": spec.get("createdAt")})
+    return out
+'''
+
+
+def hosts(only=None):
+    table = [dict(h) for h in HOSTS]
+    try:
+        for o in json.load(open(os.path.join(HOME, ".heron", "hosts.json"))):
+            for h in table:
+                if h["name"] == o.get("name"):
+                    h.update(o)
+                    break
+            else:
+                table.append(o)
+    except FileNotFoundError:
+        pass
+    me = socket.gethostname().lower().split(".")[0]
+    for h in table:
+        h["local"] = me in [n.lower() for n in h.get("hostnames", [])]
+    if only:
+        want = [n.strip() for n in only.split(",") if n.strip()]
+        unknown = set(want) - {h["name"] for h in table}
+        if unknown:
+            sys.exit("unknown computer: %s (known: %s)" % (", ".join(sorted(unknown)), ", ".join(h["name"] for h in table)))
+        table = [h for h in table if h["name"] in want]
+    return table
+
+
+def ssh_cmd(host, *remote):
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host["ssh"]] + list(remote)
+
+
+def remote(host, call, timeout=90):
+    """Run REMOTE + `call` (Python source of one expression) on a computer.
+    Returns the value, or raises RuntimeError with what went wrong."""
+    script = REMOTE + "\nprint(%r + json.dumps(%s))\n" % (MARK, call)
+    cmd = ["python3", "-"] if host["local"] else ssh_cmd(host, "python3 -")
+    try:
+        p = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("no answer in %ds" % timeout)
+    for line in p.stdout.splitlines():
+        if line.startswith(MARK):
+            return json.loads(line[len(MARK):])
+    err = (p.stderr.strip().splitlines() or ["exit %d" % p.returncode])[-1]
+    raise RuntimeError(err[:300])
+
+
+def each(table, call, timeout=90):
+    """`call` on every computer at once -> {name: value or RuntimeError}."""
+    def one(h):
+        try:
+            return remote(h, call(h) if callable(call) else call, timeout)
+        except RuntimeError as e:
+            return e
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        return dict(zip([h["name"] for h in table], pool.map(one, table)))
+
+
+def lit(value):
+    """A Python literal for the remote script, safe for any text."""
+    return "json.loads(base64.b64decode(%r))" % base64.b64encode(json.dumps(value).encode()).decode()
+
+
+def checkout():
+    """This checkout's deployable files: {dest: (bytes, mode)}; and what's missing."""
+    have, missing = {}, []
+    for src, dest, mode in FILES:
+        path = os.path.join(ROOT, src)
+        if os.path.exists(path):
+            have[dest] = (open(path, "rb").read(), mode)
+        else:
+            missing.append(src)
+    return have, missing
+
+
+def table_print(rows, header):
+    widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(len(header))]
+    for r in [header] + rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip())
+
+
+def on(ok):
+    return "up" if ok else "DOWN"
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_status(a):
+    table = hosts(a.hosts)
+    have, missing = checkout()
+    dests = [d for _, d, _ in FILES]
+    got = each(table, "facts(%s)" % lit(dests))
+    rows, notes, bad = [], [], False
+    for h in table:
+        f = got[h["name"]]
+        if isinstance(f, RuntimeError):
+            rows.append([h["name"], "UNREACHABLE", "", "", "", "", "", "", ""])
+            notes.append("%s: %s" % (h["name"], f))
+            bad = True
+            continue
+        s = f["services"]
+        differ = [d for d in have if hashlib.sha256(have[d][0]).hexdigest() != f["hashes"].get(d)]
+        rows.append([h["name"], on(s["zeron"]), on(s["keeper"]), on(s["syncthing"]), f["pi"] or "?", f["skills"],
+                     (f["models"] or ["none"])[0], "same" if not differ else "%d differ" % len(differ),
+                     len(f["conflicts"]) or "-"])
+        bad = bad or not all(s.values())
+        if f["killed"]:
+            notes.append("%s: taken down by `heronctl kill` (%s); `heronctl revive %s` brings it back"
+                         % (h["name"], ", ".join(f["killed"]["stopped"]), h["name"]))
+        if f["keeper_config"]:
+            notes.append("%s: keeper.json overrides %s" % (h["name"], json.dumps(f["keeper_config"])))
+        if len(f["models"]) < 2:
+            notes.append("%s: only %d working model(s), so no fallback on a limit" % (h["name"], len(f["models"])))
+        if f["conflicts"]:
+            notes.append("%s: %d sync-conflict file(s), e.g. %s" % (h["name"], len(f["conflicts"]), f["conflicts"][0]))
+        if f["log_last_error"]:
+            notes.append("%s: last keeper error: %s" % (h["name"], f["log_last_error"][:160]))
+        if f["runs"]:
+            notes.append("%s: running task(s): %s" % (h["name"], ", ".join(f["runs"])))
+        if f["disk_free_gb"] < 10:
+            notes.append("%s: only %s GB free" % (h["name"], f["disk_free_gb"]))
+    table_print(rows, ["computer", "zeron", "keeper", "sync", "pi", "skills", "model", "vs checkout", "conflicts"])
+    cfgs = {json.dumps(f["keeper_config"], sort_keys=True) for f in got.values() if not isinstance(f, RuntimeError)}
+    if len(cfgs) > 1:
+        notes.append("keeper.json differs between computers: they will disagree about who is offline")
+        bad = True
+    for h in sorted(table, key=lambda h: not h["local"]):  # any computer whose Zeron answers
+        try:
+            w = remote(h, "chat('where', %s)" % lit(LIVE_CHAT), 40)
+        except RuntimeError:
+            continue
+        c = w["chat"]
+        print("\nHeron chat: on %s, %s, model %s, last message %s" % (w["host"], c["sessionStatus"], c["model"], c["lastMessageAt"])
+              if c else "\nHeron chat: none")
+        break
+    else:
+        notes.append("chat: no computer's Zeron answered")
+        bad = True
+    if missing:
+        notes.append("not in this checkout (never deployed from here): %s" % ", ".join(missing))
+    if notes:
+        print("\n" + "\n".join("- " + n for n in notes))
+    return 1 if bad else 0
+
+
+def pick(table, name=None):
+    """The computer to talk to Zeron on: the named one, this one, else the first."""
+    if name:
+        return hosts(name)[0]
+    return next((h for h in table if h["local"]), table[0])
+
+
+def cmd_diff(a):
+    table = hosts(a.hosts)
+    have, missing = checkout()
+    got = each(table, "facts(%s)" % lit(list(have)))
+    differs = False
+    for h in table:
+        f = got[h["name"]]
+        if isinstance(f, RuntimeError):
+            print("%s: UNREACHABLE (%s)" % (h["name"], f))
+            differs = True
+            continue
+        d = [k for k in sorted(have) if hashlib.sha256(have[k][0]).hexdigest() != f["hashes"].get(k)]
+        differs = differs or bool(d)
+        print("%s: %s" % (h["name"], "same as this checkout" if not d else "differs: " + ", ".join("~/" + k for k in d)))
+    for m in missing:
+        print("not in this checkout, left alone everywhere: %s" % m)
+    return 1 if differs else 0
+
+
+def cmd_deploy(a):
+    table = hosts(a.hosts)
+    have, missing = checkout()
+    payload = {d: [base64.b64encode(b).decode(), m] for d, (b, m) in have.items()}
+    got = each(table, "install(%s, %r, %r)" % (lit(payload), not a.no_restart, a.dry_run), 120)
+    failed = False
+    for h in table:
+        r = got[h["name"]]
+        if isinstance(r, RuntimeError):
+            print("%s: FAILED (%s)" % (h["name"], r))
+            failed = True
+            continue
+        verb = "would change" if a.dry_run else "changed"
+        print("%s: %s" % (h["name"], "already current" if not r["changed"] else "%s %s" % (verb, ", ".join("~/" + c for c in r["changed"]))))
+        if not a.dry_run:
+            if r["restarted"]:
+                print("    keeper restarted: %s" % r["log_last"])
+            if not r["keeper"]:
+                print("    KEEPER IS NOT RUNNING")
+                failed = True
+    for m in missing:
+        print("not in this checkout, left alone everywhere: %s" % m)
+    if not a.dry_run and not failed:
+        print("A running Heron chat keeps its old extension until its agent restarts.")
+    return 1 if failed else 0
+
+
+def tail_procs(table, n, follow):
+    procs = []
+    for h in table:
+        args = ["tail", "-n", str(n)] + (["-F"] if follow else []) + [os.path.join(".heron", "keeper.log")]
+        if h["local"]:
+            args[-1] = os.path.join(HOME, args[-1])
+            cmd = args
+        else:
+            cmd = ssh_cmd(h, " ".join(args))
+        procs.append((h, subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                          text=True, bufsize=1)))
+    return procs
+
+
+def stream(procs, on_line):
+    """Feed every line of every tail to on_line(host, line) until it returns True."""
+    import queue
+    import threading
+    q = queue.Queue()
+
+    def pump(h, p):
+        for line in p.stdout:
+            q.put((h, line.rstrip("\n")))
+        q.put((h, None))
+    for h, p in procs:
+        threading.Thread(target=pump, args=(h, p), daemon=True).start()
+    live = len(procs)
+    try:
+        while live:
+            try:
+                h, line = q.get(timeout=0.5)
+            except queue.Empty:
+                if on_line(None, None):
+                    return True
+                continue
+            if line is None:
+                live -= 1
+            elif on_line(h, line):
+                return True
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for _, p in procs:
+            p.terminate()
+    return False
+
+
+def cmd_logs(a):
+    stream(tail_procs(hosts(a.hosts), a.n, a.follow), lambda h, l: print("%-5s %s" % (h["name"], l), flush=True) if h else None)
+    return 0
+
+
+def cmd_wait(a):
+    """Until every regex has matched some keeper log line written from now on."""
+    waiting = {r: re.compile(r) for r in a.regex}
+    deadline, t0 = time.time() + a.timeout, time.time()
+
+    def on_line(h, line):
+        for r in [r for r, pattern in waiting.items() if h and pattern.search(line)]:
+            del waiting[r]
+            print("%-5s %s   (+%ds)" % (h["name"], line, time.time() - t0), flush=True)
+        return not waiting or time.time() > deadline
+    stream(tail_procs(hosts(a.hosts), 0, True), on_line)  # -n 0: only new lines
+    for r in waiting:
+        print("no keeper log line matched /%s/ in %ds" % (r, a.timeout))
+    return 1 if waiting else 0
+
+
+def cmd_tasks(a):
+    table = hosts(a.hosts)
+    rows = remote(pick(table), "tasks()")
+    if not a.all:
+        rows = [r for r in rows if not (r["state"] in ("done", "failed", "stopped") and r["notified"])]
+    if not rows:
+        print("no open tasks" + ("" if a.all else " (--all shows finished ones)"))
+        return 0
+    table_print([[r["id"], r["state"], r["owner"] or "-", r["attempt"] or "-", r["moved_from"] or "-",
+                  "yes" if r["notified"] else "no", (r["title"] or "")[:40]] for r in rows],
+                ["task", "state", "computer", "attempt", "moved from", "reported", "title"])
+    return 0
+
+
+def cmd_task(a):
+    host = pick(hosts(a.hosts), a.on)
+    if a.action == "start":
+        if not (a.arg and a.brief):
+            sys.exit('task start needs a title and a brief: heronctl task start "Title" "What to do"')
+        r = remote(host, "task('start', title=%s, brief=%s)" % (lit(a.arg), lit(a.brief)))
+        print(r["id"])
+        return 0
+    if not a.arg:
+        sys.exit("task %s needs the task id (see `heronctl tasks`)" % a.action)
+    r = remote(host, "task(%r, %s)" % (a.action, lit(a.arg)))
+    if a.action != "show":
+        print(json.dumps(r))
+        return 0
+    st, lease = r["status"], r["lease"]
+    print("state %s, request %s, attempt %s on %s%s" % (st.get("state"), st.get("req"), lease.get("attempt"), lease.get("ownerName"),
+                                                       ", moved from %s" % lease["movedFrom"] if lease.get("movedFrom") else ""))
+    if st.get("error"):
+        print("error: %s" % st["error"])
+    for name in ("log", "result"):
+        if r[name]:
+            print("--- %s\n%s" % (name, r[name]))
+    if r["work"]:
+        print("--- work/: %s" % ", ".join(r["work"]))
+    return 0
+
+
+def cmd_chat(a):
+    table = hosts(a.hosts)
+    title = LIVE_CHAT if a.live else DEV_CHAT
+    host = pick(table, a.on)
+    if a.action == "where":
+        w = remote(host, "chat('where', %s)" % lit(LIVE_CHAT), 40)
+        print(json.dumps(w, indent=1, ensure_ascii=False))
+        return 0
+    if a.action == "cleanup":
+        print(json.dumps(remote(host, "chat('cleanup', %s)" % lit(DEV_CHAT), 40)))
+        return 0
+    if a.action == "send":
+        if not a.text:
+            sys.exit("chat send needs the text")
+        r = remote(host, "chat('send', %s, %s, %r, create=%r)" % (lit(title), lit(a.text), a.wait, not a.live), a.wait + 60)
+    else:
+        r = remote(host, "chat('read', %s, limit=%d)" % (lit(title), a.n), 40)
+    print("[%s on %s%s]" % (title, r["host"], ", %ss" % r["secs"] if "secs" in r else ""))
+    failed = False
+    for m in r["messages"]:
+        print("%s: %s" % (m["role"], m.get("text") or "(%s%s)" % (m.get("status", ""), ", tools: " + ", ".join(m["tools"]) if m.get("tools") else "")))
+        if m.get("errors"):
+            print("  ERRORS: %s" % " | ".join(m["errors"]))
+            failed = True
+    return 1 if failed else 0
+
+
+def cmd_kill(a):
+    h = hosts(a.host)[0]
+    r = remote(h, "kill(%r, %r)" % (a.hard, a.dry_run), 60)
+    print("%s: %s" % (h["name"], json.dumps(r)))
+    if not a.dry_run:
+        print("`heronctl revive %s` brings it back. The others notice it gone after the keeper's offline_secs." % h["name"])
+    return 1 if r.get("still_running") else 0
+
+
+def cmd_revive(a):
+    table = hosts(",".join(a.host) if a.host else a.hosts)
+    got = each(table, "revive(%r)" % a.dry_run, 90)
+    failed = False
+    for h in table:
+        r = got[h["name"]]
+        print("%s: %s" % (h["name"], r if isinstance(r, RuntimeError) else json.dumps(r)))
+        failed = failed or isinstance(r, RuntimeError) or bool(r.get("failed"))
+    return 1 if failed else 0
+
+
+def cmd_test_mode(a):
+    table = hosts(a.hosts)
+    got = each(table, "testmode(%r, %s)" % (a.action, lit(TEST_MODE)), 40)
+    states, failed = set(), False
+    for h in table:
+        r = got[h["name"]]
+        if isinstance(r, RuntimeError):
+            print("%s: UNREACHABLE (%s)" % (h["name"], r))
+            failed = True
+            continue
+        states.add(r["test_mode"])
+        print("%s: test mode %s  %s" % (h["name"], "ON" if r["test_mode"] else "off", json.dumps(r["keeper_config"]) if r["keeper_config"] else ""))
+    if len(states) > 1 or (failed and a.action == "on"):
+        print("NOT THE SAME EVERYWHERE: the computers will disagree about who is offline. Run `heronctl test-mode off`.")
+        return 1
+    if a.action == "on":
+        print("Keepers pick this up on their next tick. Turn it off when done: `heronctl test-mode off`.")
+    return 1 if failed else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="heronctl", description=__doc__.split("\n\n")[0],
+                                 epilog="\n".join(__doc__.split("\n\n")[1:]), formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--hosts", help="only these computers, comma-separated (air,zeph,mbp)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, **kw):
+        p = sub.add_parser(name, **kw)
+        p.add_argument("--hosts", help=argparse.SUPPRESS, default=argparse.SUPPRESS)
+        p.set_defaults(fn=fn)
+        return p
+    add("status", cmd_status)
+    add("diff", cmd_diff)
+    p = add("deploy", cmd_deploy)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-restart", action="store_true")
+    p = add("logs", cmd_logs)
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("-n", type=int, default=15)
+    p = add("wait", cmd_wait)
+    p.add_argument("regex", nargs="+", help="every one must match (any order)")
+    p.add_argument("--timeout", type=int, default=180)
+    p = add("tasks", cmd_tasks)
+    p.add_argument("--all", action="store_true")
+    p = add("task", cmd_task)
+    p.add_argument("action", choices=["start", "show", "stop", "rm"])
+    p.add_argument("arg", nargs="?", help="start: the title; otherwise the task id")
+    p.add_argument("brief", nargs="?")
+    p.add_argument("--on", help="the computer to write the task on")
+    p = add("chat", cmd_chat)
+    p.add_argument("action", choices=["where", "read", "send", "cleanup"])
+    p.add_argument("text", nargs="?")
+    p.add_argument("--wait", type=int, default=0, help="seconds to wait for the reply")
+    p.add_argument("--live", action="store_true", help="the real Heron chat, not the dev chat")
+    p.add_argument("--on", help="the computer whose Zeron to talk to (and where a new dev chat is made)")
+    p.add_argument("-n", type=int, default=6)
+    p = add("kill", cmd_kill)
+    p.add_argument("host")
+    p.add_argument("--hard", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p = add("revive", cmd_revive)
+    p.add_argument("host", nargs="*")
+    p.add_argument("--dry-run", action="store_true")
+    p = add("test-mode", cmd_test_mode)
+    p.add_argument("action", choices=["on", "off", "status"])
+    a = ap.parse_args()
+    try:
+        sys.exit(a.fn(a))
+    except RuntimeError as e:
+        sys.exit("heronctl: %s" % e)
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()

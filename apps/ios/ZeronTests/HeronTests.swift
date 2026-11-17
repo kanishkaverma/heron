@@ -69,6 +69,12 @@ final class HeronTests: XCTestCase {
         XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: "c-mac"), .createChat(projectId: "p-heron", deviceId: "dev-air"))
     }
 
+    func testPinsTheFirstOfferedPreferredModel() {
+        XCTAssertEqual(Heron.pick(from: ["anthropic/claude-opus-5-5", "claude-bridge/claude-opus-5-5"]), "claude-bridge/claude-opus-5-5")
+        XCTAssertEqual(Heron.pick(from: ["openai/gpt-5", "anthropic/claude-opus-5-5"]), "anthropic/claude-opus-5-5")
+        XCTAssertNil(Heron.pick(from: ["openai/gpt-5"]))
+    }
+
     func testHeronFolderPaths() {
         XCTAssertTrue(Heron.isHeronFolder("/Users/me/heron"))
         XCTAssertTrue(Heron.isHeronFolder("/home/me/Heron/"))

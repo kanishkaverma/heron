@@ -177,8 +177,24 @@ final class HeronRootController: UIViewController, AppRouter {
         stopPolling()
         Heron.setChatId(id, on: deviceId)
         chatId = id
+        pinModel(chatId: id, deviceId: deviceId)
         UIView.transition(with: nav.view, duration: 0.25, options: .transitionCrossDissolve) {
             self.nav.setViewControllers([session], animated: false)
+        }
+    }
+
+    /// Pin Heron's model on the chat (see `Heron.preferredModels`).
+    private func pinModel(chatId: String, deviceId: String) {
+        guard let client = app.client else { return }
+        Task { @MainActor in
+            guard let offered = try? await client.listModels(deviceId: deviceId, harness: Heron.harness),
+                  let model = Heron.pick(from: offered.map(\.id)),
+                  var config = client.sessionConfig(chatId: chatId),
+                  config.model != model
+            else { return }
+            config.model = model
+            config.modelOptions = [:]
+            try? client.setSessionConfig(chatId: chatId, config: config)
         }
     }
 

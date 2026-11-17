@@ -66,6 +66,19 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         showOnboardingIfNeeded()
         #if DEBUG
         TerminalProbe.runIfAsked(app: app, router: window.rootViewController as? AppRouter)
+        // `-signin-code <state.code | code>`: sign a simulator in with a code
+        // from Zeron's headless sign-in page (edge /auth/cli/callback), so a
+        // dev loop never needs the web sheet. Debug builds only.
+        if !app.isSignedIn, let i = args.firstIndex(of: "-signin-code"), i + 1 < args.count,
+           let code = args[i + 1].split(separator: ".").last.map(String.init) {
+            Task { @MainActor [app] in
+                do {
+                    try await app.signIn(code: code) { orgs in orgs.first }
+                } catch {
+                    Toast.show("Sign-in code failed: \(error.localizedDescription)", in: window)
+                }
+            }
+        }
         #endif
         if let router = window.rootViewController as? AppRouter, let i = args.firstIndex(of: "-route"), i + 1 < args.count {
             let route = args[i + 1]

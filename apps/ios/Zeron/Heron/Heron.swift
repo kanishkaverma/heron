@@ -19,6 +19,22 @@ enum Heron {
     /// The agent harness. The folder's AGENTS.md and Pi extension make it Heron.
     static let harness = "pi"
 
+    /// The models Heron runs on, best first; the first one the computer
+    /// offers is pinned on the chat. Left to itself the chat inherits
+    /// whatever Pi reports (a bare model id that can resolve to a provider
+    /// whose login has lapsed on that computer).
+    static let preferredModels = [
+        "claude-bridge/claude-opus-5-5",
+        "anthropic/claude-opus-5-5",
+        "claude-bridge/claude-opus-5",
+        "anthropic/claude-opus-5",
+    ]
+
+    /// The model to pin, from what the computer offers (nil: leave it).
+    static func pick(from offered: [String]) -> String? {
+        preferredModels.first { offered.contains($0) }
+    }
+
     // MARK: Remembered choices (this phone)
 
     private static let deviceKey = "heron.deviceId"

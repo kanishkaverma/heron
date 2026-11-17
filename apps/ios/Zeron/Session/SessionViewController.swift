@@ -50,7 +50,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         navigationItem.largeTitleDisplayMode = .never
         // The title and "project @ device" head the ⋯ menu instead of
         // crowding the bar.
-        navigationItem.titleView = UIView()
+        if !Heron.enabled { navigationItem.titleView = UIView() }
         navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: sessionMenu(title: "", subtitle: ""))
         navigationItem.rightBarButtonItem?.accessibilityIdentifier = "session-menu"
         companionsItem = UIBarButtonItem(image: UIImage(systemName: "square.stack.3d.up"), primaryAction: UIAction { [weak self] _ in
@@ -76,9 +76,12 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
                 self.navigationItem.setRightBarButtonItems(items, animated: self.view.window != nil)
             }
         }
-        voiceToken = app.voice.observe(syncVoice)
-        hostsToken = app.observe(syncVoice)
-        syncVoice()
+        // Heron: one chat — no companions, side chats or voice up here.
+        if !Heron.enabled {
+            voiceToken = app.voice.observe(syncVoice)
+            hostsToken = app.observe(syncVoice)
+            syncVoice()
+        }
 
         list.frame = view.bounds
         list.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -98,11 +101,12 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             self.present(nav, animated: true)
         }
         list.onSubagent = { [weak self] doc, title, running in
-            guard let self else { return }
+            // Heron's background work stays in the background.
+            guard let self, !Heron.enabled else { return }
             self.presentCompanion(SubagentViewController(app: self.app, parentId: self.chatId, docId: doc, title: title, running: running))
         }
         list.onOpenChat = { [weak self] id in
-            guard let self, id != self.chatId else { return }
+            guard let self, id != self.chatId, !Heron.enabled else { return }
             // On the phone the sender's chat pushes over this one, so Back
             // returns here; beside the iPad sidebar it takes the detail.
             if self.mainShell != nil, let nav = self.navigationController {
@@ -189,6 +193,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         bottom.alignment = .fill
         bottom.translatesAutoresizingMaskIntoConstraints = false
         strip.onTap = { [weak self] section in self?.showCompanions(section: section) }
+        strip.isHidden = Heron.enabled
         let pillRow = UIStackView(arrangedSubviews: [pill, UIView(), strip])
         pillRow.axis = .horizontal
         pillRow.spacing = 6
@@ -294,6 +299,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     }
 
     private func syncCompanions(animated: Bool = true) {
+        if Heron.enabled { return }
         let agents = app.sessionSubagents(chatId)
         let tabs = app.terminals.tabs(for: chatId)
         // A side chat's own siblings live with its parent.
@@ -805,8 +811,12 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         let old = shown
         shown = c
         if c.title != old.title || c.subtitle != old.subtitle || navigationItem.title == nil {
-            navigationItem.title = c.title
+            navigationItem.title = Heron.enabled ? Heron.chatTitle : c.title
             navigationItem.rightBarButtonItem?.menu = sessionMenu(title: c.title, subtitle: c.subtitle)
+        }
+        if Heron.enabled {
+            let subtitle = heronSubtitle()
+            if navigationItem.subtitle != subtitle { navigationItem.subtitle = subtitle }
         }
         list.uploadProgress = c.uploadProgress
         renderEmptyNotice(c.emptyNotice)
@@ -856,6 +866,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
 
     /// Headed by the session's title over "project @ device".
     private func sessionMenu(title: String, subtitle: String) -> UIMenu {
+        if Heron.enabled { return heronMenu() }
         // The header wraps: title, then where it runs, on its own line (a
         // menu's subtitle isn't drawn in the header).
         let header = subtitle.isEmpty ? title : "\(title)\n\(subtitle)"
@@ -1132,5 +1143,39 @@ enum Drafts {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         all[chatId] = trimmed.isEmpty ? nil : text
         UserDefaults.standard.set(all, forKey: key)
+    }
+}
+
+// MARK: - Heron
+
+extension SessionViewController {
+    /// "on <computer>", or that it's offline (messages wait for it).
+    fileprivate func heronSubtitle() -> String? {
+        guard let row = app.row(chatId) else { return nil }
+        let name = row.deviceName ?? app.deviceName(row.deviceId)
+        return row.deviceOnline ? "on \(name)" : "\(name) is offline"
+    }
+
+    /// Heron's ⋯: which computer it lives on, the transcript, signing out.
+    fileprivate func heronMenu() -> UIMenu {
+        UIMenu(title: "", children: [UIDeferredMenuElement.uncached { [weak self] done in
+            guard let self else { return done([]) }
+            let current = self.app.row(self.chatId)?.deviceId
+            let computers = self.app.hostOptions.map { host in
+                UIAction(title: host.name, subtitle: host.online ? "Online" : "Offline", image: UIImage(systemName: "laptopcomputer"), state: host.id == current ? .on : .off) { [weak self] _ in
+                    self?.heronRoot?.switchComputer(to: host.id)
+                }
+            }
+            done([
+                UIMenu(title: "Computer", image: UIImage(systemName: "laptopcomputer"), children: computers),
+                UIAction(title: "Copy Transcript", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in
+                    guard let self else { return }
+                    UIPasteboard.general.string = self.engine.frame().plainText()
+                },
+                UIAction(title: "Sign Out", image: UIImage(systemName: "rectangle.portrait.and.arrow.right"), attributes: .destructive) { [weak self] _ in
+                    self?.app.signOut()
+                },
+            ])
+        }])
     }
 }

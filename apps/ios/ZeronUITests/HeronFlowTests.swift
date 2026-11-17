@@ -1,0 +1,53 @@
+import XCTest
+
+/// Heron on the Rust core's offline demo workspace: the app opens straight
+/// into one chat (no session list, new-session button, companions or voice),
+/// sends, and the host streams a reply.
+final class HeronFlowTests: XCTestCase {
+    override func setUp() {
+        continueAfterFailure = false
+    }
+
+    private func snapshot(_ app: XCUIApplication, _ name: String) {
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = name
+        shot.lifetime = .keepAlways
+        add(shot)
+    }
+
+    func testOpensStraightIntoTheOneChat() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-demo", "-fast", "-fresh-demo"]
+        app.launch()
+        let input = app.textViews["composer-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 20), "the chat's composer, with no list in front of it")
+        let titled = app.navigationBars["Heron"].exists || app.navigationBars.staticTexts["Heron"].exists
+        XCTAssertTrue(titled, "titled Heron")
+        // Nothing but the chat.
+        XCTAssertFalse(app.buttons["new-session"].exists)
+        XCTAssertFalse(app.buttons["bottom-settings"].exists)
+        XCTAssertFalse(app.buttons["session-companions"].exists)
+        XCTAssertFalse(app.staticTexts["Sessions"].exists)
+        XCTAssertFalse(app.navigationBars.buttons["BackButton"].exists)
+        snapshot(app, "1-heron-chat")
+
+        input.tap()
+        input.typeText("What's on my calendar tomorrow?")
+        snapshot(app, "2-typing")
+        app.buttons["composer-send"].tap()
+        let echo = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'You: What'")).firstMatch
+        XCTAssertTrue(echo.waitForExistence(timeout: 5), "the message is in the chat")
+        let reply = app.staticTexts.matching(identifier: "row-markdown").element(boundBy: 0)
+        XCTAssertTrue(reply.waitForExistence(timeout: 20), "a reply streams in")
+        XCTAssertTrue(app.buttons["Send message"].waitForExistence(timeout: 30), "the turn settles")
+        snapshot(app, "3-reply")
+
+        // The ⋯ menu: the computer, the transcript, signing out; no side chats or terminals.
+        app.buttons["session-menu"].tap()
+        XCTAssertTrue(app.buttons["Copy Transcript"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Sign Out"].exists)
+        XCTAssertFalse(app.buttons["New Side Chat"].exists)
+        XCTAssertFalse(app.buttons["Terminal"].exists)
+        snapshot(app, "4-menu")
+    }
+}

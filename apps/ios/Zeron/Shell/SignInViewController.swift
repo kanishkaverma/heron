@@ -62,7 +62,7 @@ final class SignInViewController: UIViewController {
         wallpaper.frame = view.bounds
         wallpaper.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(wallpaper)
-        let mark = UIImageView(image: CloudUI.zeronMark)
+        let mark = UIImageView(image: Heron.enabled ? UIImage(systemName: "bird.fill") : CloudUI.zeronMark)
         mark.tintColor = Palette.text
         mark.contentMode = .scaleAspectFit
         mark.translatesAutoresizingMaskIntoConstraints = false
@@ -71,18 +71,21 @@ final class SignInViewController: UIViewController {
             mark.heightAnchor.constraint(equalToConstant: 53),
         ])
         let title = UILabel()
-        title.text = "Welcome to Zeron"
+        title.text = Heron.enabled ? "Heron" : "Welcome to Zeron"
         title.font = Fonts.ui(.sansSemibold, 30)
         title.textColor = Palette.text
         title.textAlignment = .center
         title.numberOfLines = 0
         let tagline = UILabel()
-        tagline.text = "Your coding agents, from anywhere."
+        tagline.text = Heron.enabled ? "Your personal assistant, on your own computer." : "Your coding agents, from anywhere."
         tagline.font = Fonts.ui(.sans, 17)
         tagline.textColor = Palette.secondary
         tagline.textAlignment = .center
         tagline.numberOfLines = 0
-        let start = CloudUI.primaryButton("Get started") { [weak self] in self?.getStarted() }
+        let start = CloudUI.primaryButton(Heron.enabled ? "Sign In" : "Get started") { [weak self] in
+            guard let self else { return }
+            if Heron.enabled { self.signIn() } else { self.getStarted() }
+        }
         start.accessibilityIdentifier = "sign-in"
 
         let top = UIStackView(arrangedSubviews: [mark, title, tagline])
@@ -103,6 +106,22 @@ final class SignInViewController: UIViewController {
             start.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -24),
             start.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -16),
         ])
+    }
+
+    private let workos = WorkOSSignIn()
+    private var signingIn = false
+
+    /// Heron: straight to the account sign-in (the same account as Zeron on
+    /// your computer), no setup pages.
+    private func signIn() {
+        guard !signingIn else { return }
+        signingIn = true
+        Task { @MainActor in
+            defer { signingIn = false }
+            if let error = await workos.run(app: app, from: self) {
+                Toast.show(error, in: view.window)
+            }
+        }
     }
 
     private func getStarted() {

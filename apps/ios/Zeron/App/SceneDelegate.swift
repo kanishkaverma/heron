@@ -88,7 +88,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     @MainActor private func showOnboardingIfNeeded(animated: Bool = true) {
         let args = ProcessInfo.processInfo.arguments
         let forced = args.firstIndex(of: "-onboarding")
-        guard app.isSignedIn, forced != nil || OnboardingViewController.shouldShow(for: app) else { return }
+        // Heron signs in and goes straight to its chat: no setup steps.
+        guard !Heron.enabled, app.isSignedIn, forced != nil || OnboardingViewController.shouldShow(for: app) else { return }
         var step = OnboardingViewController.Step.github
         if let i = forced, i + 1 < args.count {
             step = OnboardingViewController.Step(name: args[i + 1]) ?? .github
@@ -155,7 +156,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     /// registration and open a session a notification was tapped for.
     private func shellShown() {
         guard app.isSignedIn else { return }
-        if !app.isDemo { PushNotifications.shared.signedIn() }
+        // Zeron's push service sends to Zeron's own app, not this one.
+        if !app.isDemo, !Heron.enabled { PushNotifications.shared.signedIn() }
         PushNotifications.shared.shellReady()
     }
 
@@ -165,7 +167,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         // is regular in both directions (iPad, an unfolded iPhone Duo) and
         // collapses to the tab shell otherwise, live as the window changes —
         // folding or unfolding carries the open session across.
-        let root: UIViewController = !app.isSignedIn ? SignInViewController(app: app) : SplitRootController(app: app)
+        let root: UIViewController = !app.isSignedIn ? SignInViewController(app: app)
+            : Heron.enabled ? HeronRootController(app: app) : SplitRootController(app: app)
         // Sheets (new session, Settings) belong to the old root: they'd
         // stay on top of the new one.
         if let old = window.rootViewController, old.presentedViewController != nil {

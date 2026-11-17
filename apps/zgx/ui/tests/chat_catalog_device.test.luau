@@ -1,0 +1,197 @@
+-- The model picker lists the agents and models of the device the chat runs
+-- on, as Zeron's does (crates/client `list_harnesses(device)`): the composer
+-- tells the host which device that is as it changes (`store.catalog_on`).
+
+test("a session on another device reads that device's catalog, and back", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	app:command("session_on_box")
+	app:frames(30)
+	expect(app:state("calls")).to_contain("catalog_on:box")
+	-- Once: the same device again asks nothing more.
+	local _, n = string.gsub(app:state("calls"), "catalog_on:box", "")
+	app:command("session_on_box")
+	app:frames(30)
+	local _, again = string.gsub(app:state("calls"), "catalog_on:box", "")
+	expect(again).to_be(n)
+	expect(app:error()).to_be(nil)
+end)
+
+-- The chip's words, as they show (composer_place.test.luau's).
+local function chip_text(app: any, name: string): string
+	local out = {}
+	for line in app:tree(`role:button "{name}"`):gmatch("[^\n]+") do
+		if not line:find(" hidden", 1, true) then
+			local text = line:match('text "([^"]+)"') or line:match('#[%w%-]+ "([^"]+)"')
+			if text then
+				table.insert(out, text)
+			end
+		end
+	end
+	return table.concat(out, " ")
+end
+
+test("a device's catalog is asked for once, whatever catalog shows meanwhile", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	app:command("session_on_box")
+	app:frames(30)
+	local _, n = string.gsub(app:state("calls"), "catalog_on:box", "")
+	expect(n).to_be(1)
+	-- (Another's showing, or this one's changing, asks nothing again: the
+	-- host keeps its look current, and asking each time it shows looped.)
+	app:command("catalog_of_box")
+	app:frames(30)
+	app:command("catalog_grows")
+	app:frames(30)
+	local _, again = string.gsub(app:state("calls"), "catalog_on:box", "")
+	expect(again).to_be(1)
+	expect(app:error()).to_be(nil)
+end)
+
+test("a chat that names no model shows its agent's own, not the last chat's", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	local before = chip_text(app, "Model")
+	app:command("session_names_no_model")
+	app:frames(30)
+	local after = chip_text(app, "Model")
+	expect(after == before).to_be(false)
+	expect(app:has('role:button "Model" >> ~"Choose"')).to_be(false)
+	expect(app:error()).to_be(nil)
+end)
+
+test("a chat that names no model shows its agent's default row, and sends no pick", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	app:command("session_names_no_model")
+	app:frames(30)
+	-- The agent's first model, with its own reasoning, as Zeron's chip has it.
+	local chip = chip_text(app, "Model")
+	expect(chip).to_contain("Opus")
+	expect(chip).to_contain("High")
+	expect(chip).never.to_contain("Sonnet")
+	app:type('role:textbox "Message"', "Go on")
+	app:key("Enter")
+	app:frames(30)
+	expect(app:state("calls")).to_contain("send:s2:Go on")
+	expect(app:state("calls")).never.to_contain("took:s2")
+	expect(app:error()).to_be(nil)
+end)
+
+test("a chat that names no model shows the row its agent marks default, not its first", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	app:command("catalog_marks_fusion_default")
+	app:command("session_names_no_model")
+	app:frames(30)
+	local chip = chip_text(app, "Model")
+	expect(chip).to_contain("Fusion")
+	expect(chip).never.to_contain("Opus")
+	expect(app:error()).to_be(nil)
+end)
+
+test("a new chat's model its device doesn't offer gives way to its agent's marked default", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(960, 760)
+	app:command("go_home")
+	app:frames(30)
+	expect(chip_text(app, "Model")).to_contain("Opus")
+	app:command("catalog_complete_without_opus_marks_fusion")
+	app:frames(30)
+	expect(chip_text(app, "Model")).to_contain("Fusion")
+	expect(app:error()).to_be(nil)
+end)
+
+test("a chat's model its catalog doesn't list is named, not a placeholder", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	app:command("session_model_elsewhere")
+	app:frames(30)
+	expect(chip_text(app, "Model")).to_contain("Kimi K3")
+	expect(app:has('role:button "Model" >> ~"Choose"')).to_be(false)
+	expect(app:error()).to_be(nil)
+end)
+
+test("a new chat's model its device doesn't offer gives way to one it does", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(960, 760)
+	app:command("go_home")
+	app:frames(30)
+	expect(chip_text(app, "Model")).to_contain("Opus")
+	app:command("catalog_complete_without_opus")
+	app:frames(30)
+	expect(chip_text(app, "Model")).to_contain("Sonnet")
+	expect(app:error()).to_be(nil)
+end)
+
+-- The connection, as Zeron's composer says it (composer.rs `link_notice`).
+local LinkNotice = require("../screens/chat/link_notice")
+
+test("the connection notice follows production's cases", function()
+	local function text(link: any): string?
+		local n = LinkNotice.of(link)
+		return if n then n.text else nil
+	end
+	expect(text({})).to_be(nil)
+	expect(text({ host_unreachable = true, host = "omarchy" })).to_be(nil)
+	expect(text({ host_unreachable = true, host = "omarchy", intent = true })).to_be("Can't reach omarchy — messages will send when it's reachable.")
+	expect(text({ connection = "reconnecting" })).to_be("Reconnecting…")
+	expect(text({ connection = "reconnecting", host_unreachable = true, intent = true })).to_be("Reconnecting — messages will send once the connection recovers.")
+	expect(text({ connection = "offline" })).to_be("Offline")
+	expect(text({ connection = "offline", intent = true })).to_be("Offline — messages will send when you're back online.")
+	expect(text({ connection = "unsaved" })).to_be(nil)
+end)
+
+test("the composer says when the connection or the chat's host is gone", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	app:command("connection_reconnecting")
+	app:frames(10)
+	expect(app:has('~"Reconnecting…"')).to_be(true)
+	app:type('role:textbox "Message"', "Ship it")
+	app:frames(10)
+	expect(app:has('~"Reconnecting — messages will send once the connection recovers."')).to_be(true)
+	app:command("connection_back")
+	app:frames(10)
+	expect(app:has('~"Reconnecting"')).to_be(false)
+	-- On the old laptop, which has gone quiet: said only with a draft.
+	app:command("session_on_old")
+	app:frames(10)
+	expect(app:has('~"Can\'t reach Old laptop — messages will send when it\'s reachable."')).to_be(true)
+	expect(app:error()).to_be(nil)
+end)
+
+-- `@` searches the files where the chat runs: its host goes with the search
+-- (the engine forwards it there). Asked of this Mac's engine alone, a chat on
+-- another device is refused ("chat belongs to another device"), and the list
+-- showed "Files 0" (beta.5, a chat on home-laptop).
+test("@ in a session on another device searches that device's files", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(30)
+	app:command("session_on_box")
+	app:frames(30)
+	app:type('role:textbox "Message"', "@chat")
+	app:wait("#never-shown", { timeout_ms = 300 })
+	app:frames(30)
+	expect(app:state("calls")).to_contain("search:s2:chat")
+	expect(app:state("calls")).to_contain("search_on:box")
+	expect(app:state("calls")).never.to_contain("search_on:here")
+	expect(app:error()).to_be(nil)
+end)

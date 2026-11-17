@@ -1,0 +1,1672 @@
+//! Observe only this user's listeners, and attribute each to the Zeron agent
+//! run or terminal that started it (see [`zeron_proto::ORIGIN_ENV`]). HTTP probes
+//! run only after that origin is established and commands performing
+//! authentication have been excluded.
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zeron_proto::ORIGIN_ENV;
+
+#[derive(Debug, Clone)]
+pub struct Listener {
+    pub pid: u32,
+    pub parent: u32,
+    pub cwd: PathBuf,
+    pub args: Vec<String>,
+    pub started_at: u64,
+    pub address: SocketAddr,
+    /// Started, directly or through any ancestor, by a Zeron agent run or
+    /// terminal.
+    pub zeron_owned: bool,
+    /// What started it: the origin marker's value (`chat:…`, `terminal:…`).
+    pub origin: Option<String>,
+    /// The chat that owns [`Self::origin`], once resolved against the chats
+    /// and terminals this device hosts.
+    pub chat_id: Option<String>,
+    /// Part of an agent's sign-in (its process, or an ancestor, carries
+    /// [`SIGN_IN_ENV`]): a browser callback, never probed (Gemini CLI's
+    /// OAuth server ends the sign-in on the first request that isn't the
+    /// callback).
+    pub signing_in: bool,
+}
+
+/// What an engine sets on an agent's sign-in (the file its browser's page
+/// is recorded in): a listener under it is that sign-in's callback.
+pub const SIGN_IN_ENV: &str = "ZERON_LOGIN_URL_FILE";
+
+impl Listener {
+    pub fn belongs_to(&self, root: &Path) -> bool {
+        self.cwd.starts_with(root)
+    }
+
+    /// A login CLI may open an HTTP listener in the project's cwd, but that
+    /// listener is a browser callback, not a development server. Some (such as
+    /// Infisical) abort the login on an unsolicited HEAD, so exclude explicit
+    /// authentication commands before connecting at all. Match whole arguments,
+    /// not paths, URLs or source strings that happen to mention authentication.
+    pub(crate) fn is_authentication_command(&self) -> bool {
+        self.args
+            .iter()
+            .skip(1)
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "login"
+                        | "auth"
+                        | "authenticate"
+                        | "signin"
+                        | "sign-in"
+                        | "sso"
+                        | "oauth"
+                        | "oauth2"
+                )
+            })
+    }
+}
+
+/// Preserve a useful framework label without advertising process arguments,
+/// which may contain credentials. Rank frontends above generic HTTP services.
+pub fn framework(args: &[String]) -> (&'static str, u8) {
+    for (needle, name) in [
+        ("vite", "Vite"),
+        ("next", "Next.js"),
+        ("astro", "Astro"),
+        ("miniflare", "Miniflare"),
+    ] {
+        if args.iter().any(|arg| {
+            let arg = arg.to_lowercase();
+            Path::new(&arg).file_stem().and_then(|s| s.to_str()) == Some(needle)
+                || arg.contains(&format!("/{needle}/"))
+                || arg.starts_with(&format!("{needle}-server"))
+        }) {
+            return (name, if needle == "miniflare" { 80 } else { 100 });
+        }
+    }
+    if args.first().is_some_and(|s| {
+        Path::new(s)
+            .file_name()
+            .is_some_and(|n| n == "node" || n == "bun" || n == "deno")
+    }) {
+        ("Node HTTP server", 50)
+    } else {
+        ("HTTP server", 40)
+    }
+}
+
+/// Port flags are operational settings, never part of a service identity.
+pub fn command_identity(args: &[String]) -> String {
+    let mut skip = false;
+    let python_http = args.iter().any(|arg| arg == "http.server");
+    args.iter()
+        .filter_map(|arg| {
+            if skip {
+                skip = false;
+                return None;
+            }
+            if matches!(arg.as_str(), "--port" | "-p" | "--inspect-port") {
+                skip = true;
+                return None;
+            }
+            if arg.starts_with("--port=")
+                || arg.starts_with("PORT=")
+                || arg.starts_with("--inspect-port=")
+            {
+                return None;
+            }
+            if python_http && arg.parse::<u16>().is_ok() {
+                return None;
+            }
+            Some(arg.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+pub async fn is_http(address: SocketAddr) -> bool {
+    tokio::time::timeout(Duration::from_millis(800), async move {
+        let mut socket = tokio::net::TcpStream::connect(address).await.ok()?;
+        socket
+            .write_all(
+                format!(
+                    "HEAD / HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+                    address.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut prefix = [0; 12];
+        socket.read_exact(&mut prefix).await.ok()?;
+        let version = &prefix[..9];
+        let status = std::str::from_utf8(&prefix[9..])
+            .ok()?
+            .parse::<u16>()
+            .ok()?;
+        ((version == b"HTTP/1.1 " || version == b"HTTP/1.0 ") && (100..600).contains(&status))
+            .then_some(())
+    })
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// One process in the scan: enough to walk ancestry and to key the origin
+/// cache by process identity (a recycled pid is a different process).
+#[derive(Clone, Copy)]
+struct Process {
+    parent: u32,
+    started_at: u64,
+}
+
+/// Each process's origin marker, read once per process lifetime: a process's
+/// environment is fixed when it execs, so neither the verdict nor the cost of
+/// reading it repeats every scan, and a later transient read failure (the
+/// process exiting mid-scan, a busy sysctl) cannot drop a server already
+/// attributed.
+#[derive(Default)]
+pub struct Origins {
+    /// `Some(origin)` when the marker is present, and whether the process
+    /// is an agent's sign-in.
+    markers: HashMap<(u32, u64), (Option<String>, bool)>,
+    /// [`Origins::owned`] reads failed this many times (a process mid-exec,
+    /// a zombie). It gives up after [`UNREADABLE_TRIES`], so such a process
+    /// can't cost a read every scan; [`Origins::resolve`] still retries.
+    unreadable: HashMap<(u32, u64), u8>,
+}
+
+const UNREADABLE_TRIES: u8 = 3;
+
+/// What Zeron started here and still runs: each process whose own origin
+/// marker the scope accepts (an agent, a terminal's shell, anything they
+/// left running), and everything below it. Only these can own a listener
+/// discovery lists, so the socket scan looks at nothing else, and none
+/// alive means there is nothing to scan for.
+#[derive(Default)]
+pub struct Owned {
+    processes: HashMap<u32, Process>,
+    pids: HashSet<u32>,
+}
+
+impl Owned {
+    pub fn is_empty(&self) -> bool {
+        self.pids.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.pids.len()
+    }
+}
+
+impl Origins {
+    /// What started `pid`: its own marker, else the nearest
+    /// ancestor's, so a server whose launcher scrubbed its environment still
+    /// counts while that launcher lives. The walk stops at this engine: an
+    /// engine itself started by an agent (a nested development build) must
+    /// not lend that outer chat to everything it spawns.
+    /// Also whether it, or an ancestor on the way, is an agent's sign-in.
+    fn resolve(
+        &mut self,
+        pid: u32,
+        processes: &HashMap<u32, Process>,
+        read: &mut impl FnMut(u32) -> Option<Vec<u8>>,
+    ) -> (Option<String>, bool) {
+        let engine = std::process::id();
+        let mut pid = pid;
+        let mut signing_in = false;
+        for _ in 0..64 {
+            if pid <= 1 || pid == engine {
+                return (None, signing_in);
+            }
+            let Some(process) = processes.get(&pid) else {
+                return (None, signing_in);
+            };
+            let key = (pid, process.started_at);
+            let (marker, sign_in) = match self.markers.get(&key) {
+                Some(marker) => marker.clone(),
+                None => match read(pid) {
+                    Some(environment) => {
+                        let marker = (origin_marker(&environment), has_variable(&environment, SIGN_IN_ENV));
+                        self.markers.insert(key, marker.clone());
+                        marker
+                    }
+                    // Unreadable now: retried next scan, never cached.
+                    None => (None, false),
+                },
+            };
+            signing_in |= sign_in;
+            if marker.is_some() {
+                return (marker, signing_in);
+            }
+            if process.parent == pid {
+                return (None, signing_in);
+            }
+            pid = process.parent;
+        }
+        (None, signing_in)
+    }
+
+    /// [`Owned`] from a process table: reads the marker of each of this
+    /// user's processes not seen before (once per process lifetime, so a
+    /// scan reads only what started since the last one), keeps those whose
+    /// marker `accept`s, and adds their descendants (a launcher may scrub
+    /// its environment). Stops at this engine, as [`Self::resolve`] does.
+    fn owned(
+        &mut self,
+        processes: HashMap<u32, Process>,
+        mine: &HashSet<u32>,
+        accept: &dyn Fn(&str) -> bool,
+        mut read: impl FnMut(u32) -> Option<Vec<u8>>,
+    ) -> Owned {
+        let engine = std::process::id();
+        let mut roots = HashSet::new();
+        for (&pid, process) in &processes {
+            if pid <= 1 || pid == engine || !mine.contains(&pid) {
+                continue;
+            }
+            let key = (pid, process.started_at);
+            let marker = match self.markers.get(&key) {
+                Some((marker, _)) => marker.clone(),
+                None if self.unreadable.get(&key).is_some_and(|n| *n >= UNREADABLE_TRIES) => continue,
+                None => match read(pid) {
+                    Some(environment) => {
+                        let marker = origin_marker(&environment);
+                        let sign_in = has_variable(&environment, SIGN_IN_ENV);
+                        self.markers.insert(key, (marker.clone(), sign_in));
+                        self.unreadable.remove(&key);
+                        marker
+                    }
+                    None => {
+                        *self.unreadable.entry(key).or_default() += 1;
+                        continue;
+                    }
+                },
+            };
+            if marker.as_deref().is_some_and(accept) {
+                roots.insert(pid);
+            }
+        }
+        let mut pids = HashSet::new();
+        let mut outside = HashSet::new();
+        for &start in processes.keys() {
+            let mut path = Vec::new();
+            let mut pid = start;
+            let owned = loop {
+                if roots.contains(&pid) || pids.contains(&pid) {
+                    break true;
+                }
+                if pid <= 1 || pid == engine || outside.contains(&pid) || path.len() >= 64 {
+                    break false;
+                }
+                let Some(process) = processes.get(&pid) else {
+                    break false;
+                };
+                path.push(pid);
+                if process.parent == pid {
+                    break false;
+                }
+                pid = process.parent;
+            };
+            if owned {
+                pids.extend(path);
+                pids.extend(roots.get(&pid));
+            } else {
+                outside.extend(path);
+            }
+        }
+        let alive: HashSet<_> = processes
+            .iter()
+            .map(|(pid, process)| (*pid, process.started_at))
+            .collect();
+        self.markers.retain(|key, _| alive.contains(key));
+        self.unreadable.retain(|key, _| alive.contains(key));
+        Owned { processes, pids }
+    }
+
+    /// Attribute `listeners`, then forget processes no longer running.
+    fn attribute(
+        &mut self,
+        listeners: &mut [Listener],
+        processes: &HashMap<u32, Process>,
+        mut read: impl FnMut(u32) -> Option<Vec<u8>>,
+    ) {
+        for listener in listeners.iter_mut() {
+            let (origin, signing_in) = self.resolve(listener.pid, processes, &mut read);
+            listener.signing_in = signing_in;
+            listener.zeron_owned = origin.is_some();
+            listener.origin = origin.filter(|origin| !origin.is_empty());
+        }
+        let alive: HashSet<_> = processes
+            .iter()
+            .map(|(pid, process)| (*pid, process.started_at))
+            .collect();
+        self.markers.retain(|key, _| alive.contains(key));
+    }
+}
+
+/// Whether a NUL-separated environment block sets `name`.
+fn has_variable(environment: &[u8], name: &str) -> bool {
+    let prefix = format!("{name}=");
+    environment.split(|b| *b == 0).any(|entry| entry.starts_with(prefix.as_bytes()))
+}
+
+/// The origin marker's value in a NUL-separated environment block.
+fn origin_marker(environment: &[u8]) -> Option<String> {
+    let prefix = format!("{ORIGIN_ENV}=");
+    environment
+        .split(|b| *b == 0)
+        .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+}
+
+/// Process start in ms since the epoch, derived the same way for the scanner
+/// and for [`same_process`] so the two agree exactly.
+#[cfg(target_os = "linux")]
+fn linux_clock() -> (u64, u64) {
+    let boot = std::fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|line| {
+                line.strip_prefix("btime ")
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+        })
+        .unwrap_or(0);
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    (boot, ticks)
+}
+#[cfg(target_os = "linux")]
+fn linux_started_at(stat_fields: &[&str], boot: u64, ticks: u64) -> u64 {
+    boot * 1000
+        + stat_fields
+            .get(19)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1000
+            / ticks
+}
+
+/// Whether `pid` is still the process the scanner observed with `started_at`.
+/// Cheap enough to run per proxied connection; a full [`listeners`] pass
+/// walks every process (and spawns lsof/ps on macOS), which the proxy used
+/// to do for every asset a remote page requested.
+#[cfg(target_os = "linux")]
+pub fn same_process(pid: u32, started_at: u64) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, tail)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let fields: Vec<_> = tail.split_whitespace().collect();
+    let (boot, ticks) = linux_clock();
+    linux_started_at(&fields, boot, ticks) == started_at
+}
+
+/// This user's loopback-reachable TCP listeners, attributed to their origin
+/// chat. `None` when the process table itself could not be read: the caller
+/// keeps what it last saw rather than reading a failed scan as "nothing runs".
+#[cfg(target_os = "linux")]
+pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
+    linux_listeners(origins, None)
+}
+
+/// See the macOS variant.
+#[cfg(target_os = "linux")]
+pub fn owned(origins: &mut Origins, accept: &dyn Fn(&str) -> bool) -> Option<Owned> {
+    use std::{fs, os::unix::fs::MetadataExt};
+    let (boot, ticks) = linux_clock();
+    let uid = unsafe { libc::geteuid() };
+    let mut processes = HashMap::new();
+    let mut mine = HashSet::new();
+    for process in fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let path = process.path();
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            continue;
+        };
+        let Some((_, tail)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let fields: Vec<_> = tail.split_whitespace().collect();
+        let Some(parent) = fields.get(1).and_then(|v| v.parse().ok()) else {
+            continue;
+        };
+        if fs::metadata(&path).is_ok_and(|m| m.uid() == uid) {
+            mine.insert(pid);
+        }
+        processes.insert(pid, Process { parent, started_at: linux_started_at(&fields, boot, ticks) });
+    }
+    Some(origins.owned(processes, &mine, accept, |pid| {
+        fs::read(format!("/proc/{pid}/environ")).ok()
+    }))
+}
+
+/// [`listeners`], looking only at `owned`'s processes.
+#[cfg(target_os = "linux")]
+pub fn owned_listeners(origins: &mut Origins, owned: &Owned) -> Option<Vec<Listener>> {
+    if owned.is_empty() {
+        return Some(Vec::new());
+    }
+    linux_listeners(origins, Some(&owned.pids))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_listeners(origins: &mut Origins, only: Option<&HashSet<u32>>) -> Option<Vec<Listener>> {
+    use std::{fs, os::unix::fs::MetadataExt};
+    let mut sockets = HashMap::new();
+    let mut tables = 0;
+    for (file, ipv6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        if let Ok(text) = fs::read_to_string(file) {
+            tables += 1;
+            for line in text.lines().skip(1) {
+                let parts: Vec<_> = line.split_whitespace().collect();
+                if parts.len() <= 9 || parts[3] != "0A" {
+                    continue;
+                }
+                if let Some(address) = proc_address(parts[1], ipv6) {
+                    sockets.insert(parts[9].to_string(), address);
+                }
+            }
+        }
+    }
+    if tables == 0 {
+        return None;
+    }
+    let (boot, ticks) = linux_clock();
+    let uid = unsafe { libc::geteuid() };
+    let mut result = Vec::new();
+    let mut processes = HashMap::new();
+    for process in fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let path = process.path();
+        if !fs::metadata(&path).is_ok_and(|m| m.uid() == uid) {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            continue;
+        };
+        let Some((_, tail)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let fields: Vec<_> = tail.split_whitespace().collect();
+        let Some(parent) = fields.get(1).and_then(|v| v.parse().ok()) else {
+            continue;
+        };
+        let started_at = linux_started_at(&fields, boot, ticks);
+        processes.insert(pid, Process { parent, started_at });
+        if only.is_some_and(|only| !only.contains(&pid)) {
+            continue;
+        }
+        // Sockets first: most processes listen on nothing, and need neither
+        // their cwd nor their arguments read.
+        let Ok(fds) = fs::read_dir(path.join("fd")) else {
+            continue;
+        };
+        let addresses: Vec<SocketAddr> = fds
+            .flatten()
+            .filter_map(|fd| {
+                let link = fs::read_link(fd.path()).ok()?;
+                let link = link.to_string_lossy();
+                let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
+                sockets.get(inode).copied()
+            })
+            .collect();
+        if addresses.is_empty() {
+            continue;
+        }
+        let Ok(cwd) = fs::read_link(path.join("cwd")) else {
+            continue;
+        };
+        let args = fs::read(path.join("cmdline"))
+            .unwrap_or_default()
+            .split(|b| *b == 0)
+            .filter(|b| !b.is_empty())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<Vec<_>>();
+        for address in addresses {
+            result.push(Listener {
+                pid,
+                parent,
+                cwd: cwd.clone(),
+                args: args.clone(),
+                started_at,
+                address,
+                zeron_owned: false,
+                origin: None,
+                chat_id: None,
+                signing_in: false,
+            });
+        }
+    }
+    origins.attribute(&mut result, &processes, |pid| {
+        fs::read(format!("/proc/{pid}/environ")).ok()
+    });
+    result.sort_by_key(|l| (l.address, l.pid));
+    result.dedup_by_key(|l| (l.address, l.pid));
+    Some(result)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_address(value: &str, ipv6: bool) -> Option<SocketAddr> {
+    let (host, port) = value.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let ip = if ipv6 {
+        if host.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0; 16];
+        for (i, chunk) in host.as_bytes().chunks_exact(8).enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(
+                &u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16)
+                    .ok()?
+                    .to_le_bytes(),
+            );
+        }
+        IpAddr::V6(Ipv6Addr::from(bytes))
+    } else {
+        IpAddr::V4(Ipv4Addr::from(
+            u32::from_str_radix(host, 16).ok()?.to_le_bytes(),
+        ))
+    };
+    if !ip.is_loopback() && !ip.is_unspecified() {
+        return None;
+    }
+    Some(SocketAddr::new(
+        if ip.is_unspecified() {
+            if ipv6 {
+                Ipv6Addr::LOCALHOST.into()
+            } else {
+                Ipv4Addr::LOCALHOST.into()
+            }
+        } else {
+            ip
+        },
+        port,
+    ))
+}
+
+/// `ps lstart=` tokens ("Thu Sep 11 16:14:42 2026") to ms since the epoch.
+#[cfg(target_os = "macos")]
+fn parse_lstart(parts: &[&str]) -> u64 {
+    use chrono::TimeZone;
+    chrono::NaiveDateTime::parse_from_str(&parts.join(" "), "%a %b %e %T %Y")
+        .ok()
+        .and_then(|d| chrono::Local.from_local_datetime(&d).earliest())
+        .map(|d| d.timestamp_millis().max(0) as u64)
+        .unwrap_or(0)
+}
+
+/// See the Linux variant. Its start time asked of the kernel, as the scan
+/// reads it (whole seconds, as `ps lstart` gave them): no process started.
+#[cfg(target_os = "macos")]
+pub fn same_process(pid: u32, started_at: u64) -> bool {
+    libproc::started_at(pid).is_some_and(|at| at == started_at)
+}
+
+/// See the Linux variant. Read from the kernel (libproc and `sysctl`), as
+/// lsof and ps read it, without starting either: the scan runs every 2 s
+/// while a chat here has a folder, and two lsof passes and a `ps -ax` each
+/// time kept the Mac busy for nothing. Should the kernel's socket record
+/// ever change shape, that scan is lsof's again.
+#[cfg(target_os = "macos")]
+pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
+    let Some(sockets) = libproc::listening_sockets(None) else {
+        tracing::debug!("preview scan: libproc sockets unreadable; asking lsof");
+        return lsof_listeners(origins);
+    };
+    if sockets.is_empty() {
+        return Some(Vec::new());
+    }
+    let processes = libproc::process_table()?;
+    Some(macos_listeners(origins, sockets, &processes))
+}
+
+/// The processes Zeron started here and still runs ([`Owned`]): one
+/// process-table read, plus the environment of each process new since the
+/// last call. `accept` says which origin markers count (the chats and
+/// terminals this device hosts).
+#[cfg(target_os = "macos")]
+pub fn owned(origins: &mut Origins, accept: &dyn Fn(&str) -> bool) -> Option<Owned> {
+    let processes = libproc::process_table()?;
+    let mine: HashSet<u32> = libproc::pids(unsafe { libc::geteuid() }).into_iter().collect();
+    Some(origins.owned(processes, &mine, accept, environment))
+}
+
+/// [`listeners`], looking only at `owned`'s processes: their sockets are
+/// the only ones discovery could list.
+#[cfg(target_os = "macos")]
+pub fn owned_listeners(origins: &mut Origins, owned: &Owned) -> Option<Vec<Listener>> {
+    if owned.is_empty() {
+        return Some(Vec::new());
+    }
+    let Some(sockets) = libproc::listening_sockets(Some(&owned.pids)) else {
+        tracing::debug!("preview scan: libproc sockets unreadable; asking lsof");
+        let mut all = lsof_listeners(origins)?;
+        all.retain(|listener| owned.pids.contains(&listener.pid));
+        return Some(all);
+    };
+    Some(macos_listeners(origins, sockets, &owned.processes))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_listeners(
+    origins: &mut Origins,
+    sockets: Vec<(u32, Option<IpAddr>, u16)>,
+    processes: &HashMap<u32, Process>,
+) -> Vec<Listener> {
+    let mut result = Vec::new();
+    for (pid, ip, port) in sockets {
+        let addresses = match ip {
+            // Any address (lsof's `*:port`): reachable on both loopbacks.
+            None => vec![
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+            ],
+            Some(ip) if ip.is_loopback() => vec![SocketAddr::new(ip, port)],
+            Some(_) => continue,
+        };
+        let Some(process) = processes.get(&pid) else {
+            continue;
+        };
+        let Some(cwd) = libproc::cwd(pid).and_then(|cwd| std::fs::canonicalize(cwd).ok()) else {
+            continue;
+        };
+        let Some(args) = libproc::arguments(pid) else {
+            continue;
+        };
+        for address in addresses {
+            result.push(Listener {
+                pid,
+                parent: process.parent,
+                cwd: cwd.clone(),
+                args: args.clone(),
+                started_at: process.started_at,
+                address,
+                zeron_owned: false,
+                origin: None,
+                chat_id: None,
+                signing_in: false,
+            });
+        }
+    }
+    origins.attribute(&mut result, processes, environment);
+    result.sort_by_key(|l| (l.address, l.pid));
+    result.dedup_by_key(|l| (l.address, l.pid));
+    result
+}
+
+/// `program`'s stdout, or `None` when it could not run or outlived
+/// `timeout` (lsof can block on an unresponsive network mount; a stuck scan
+/// would otherwise freeze discovery for good). The exit status is not
+/// checked: lsof exits 1 when it simply found nothing.
+#[cfg(target_os = "macos")]
+fn command_output(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+    use std::{io::Read, process::Stdio};
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout.read_to_end(&mut output);
+        output
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    reader.join().ok()
+}
+
+/// `pid`'s environment as a NUL-separated block, read the way `ps -E` does
+/// (`KERN_PROCARGS2`: argc, the exec path, padding, argv, then envp). Only
+/// this user's processes are readable, which is all discovery looks at.
+#[cfg(target_os = "macos")]
+fn environment(pid: u32) -> Option<Vec<u8>> {
+    procargs(pid).and_then(|buffer| procargs_environment(&buffer))
+}
+
+/// `pid`'s `KERN_PROCARGS2` buffer.
+#[cfg(target_os = "macos")]
+fn procargs(pid: u32) -> Option<Vec<u8>> {
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&mut argmax as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || argmax <= 0
+    {
+        return None;
+    }
+    let mut buffer = vec![0u8; argmax as usize];
+    let mut size = buffer.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    buffer.truncate(size);
+    Some(buffer)
+}
+
+/// The argv section of a `KERN_PROCARGS2` buffer, as `ps -o command=`
+/// showed it and the scan split it: joined by spaces, split on whitespace.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn procargs_arguments(buffer: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let rest = buffer.get(4..)?;
+    let rest = &rest[rest.iter().position(|b| *b == 0)?..];
+    let rest = &rest[rest.iter().position(|b| *b != 0).unwrap_or(rest.len())..];
+    let argv: Vec<_> = rest
+        .split(|b| *b == 0)
+        .take(argc.max(0) as usize)
+        .map(String::from_utf8_lossy)
+        .collect();
+    Some(argv.join(" ").split_whitespace().map(str::to_owned).collect())
+}
+
+/// The envp section of a `KERN_PROCARGS2` buffer.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn procargs_environment(buffer: &[u8]) -> Option<Vec<u8>> {
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let rest = buffer.get(4..)?;
+    // The exec path, then the NUL padding after it.
+    let rest = &rest[rest.iter().position(|b| *b == 0)?..];
+    let rest = &rest[rest.iter().position(|b| *b != 0).unwrap_or(rest.len())..];
+    let mut entries = rest.split(|b| *b == 0);
+    for _ in 0..argc.max(0) {
+        entries.next()?;
+    }
+    let mut environment = Vec::new();
+    for entry in entries.take_while(|entry| !entry.is_empty()) {
+        environment.extend_from_slice(entry);
+        environment.push(0);
+    }
+    Some(environment)
+}
+
+/// The scan as lsof and ps give it: what [`listeners`] falls back to.
+#[cfg(target_os = "macos")]
+fn lsof_listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let fields = |arguments: &[&str]| -> Option<Vec<(u32, String)>> {
+        let output = command_output("/usr/sbin/lsof", arguments, TIMEOUT)?;
+        let mut pid = 0;
+        let mut values = Vec::new();
+        for field in output.split(|b| *b == 0) {
+            let field = String::from_utf8_lossy(field);
+            let field = field.trim_start_matches('\n');
+            if let Some(value) = field.strip_prefix('p') {
+                pid = value.parse().unwrap_or(0);
+            }
+            if let Some(value) = field.strip_prefix('n') {
+                values.push((pid, value.to_owned()));
+            }
+        }
+        Some(values)
+    };
+    let sockets = fields(&["-nP", "-a", "-u", &uid, "-iTCP", "-sTCP:LISTEN", "-F0pn"])?;
+    if sockets.is_empty() {
+        return Some(Vec::new());
+    }
+    let cwds: HashMap<_, _> = fields(&["-nP", "-a", "-u", &uid, "-d", "cwd", "-F0pn"])?
+        .into_iter()
+        .collect();
+    let mut processes = HashMap::new();
+    let mut commands = HashMap::new();
+    let table = command_output("/bin/ps", &["-axo", "pid=,ppid=,lstart=,command="], TIMEOUT)?;
+    for line in String::from_utf8_lossy(&table).lines() {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        if parts.len() < 8 {
+            continue;
+        }
+        let (Ok(pid), Ok(parent)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) else {
+            continue;
+        };
+        let started_at = parse_lstart(&parts[2..7]);
+        processes.insert(pid, Process { parent, started_at });
+        commands.insert(
+            pid,
+            parts[7..].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+    }
+    let mut result = Vec::new();
+    for (pid, socket) in sockets {
+        let Some(cwd) = cwds.get(&pid).and_then(|s| std::fs::canonicalize(s).ok()) else {
+            continue;
+        };
+        let (Some(process), Some(args)) = (processes.get(&pid), commands.get(&pid)) else {
+            continue;
+        };
+        let addresses = if let Some(port) = socket
+            .strip_prefix("*:")
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            vec![
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
+            ]
+        } else {
+            socket
+                .parse::<SocketAddr>()
+                .ok()
+                .filter(|a| a.ip().is_loopback())
+                .into_iter()
+                .collect()
+        };
+        for address in addresses {
+            result.push(Listener {
+                pid,
+                parent: process.parent,
+                cwd: cwd.clone(),
+                args: args.clone(),
+                started_at: process.started_at,
+                address,
+                zeron_owned: false,
+                origin: None,
+                chat_id: None,
+                signing_in: false,
+            });
+        }
+    }
+    origins.attribute(&mut result, &processes, environment);
+    result.sort_by_key(|l| (l.address, l.pid));
+    result.dedup_by_key(|l| (l.address, l.pid));
+    Some(result)
+}
+
+/// What lsof and ps read, asked of the kernel directly.
+#[cfg(target_os = "macos")]
+mod libproc {
+    use super::Process;
+    use std::{
+        collections::HashMap,
+        ffi::c_int,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        os::unix::ffi::OsStrExt,
+        path::PathBuf,
+    };
+
+    // `struct socket_fdinfo` (sys/proc_info.h), which libc doesn't carry:
+    // its size, and where the fields read here sit in it.
+    const PROC_PIDFDSOCKETINFO: c_int = 3;
+    const SOCKET_FDINFO_SIZE: usize = 792;
+    const SOI_FAMILY: usize = 184;
+    const SOI_KIND: usize = 256;
+    const INSI_LPORT: usize = 268;
+    const INSI_LADDR: usize = 312;
+    const INSI_LADDR_V4: usize = INSI_LADDR + 12;
+    const TCPSI_STATE: usize = 344;
+    const SOCKINFO_TCP: i32 = 2;
+    const TSI_S_LISTEN: i32 = 1;
+    const PROC_UID_ONLY: u32 = 4;
+
+    // `struct kinfo_proc` (sys/sysctl.h), likewise.
+    const KINFO_PROC_SIZE: usize = 648;
+    const P_STARTTIME_SEC: usize = 0;
+    const P_PID: usize = 40;
+    const E_PPID: usize = 560;
+
+    fn i32_at(bytes: &[u8], at: usize) -> i32 {
+        i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// This user's TCP listening sockets: (pid, address, port), the address
+    /// `None` for any (lsof's `*`). `None` when the kernel's socket record
+    /// isn't the size known here: its fields can't be trusted.
+    /// `only`: look at just these processes.
+    pub fn listening_sockets(
+        only: Option<&std::collections::HashSet<u32>>,
+    ) -> Option<Vec<(u32, Option<IpAddr>, u16)>> {
+        let uid = unsafe { libc::geteuid() };
+        let mut sockets = Vec::new();
+        let pids: Vec<u32> = match only {
+            Some(only) => only.iter().copied().collect(),
+            None => pids(uid),
+        };
+        for pid in pids {
+            for fd in socket_fds(pid) {
+                let mut record = [0u64; SOCKET_FDINFO_SIZE / 8];
+                let read = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid as c_int,
+                        fd,
+                        PROC_PIDFDSOCKETINFO,
+                        record.as_mut_ptr().cast(),
+                        SOCKET_FDINFO_SIZE as c_int,
+                    )
+                };
+                if read <= 0 {
+                    // Closed since it was listed, or (ENOMEM) a record
+                    // larger than this one.
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+                        return None;
+                    }
+                    continue;
+                }
+                if read as usize != SOCKET_FDINFO_SIZE {
+                    return None;
+                }
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(record.as_ptr().cast(), SOCKET_FDINFO_SIZE) };
+                if let Some((ip, port)) = tcp_listener(bytes) {
+                    sockets.push((pid, ip, port));
+                }
+            }
+        }
+        Some(sockets)
+    }
+
+    /// A `socket_fdinfo` record's address and port, when it's a listening
+    /// TCP socket.
+    fn tcp_listener(record: &[u8]) -> Option<(Option<IpAddr>, u16)> {
+        if i32_at(record, SOI_KIND) != SOCKINFO_TCP || i32_at(record, TCPSI_STATE) != TSI_S_LISTEN {
+            return None;
+        }
+        // (In network order, in the int's first two bytes.)
+        let port = u16::from_be_bytes([record[INSI_LPORT], record[INSI_LPORT + 1]]);
+        let ip: IpAddr = match i32_at(record, SOI_FAMILY) {
+            libc::AF_INET => {
+                let v4: [u8; 4] = record[INSI_LADDR_V4..INSI_LADDR_V4 + 4].try_into().ok()?;
+                Ipv4Addr::from(v4).into()
+            }
+            libc::AF_INET6 => {
+                let v6: [u8; 16] = record[INSI_LADDR..INSI_LADDR + 16].try_into().ok()?;
+                Ipv6Addr::from(v6).into()
+            }
+            _ => return None,
+        };
+        Some(((!ip.is_unspecified()).then_some(ip), port))
+    }
+
+    /// This user's processes.
+    pub fn pids(uid: libc::uid_t) -> Vec<u32> {
+        let needed = unsafe { libc::proc_listpids(PROC_UID_ONLY, uid, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return Vec::new();
+        }
+        // (Room for a few started meanwhile.)
+        let mut pids = vec![0 as c_int; needed as usize / 4 + 64];
+        let read = unsafe {
+            libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), (pids.len() * 4) as c_int)
+        };
+        pids.truncate(read.max(0) as usize / 4);
+        pids.into_iter().filter(|pid| *pid > 0).map(|pid| pid as u32).collect()
+    }
+
+    /// `pid`'s open sockets, by descriptor.
+    fn socket_fds(pid: u32) -> Vec<c_int> {
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        let needed =
+            unsafe { libc::proc_pidinfo(pid as c_int, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return Vec::new();
+        }
+        let mut fds = vec![libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }; needed as usize / entry + 16];
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as c_int,
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                (fds.len() * entry) as c_int,
+            )
+        };
+        fds.truncate(read.max(0) as usize / entry);
+        fds.into_iter()
+            .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
+            .map(|fd| fd.proc_fd)
+            .collect()
+    }
+
+    /// Every process's parent and start (ms since the epoch, whole seconds,
+    /// as `ps lstart` gave it), in one `sysctl` as ps reads it. `None` when
+    /// it can't be read.
+    pub fn process_table() -> Option<HashMap<u32, Process>> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+        for _ in 0..3 {
+            let mut size = 0;
+            if unsafe {
+                libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
+            } != 0
+            {
+                return None;
+            }
+            size += size / 8 + KINFO_PROC_SIZE * 16;
+            let mut buffer = vec![0u64; size / 8 + 1];
+            let mut size = buffer.len() * 8;
+            if unsafe {
+                libc::sysctl(mib.as_mut_ptr(), 3, buffer.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0)
+            } != 0
+            {
+                // (More processes than room: asked again.)
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+                    continue;
+                }
+                return None;
+            }
+            if !size.is_multiple_of(KINFO_PROC_SIZE) {
+                return None;
+            }
+            let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), size) };
+            let mut table = HashMap::new();
+            for record in bytes.as_chunks::<KINFO_PROC_SIZE>().0 {
+                let seconds = i64::from_ne_bytes(record[P_STARTTIME_SEC..P_STARTTIME_SEC + 8].try_into().ok()?);
+                let pid = i32_at(record, P_PID);
+                let parent = i32_at(record, E_PPID);
+                if pid < 0 {
+                    continue;
+                }
+                table.insert(
+                    pid as u32,
+                    Process {
+                        parent: parent.max(0) as u32,
+                        started_at: (seconds.max(0) as u64) * 1000,
+                    },
+                );
+            }
+            return Some(table);
+        }
+        None
+    }
+
+    /// When `pid` started, as [`process_table`] reads it.
+    pub fn started_at(pid: u32) -> Option<u64> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
+        let read = unsafe {
+            libc::proc_pidinfo(pid as c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+        };
+        (read == size).then_some(info.pbi_start_tvsec * 1000)
+    }
+
+    /// `pid`'s working directory.
+    pub fn cwd(pid: u32) -> Option<PathBuf> {
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as c_int;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as c_int,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+                size,
+            )
+        };
+        if read != size {
+            return None;
+        }
+        let path: &[u8] = unsafe {
+            std::slice::from_raw_parts(info.pvi_cdir.vip_path.as_ptr().cast(), std::mem::size_of_val(&info.pvi_cdir.vip_path))
+        };
+        let path = &path[..path.iter().position(|b| *b == 0)?];
+        (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+    }
+
+    /// `pid`'s command line, as the scan split ps's.
+    pub fn arguments(pid: u32) -> Option<Vec<String>> {
+        super::procargs(pid).and_then(|buffer| super::procargs_arguments(&buffer))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn listeners(_origins: &mut Origins) -> Option<Vec<Listener>> {
+    Some(Vec::new())
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn owned(_origins: &mut Origins, _accept: &dyn Fn(&str) -> bool) -> Option<Owned> {
+    Some(Owned::default())
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn owned_listeners(_origins: &mut Origins, _owned: &Owned) -> Option<Vec<Listener>> {
+    Some(Vec::new())
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn same_process(_pid: u32, _started_at: u64) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn authentication_commands_are_not_preview_candidates() {
+        let listener = |args: &[&str]| Listener {
+            pid: 1,
+            parent: 0,
+            cwd: "/project".into(),
+            args: args.iter().map(|arg| (*arg).into()).collect(),
+            started_at: 1,
+            address: "127.0.0.1:3000".parse().unwrap(),
+            zeron_owned: true,
+            origin: Some("chat:chat".into()),
+            chat_id: Some("chat".into()),
+            signing_in: false,
+        };
+        for args in [
+            vec!["/usr/bin/infisical", "login"],
+            vec![
+                "infisical",
+                "--silent",
+                "login",
+                "--domain",
+                "https://app.infisical.com",
+            ],
+            vec!["gh", "auth", "login"],
+            vec!["aws", "sso", "login"],
+            vec!["gcloud", "auth", "application-default", "login"],
+            vec!["codex", "login"],
+            vec!["node", "/tools/firebase.js", "login"],
+            vec!["cli", "authenticate"],
+            vec!["cli", "signin"],
+            vec!["cli", "sign-in"],
+            vec!["cli", "oauth"],
+            vec!["cli", "oauth2"],
+        ] {
+            assert!(listener(&args).is_authentication_command(), "{args:?}");
+        }
+        for args in [
+            vec![],
+            vec!["node", "/project/auth/server.js"],
+            vec!["node", "/project/login.js"],
+            vec!["node", "/project/node_modules/vite/bin/vite.js"],
+            vec!["next", "dev"],
+            vec!["python3", "-m", "http.server", "3000"],
+            vec!["python3", "-c", "import auth; auth.serve()"],
+            vec!["server", "--auth", "--login-url=https://example.com/login"],
+            vec!["infisical", "run", "--", "node", "server.js", "login"],
+        ] {
+            assert!(!listener(&args).is_authentication_command(), "{args:?}");
+        }
+    }
+    fn listener_of(pid: u32) -> Listener {
+        Listener {
+            pid,
+            parent: 0,
+            cwd: "/project".into(),
+            args: Vec::new(),
+            started_at: 0,
+            address: "127.0.0.1:3000".parse().unwrap(),
+            zeron_owned: false,
+            origin: None,
+            chat_id: None,
+            signing_in: false,
+        }
+    }
+    fn environment(entries: &[&str]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|e| [e.as_bytes(), b"\0"])
+            .flatten()
+            .copied()
+            .collect()
+    }
+    #[test]
+    fn origin_is_the_nearest_marked_process_and_never_the_engine() {
+        let engine = std::process::id();
+        // shell (agent's chat) → env-scrubbed server; an unrelated server;
+        // and a server whose ancestry reaches this engine before any marker.
+        let processes: HashMap<u32, Process> = [
+            (
+                100,
+                Process {
+                    parent: engine,
+                    started_at: 1,
+                },
+            ),
+            (
+                101,
+                Process {
+                    parent: 100,
+                    started_at: 2,
+                },
+            ),
+            (
+                102,
+                Process {
+                    parent: 101,
+                    started_at: 3,
+                },
+            ),
+            (
+                200,
+                Process {
+                    parent: 1,
+                    started_at: 4,
+                },
+            ),
+            (
+                300,
+                Process {
+                    parent: engine,
+                    started_at: 5,
+                },
+            ),
+        ]
+        .into();
+        let reads = std::cell::RefCell::new(Vec::new());
+        let mut read = |pid: u32| {
+            reads.borrow_mut().push(pid);
+            Some(match pid {
+                100 => environment(&["PATH=/bin", "ZERON_ORIGIN=chat:a"]),
+                101 => environment(&["PATH=/bin", "ZERON_ORIGIN=terminal:b"]),
+                _ => environment(&["PATH=/bin"]),
+            })
+        };
+        let mut origins = Origins::default();
+        let mut listeners = vec![listener_of(102), listener_of(200), listener_of(300)];
+        origins.attribute(&mut listeners, &processes, &mut read);
+        assert!(listeners[0].zeron_owned);
+        assert_eq!(listeners[0].origin.as_deref(), Some("terminal:b"));
+        assert!(!listeners[1].zeron_owned);
+        assert!(!listeners[2].zeron_owned);
+        assert!(
+            !reads.borrow().contains(&engine),
+            "the engine's own environment is never consulted"
+        );
+        // A process's verdict is read once for its lifetime.
+        let first = reads.borrow().len();
+        origins.attribute(&mut listeners, &processes, &mut read);
+        assert_eq!(reads.borrow().len(), first);
+        assert_eq!(listeners[0].origin.as_deref(), Some("terminal:b"));
+        // A recycled pid is a different process: read afresh.
+        let mut recycled = processes.clone();
+        recycled.insert(
+            102,
+            Process {
+                parent: 1,
+                started_at: 9,
+            },
+        );
+        let mut listeners = vec![listener_of(102)];
+        origins.attribute(&mut listeners, &recycled, &mut read);
+        assert!(!listeners[0].zeron_owned);
+    }
+    #[test]
+    fn an_agents_sign_in_is_never_probed() {
+        // A chat's engine (zeron-owned, chat:a) runs an agent's sign-in
+        // (the marker on it); the agent's callback server is its child.
+        let processes: HashMap<u32, Process> = [
+            (100, Process { parent: 1, started_at: 1 }),
+            (101, Process { parent: 100, started_at: 2 }),
+            (102, Process { parent: 101, started_at: 3 }),
+            (103, Process { parent: 100, started_at: 4 }),
+        ]
+        .into();
+        let read = |pid: u32| {
+            Some(match pid {
+                100 => environment(&["ZERON_ORIGIN=chat:a"]),
+                101 => environment(&["ZERON_LOGIN_URL_FILE=/tmp/x/browser-url"]),
+                _ => environment(&["PATH=/bin"]),
+            })
+        };
+        let mut origins = Origins::default();
+        let mut listeners = vec![listener_of(102), listener_of(103)];
+        origins.attribute(&mut listeners, &processes, read);
+        assert!(listeners[0].zeron_owned && listeners[0].signing_in, "the sign-in's callback");
+        assert!(listeners[1].zeron_owned && !listeners[1].signing_in, "a dev server beside it");
+        assert!(has_variable(&environment(&["A=1", "ZERON_LOGIN_URL_FILE="]), SIGN_IN_ENV));
+        assert!(!has_variable(&environment(&["XZERON_LOGIN_URL_FILE=1"]), SIGN_IN_ENV));
+    }
+    #[test]
+    fn an_unreadable_environment_is_retried_not_remembered() {
+        let processes: HashMap<u32, Process> = [(
+            100,
+            Process {
+                parent: 1,
+                started_at: 1,
+            },
+        )]
+        .into();
+        let mut origins = Origins::default();
+        let mut listeners = vec![listener_of(100)];
+        origins.attribute(&mut listeners, &processes, |_| None);
+        assert!(!listeners[0].zeron_owned);
+        origins.attribute(&mut listeners, &processes, |_| {
+            Some(environment(&["ZERON_ORIGIN=chat:c"]))
+        });
+        assert_eq!(listeners[0].origin.as_deref(), Some("chat:c"));
+    }
+    /// Owned = processes whose own marker is in scope, plus everything
+    /// below them; never the engine or what it starts unmarked; each
+    /// process's environment read once, an unreadable one a few times.
+    #[test]
+    fn owned_processes_are_the_marked_trees_in_scope() {
+        let engine = std::process::id();
+        let p = |parent, started_at| Process { parent, started_at };
+        // 100: an agent (chat:a) → 101 a shell → 102 a scrubbed server.
+        // 110: a server an agent of chat:a left running, adopted by launchd.
+        // 200: another engine's chat (chat:z, not hosted here) → 201.
+        // 300: the user's own server; 400: started by this engine, unmarked.
+        // 500: unreadable.
+        let processes: HashMap<u32, Process> = [
+            (100, p(engine, 1)),
+            (101, p(100, 2)),
+            (102, p(101, 3)),
+            (110, p(1, 4)),
+            (200, p(1, 5)),
+            (201, p(200, 6)),
+            (300, p(1, 7)),
+            (400, p(engine, 8)),
+            (500, p(1, 9)),
+        ]
+        .into();
+        let mine: HashSet<u32> = processes.keys().copied().collect();
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |pid: u32| {
+            reads.borrow_mut().push(pid);
+            match pid {
+                100 | 110 => Some(environment(&["ZERON_ORIGIN=chat:a"])),
+                200 => Some(environment(&["ZERON_ORIGIN=chat:z"])),
+                500 => None,
+                _ => Some(environment(&["PATH=/bin"])),
+            }
+        };
+        let accept = |origin: &str| origin == "chat:a";
+        let mut origins = Origins::default();
+        let owned = origins.owned(processes.clone(), &mine, &accept, read);
+        let mut pids: Vec<_> = owned.pids.iter().copied().collect();
+        pids.sort();
+        assert_eq!(pids, [100, 101, 102, 110]);
+        assert!(!reads.borrow().contains(&engine));
+        // The next sweep reads nothing new: every verdict is kept for the
+        // process's lifetime, and an unreadable one is retried, not forever.
+        for _ in 0..UNREADABLE_TRIES + 2 {
+            reads.borrow_mut().clear();
+            let again = origins.owned(processes.clone(), &mine, &accept, read);
+            assert_eq!(again.len(), 4);
+            assert!(reads.borrow().iter().all(|pid| *pid == 500), "{:?}", reads.borrow());
+        }
+        reads.borrow_mut().clear();
+        origins.owned(processes.clone(), &mine, &accept, read);
+        assert!(reads.borrow().is_empty(), "gave up on the unreadable process");
+        // With the agent and its leftovers gone, nothing is owned: the scan
+        // has nothing to look for.
+        let rest: HashMap<u32, Process> = processes
+            .into_iter()
+            .filter(|(pid, _)| ![100, 101, 102, 110].contains(pid))
+            .collect();
+        assert!(origins.owned(rest, &mine, &accept, read).is_empty());
+        // Other users' processes are never read.
+        reads.borrow_mut().clear();
+        let theirs: HashMap<u32, Process> = [(700, p(1, 10))].into();
+        assert!(origins.owned(theirs, &HashSet::new(), &accept, read).is_empty());
+        assert!(reads.borrow().is_empty());
+    }
+    #[test]
+    fn origin_marker_matches_the_whole_name() {
+        assert_eq!(
+            origin_marker(&environment(&["XZERON_ORIGIN=no", "ZERON_ORIGIN=yes"])),
+            Some("yes".into())
+        );
+        assert_eq!(origin_marker(&environment(&["ZERON_ORIGIN_X=no"])), None);
+        assert_eq!(
+            origin_marker(&environment(&["ZERON_ORIGIN="])),
+            Some(String::new())
+        );
+    }
+    #[test]
+    fn procargs_environment_skips_the_exec_path_and_arguments() {
+        let mut buffer = 2i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(
+            b"/usr/bin/node\0\0\0\0node\0ZERON_ORIGIN=argv\0A=1\0ZERON_ORIGIN=env\0\0junk",
+        );
+        let environment = procargs_environment(&buffer).unwrap();
+        assert_eq!(origin_marker(&environment), Some("env".into()));
+        assert!(procargs_environment(&[1, 0]).is_none());
+    }
+    #[test]
+    fn service_identity_ignores_port_configuration() {
+        let args = |port: &str| vec!["node".into(), "api.js".into(), "--port".into(), port.into()];
+        assert_eq!(
+            command_identity(&args("3000")),
+            command_identity(&args("3001"))
+        );
+        assert_ne!(
+            command_identity(&args("3000")),
+            command_identity(&["node".into(), "docs.js".into()])
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_only_loopback_reachable_listeners() {
+        assert_eq!(
+            proc_address("0100007F:1435", false).unwrap(),
+            "127.0.0.1:5173".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            proc_address("00000000000000000000000001000000:1435", true).unwrap(),
+            "[::1]:5173".parse::<SocketAddr>().unwrap()
+        );
+        assert!(proc_address("0101A8C0:1435", false).is_none());
+        assert!(proc_address("malformed:00", true).is_none());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_process_matches_the_scanner_start_time() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _guard = Kill(child);
+        // `listeners()` only reports sockets; derive the scanner's start time
+        // through the same platform path it uses.
+        #[cfg(target_os = "linux")]
+        let started_at = {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let (_, tail) = stat.rsplit_once(") ").unwrap();
+            let fields: Vec<_> = tail.split_whitespace().collect();
+            let (boot, ticks) = linux_clock();
+            linux_started_at(&fields, boot, ticks)
+        };
+        #[cfg(target_os = "macos")]
+        let started_at = {
+            let output = std::process::Command::new("/bin/ps")
+                .args(["-axo", "pid=,ppid=,lstart=,command="])
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                .find(|parts| parts.first().and_then(|p| p.parse::<u32>().ok()) == Some(pid))
+                .map(|parts| parse_lstart(&parts[2..7]))
+                .unwrap()
+        };
+        assert!(started_at > 0);
+        assert!(same_process(pid, started_at));
+        assert!(!same_process(pid, started_at + 1000));
+        assert!(!same_process(pid, 0));
+        drop(_guard);
+        assert!(
+            !same_process(pid, started_at),
+            "a reaped pid no longer matches"
+        );
+    }
+    #[test]
+    fn procargs_arguments_read_argv_as_ps_split_it() {
+        let mut buffer = 3i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(b"/usr/bin/node\0\0\0node\0my server.js\0--port=3000\0A=1\0\0");
+        assert_eq!(
+            procargs_arguments(&buffer).unwrap(),
+            ["node", "my", "server.js", "--port=3000"]
+        );
+        assert!(procargs_arguments(&[1, 0]).is_none());
+    }
+    /// The kernel's answer is lsof's: this process's listener, by port.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn libproc_finds_the_listeners_lsof_finds() {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let any = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let pid = std::process::id();
+        let mut ours: Vec<String> = libproc::listening_sockets(None)
+            .expect("socket records readable")
+            .into_iter()
+            .filter(|(p, _, _)| *p == pid)
+            .map(|(_, ip, port)| match ip {
+                None => format!("*:{port}"),
+                Some(IpAddr::V6(ip)) => format!("[{ip}]:{port}"),
+                Some(ip) => format!("{ip}:{port}"),
+            })
+            .collect();
+        ours.sort();
+        let output = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN", "-F0pn"])
+            .output()
+            .unwrap();
+        let mut theirs: Vec<String> = output
+            .stdout
+            .split(|b| *b == 0)
+            .filter_map(|field| {
+                let field = String::from_utf8_lossy(field);
+                field.trim_start_matches('\n').strip_prefix('n').map(str::to_owned)
+            })
+            .collect();
+        theirs.sort();
+        // (Only these: other tests in this process listen meanwhile.)
+        let ports: Vec<String> = [&v4, &v6, &any]
+            .iter()
+            .map(|l| format!(":{}", l.local_addr().unwrap().port()))
+            .collect();
+        let mine = |list: Vec<String>| -> Vec<String> {
+            list.into_iter().filter(|a| ports.iter().any(|p| a.ends_with(p))).collect()
+        };
+        let (ours, theirs) = (mine(ours), mine(theirs));
+        assert_eq!(ours.len(), 3, "{ours:?}");
+        assert_eq!(ours, theirs);
+        assert_eq!(libproc::cwd(pid), std::env::current_dir().ok());
+        let args = libproc::arguments(pid).unwrap();
+        assert_eq!(args.first().map(String::as_str), std::env::args().next().as_deref());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_process_table_agrees_with_ps_and_same_process() {
+        let pid = std::process::id();
+        let table = libproc::process_table().unwrap();
+        let me = &table[&pid];
+        assert_eq!(me.parent, std::os::unix::process::parent_id());
+        assert!(me.started_at > 0);
+        assert!(same_process(pid, me.started_at));
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        let parts: Vec<_> = text.split_whitespace().collect();
+        assert_eq!(parse_lstart(&parts[..5]), me.started_at);
+        // Every process ps lists, the table has: read before and after it,
+        // ps itself aside (bar a few that came and went in between, on a
+        // busy machine).
+        let before = libproc::process_table().unwrap();
+        let ps = std::process::Command::new("/bin/ps")
+            .args(["-axo", "pid="])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ps_pid = ps.id();
+        let ps = ps.wait_with_output().unwrap();
+        let after = libproc::process_table().unwrap();
+        let listed: Vec<u32> = String::from_utf8_lossy(&ps.stdout)
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        let missing = listed
+            .iter()
+            .filter(|p| **p != ps_pid && !before.contains_key(p) && !after.contains_key(p))
+            .count();
+        assert!(missing <= 2, "{missing} of {} missing", listed.len());
+    }
+    /// `cargo test -p zeron-preview --release -- --ignored scan_cost --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn scan_cost() {
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let time = |f: &dyn Fn() -> usize| {
+            let start = std::time::Instant::now();
+            let mut found = 0;
+            for _ in 0..10 {
+                found = f();
+            }
+            (start.elapsed() / 10, found)
+        };
+        let (new, n) = time(&|| listeners(&mut Origins::default()).unwrap().len());
+        let (old, m) = time(&|| lsof_listeners(&mut Origins::default()).unwrap().len());
+        println!("listeners: libproc {new:?} ({n} found), lsof+ps {old:?} ({m} found)");
+        let a: Vec<_> = listeners(&mut Origins::default()).unwrap().into_iter().map(|l| (l.address, l.pid, l.parent, l.cwd, l.args, l.started_at)).collect();
+        let b: Vec<_> = lsof_listeners(&mut Origins::default()).unwrap().into_iter().map(|l| (l.address, l.pid, l.parent, l.cwd, l.args, l.started_at)).collect();
+        assert_eq!(a, b);
+    }
+    #[tokio::test]
+    async fn requires_an_http_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for response in [
+                b"SSH-2.0-test\r\n".as_slice(),
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+            ] {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let mut input = [0; 512];
+                let _ = client.read(&mut input).await;
+                client.write_all(response).await.unwrap();
+            }
+        });
+        assert!(!is_http(address).await);
+        assert!(is_http(address).await);
+        task.await.unwrap();
+    }
+}

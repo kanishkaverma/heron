@@ -1,0 +1,2246 @@
+//! Workspace registry — the client side of the row-table sidebar sync that
+//! replaces the Loro workspace doc (docs/registry-sync.md).
+//!
+//! [`RegistryDoc`] is a local replica of the per-user registry room:
+//! - `authoritative` rows — the server's truth, replaced wholesale by `state`/
+//!   `rows` frames (the server merges; clients never re-merge server rows);
+//! - `pending` op batches — local writes not yet acked, replayed over the
+//!   authoritative rows for every read (optimistic overlay), re-pushed on
+//!   reconnect (idempotent by strict-`>` clock compare). Repeated writes to
+//!   one row in the unsent tail coalesce ([`coalesce_ops`]) wherever the
+//!   room's outcome — rows AND push notifications — stays identical, so an
+//!   offline queue grows with rows touched and status transitions, not with
+//!   writes made (see `RegistryDoc::coalesce_unsent`);
+//! - an HLC clock stamping every local write.
+//!
+//! A local-only replica ([`RegistryDoc::set_local_only`]) has no server to
+//! ack anything: its writes fold straight into `authoritative` and `pending`
+//! stays empty.
+//!
+//! The merge function [`apply_op`] mirrors `edge/src/registry-core.ts` 1:1 —
+//! the shared test vectors live in both files; change them together. The
+//! typed API mirrors the old `WorkspaceDoc` surface so `WorkspaceHost` is a
+//! drop-in swap.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use zeron_proto::{Chat, ChatConfig, Device, MAX_SIDEBAR_PINS, Session, SidebarPreferences, Space};
+
+use crate::schema::DocError;
+use crate::workspace::{DeletedSpace, WorkspaceState};
+
+/// Row kinds — synced sidebar entities plus user preferences.
+pub const KIND_DEVICES: &str = "devices";
+pub const KIND_SPACES: &str = "spaces";
+pub const KIND_CHATS: &str = "chats";
+pub const KIND_SESSIONS: &str = "sessions";
+pub const KIND_PREFERENCES: &str = "preferences";
+
+/// Readiness only; membership and order live on individual pins.
+pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
+pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
+/// A repository's name and icon, shared by its copies; see `repository_looks`.
+pub const KIND_REPOSITORY_LOOKS: &str = "repositoryLooks";
+mod repository_looks;
+mod row_cache;
+mod sidebar_pins;
+mod sidebar_sections;
+
+/// Snapshot row id in the local `DocsStore` for the persisted registry state.
+pub const REGISTRY_DOC_ID: &str = "registry1";
+
+// ── HLC ─────────────────────────────────────────────────────────────────────
+
+/// Encode an HLC string: `{ms:013}-{counter:06}-{device}`. Fixed-width zero
+/// padding makes lexicographic order = (ms, counter, device) order, and the
+/// device suffix makes the order total (two writers can never tie).
+pub fn encode_hlc(ms: i64, counter: u32, device: &str) -> String {
+    format!("{ms:013}-{counter:06}-{device}")
+}
+
+/// `a` strictly newer than `b` (`None` = never written, loses to any).
+fn hlc_newer(a: &str, b: Option<&str>) -> bool {
+    match b {
+        None => true,
+        Some(b) => a > b,
+    }
+}
+
+/// Monotonic HLC source: never emits the same or an earlier clock twice, even
+/// across a wall-clock regression or restart (state persists with the doc).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HlcClock {
+    last_ms: i64,
+    counter: u32,
+}
+
+impl HlcClock {
+    fn next(&mut self, now_ms: i64, device: &str) -> String {
+        if now_ms > self.last_ms {
+            self.last_ms = now_ms;
+            self.counter = 0;
+        } else {
+            self.counter += 1;
+            if self.counter > 999_999 {
+                self.last_ms += 1;
+                self.counter = 0;
+            }
+        }
+        encode_hlc(self.last_ms, self.counter, device)
+    }
+}
+
+// ── rows and ops (wire-compatible with edge/src/registry-core.ts) ───────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryRow {
+    pub kind: String,
+    pub id: String,
+    /// Server seq of the batch that last touched this row (0 locally).
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub deleted: bool,
+    /// Tombstone clock — an upsert newer than this revives the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub del_hlc: Option<String>,
+    #[serde(default)]
+    pub fields: BTreeMap<String, Value>,
+    /// Per-field last-write clocks.
+    #[serde(default)]
+    pub clocks: BTreeMap<String, String>,
+}
+
+impl RegistryRow {
+    fn tombstone(kind: &str, id: &str, hlc: String) -> Self {
+        Self {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            seq: 0,
+            deleted: true,
+            del_hlc: Some(hlc),
+            fields: BTreeMap::new(),
+            clocks: BTreeMap::new(),
+        }
+    }
+
+    /// The newest clock anywhere on the row (delete-vs-live comparison base).
+    fn max_clock(&self) -> Option<&str> {
+        let mut max = self.del_hlc.as_deref();
+        for clock in self.clocks.values() {
+            if max.is_none_or(|m| clock.as_str() > m) {
+                max = Some(clock);
+            }
+        }
+        max
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpKind {
+    /// Creates, and revives tombstones when newer.
+    Upsert,
+    /// Never creates or revives ("never invent rows").
+    Update,
+    /// Tombstones when causally newer than the row.
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowOp {
+    pub kind: String,
+    pub id: String,
+    pub op: OpKind,
+    /// Field writes; `Value::Null` deletes the field (still a clocked write).
+    /// Absent for deletes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<BTreeMap<String, Value>>,
+    /// Clock for every write in `set` without an entry in `clocks`.
+    pub hlc: String,
+    /// Per-field clock overrides — re-seed pushes carry a row's ORIGINAL
+    /// clocks so recovery never coarsens causality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clocks: Option<BTreeMap<String, String>>,
+}
+
+impl RowOp {
+    fn clock_for<'a>(&'a self, field: &str) -> &'a str {
+        self.clocks
+            .as_ref()
+            .and_then(|c| c.get(field))
+            .map_or(self.hlc.as_str(), String::as_str)
+    }
+}
+
+/// Apply one op to a row — the 1:1 mirror of `applyOp` in
+/// `edge/src/registry-core.ts`. Returns the new row (`None` only for an
+/// `update` on a missing row) and whether anything changed.
+pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, bool) {
+    if op.op == OpKind::Delete {
+        return match row {
+            // Tombstone-on-missing guards against a late create racing the delete.
+            None => (
+                Some(RegistryRow::tombstone(&op.kind, &op.id, op.hlc.clone())),
+                true,
+            ),
+            Some(row) => {
+                let beats = if row.deleted {
+                    hlc_newer(&op.hlc, row.del_hlc.as_deref())
+                } else {
+                    hlc_newer(&op.hlc, row.max_clock())
+                };
+                if beats {
+                    let mut gone = row.clone();
+                    gone.deleted = true;
+                    gone.del_hlc = Some(op.hlc.clone());
+                    gone.fields.clear();
+                    gone.clocks.clear();
+                    (Some(gone), true)
+                } else {
+                    (Some(row.clone()), false)
+                }
+            }
+        };
+    }
+
+    let mut base = match row {
+        None => {
+            if op.op == OpKind::Update {
+                return (None, false);
+            }
+            RegistryRow {
+                kind: op.kind.clone(),
+                id: op.id.clone(),
+                seq: 0,
+                deleted: false,
+                del_hlc: None,
+                fields: BTreeMap::new(),
+                clocks: BTreeMap::new(),
+            }
+        }
+        Some(row) if row.deleted => {
+            if op.op == OpKind::Update || !hlc_newer(&op.hlc, row.del_hlc.as_deref()) {
+                return (Some(row.clone()), false);
+            }
+            // Revival: the tombstone loses wholesale; the upsert's fields are
+            // the row.
+            RegistryRow {
+                kind: row.kind.clone(),
+                id: row.id.clone(),
+                seq: row.seq,
+                deleted: false,
+                del_hlc: row.del_hlc.clone(),
+                fields: BTreeMap::new(),
+                clocks: BTreeMap::new(),
+            }
+        }
+        Some(row) => row.clone(),
+    };
+
+    let mut changed = row.is_none() || (row.is_some_and(|r| r.deleted) && !base.deleted);
+    if let Some(set) = &op.set {
+        for (key, value) in set {
+            let clock = op.clock_for(key);
+            if !hlc_newer(clock, base.clocks.get(key).map(String::as_str)) {
+                continue;
+            }
+            if value.is_null() {
+                base.fields.remove(key);
+            } else {
+                base.fields.insert(key.clone(), value.clone());
+            }
+            base.clocks.insert(key.clone(), clock.to_string());
+            changed = true;
+        }
+    }
+    if changed {
+        base.deleted = false;
+        (Some(base), true)
+    } else {
+        (Some(base), false)
+    }
+}
+
+/// A row as a re-seed op (server-behind-client recovery): one upsert carrying
+/// the row's ORIGINAL per-field clocks, or a delete for tombstones.
+pub fn row_to_seed_op(row: &RegistryRow) -> RowOp {
+    if row.deleted {
+        return RowOp {
+            kind: row.kind.clone(),
+            id: row.id.clone(),
+            op: OpKind::Delete,
+            set: None,
+            hlc: row
+                .del_hlc
+                .clone()
+                .unwrap_or_else(|| encode_hlc(0, 0, "seed")),
+            clocks: None,
+        };
+    }
+    RowOp {
+        kind: row.kind.clone(),
+        id: row.id.clone(),
+        op: OpKind::Upsert,
+        set: Some(
+            row.fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        hlc: row
+            .max_clock()
+            .map(str::to_string)
+            .unwrap_or_else(|| encode_hlc(0, 0, "seed")),
+        clocks: Some(row.clocks.clone()),
+    }
+}
+
+/// One op with EXACTLY the effect of applying `a` then `b` (same row) to any
+/// row state — live, tombstoned, or missing — or `None` when no single op
+/// can express the pair. Per-field writes always merge (newest clock wins, a
+/// tie keeps `a`, as in [`apply_op`]); what can break exactness is
+/// existence: an update never creates/revives, and an upsert revives a
+/// tombstone on its own `hlc` with ALL its fields. So:
+/// - `b` update: `a` alone decides existence → `a`'s kind and revival clock;
+/// - `b` upsert: exact when `a` (an upsert) can never revive where `b` would
+///   not (`b.hlc <= a.hlc`), or when `b` overwrites every field `a` wrote
+///   with a newer clock — whatever `a` revived or created, `b` replaces;
+/// - deletes compare against the row's clocks at apply time and never fold.
+///
+/// The steady-state writers (full-row session/chat/device upserts, field
+/// updates) all hit the exact cases. A merge whose result the room would
+/// reject as oversized ([`MAX_OP_BYTES`]) is refused too: the inputs stay
+/// separate and each still fits.
+pub fn coalesce_ops(a: &RowOp, b: &RowOp) -> Option<RowOp> {
+    if a.kind != b.kind || a.id != b.id {
+        return None;
+    }
+    let (op, hlc) = match (a.op, b.op) {
+        (OpKind::Delete, _) | (_, OpKind::Delete) => return None,
+        (_, OpKind::Update) => (a.op, a.hlc.clone()),
+        (OpKind::Upsert, OpKind::Upsert) if b.hlc <= a.hlc || shadows(b, a) => {
+            (OpKind::Upsert, a.hlc.clone().max(b.hlc.clone()))
+        }
+        (OpKind::Update, OpKind::Upsert) if shadows(b, a) => (OpKind::Upsert, b.hlc.clone()),
+        _ => return None,
+    };
+    let mut writes: BTreeMap<String, (Value, String)> = BTreeMap::new();
+    for (key, value) in a.set.iter().flatten() {
+        writes.insert(key.clone(), (value.clone(), a.clock_for(key).to_string()));
+    }
+    for (key, value) in b.set.iter().flatten() {
+        let clock = b.clock_for(key);
+        if writes
+            .get(key)
+            .is_none_or(|(_, prev)| hlc_newer(clock, Some(prev)))
+        {
+            writes.insert(key.clone(), (value.clone(), clock.to_string()));
+        }
+    }
+    // Every write keeps its ORIGINAL clock; only those differing from the
+    // op's `hlc` need an explicit override.
+    let mut set = BTreeMap::new();
+    let mut clocks = BTreeMap::new();
+    for (key, (value, clock)) in writes {
+        if clock != hlc {
+            clocks.insert(key.clone(), clock);
+        }
+        set.insert(key, value);
+    }
+    let merged = RowOp {
+        kind: a.kind.clone(),
+        id: a.id.clone(),
+        op,
+        set: Some(set),
+        hlc,
+        clocks: (!clocks.is_empty()).then_some(clocks),
+    };
+    fits_op_budget(&merged).then_some(merged)
+}
+
+/// Per-op serialized budget — the 1:1 mirror of `MAX_OP_BYTES` in
+/// `edge/src/registry-core.ts`; `validateOp` rejects (and with it the whole
+/// batch) any op whose `JSON.stringify` is longer.
+pub const MAX_OP_BYTES: usize = 16 * 1024;
+
+/// Whether `op` passes the room's size check. serde_json's UTF-8 byte count
+/// is never below `JSON.stringify`'s UTF-16 length for the same value, so
+/// this errs toward "too large".
+fn fits_op_budget(op: &RowOp) -> bool {
+    serde_json::to_vec(op).is_ok_and(|bytes| bytes.len() <= MAX_OP_BYTES)
+}
+
+/// The `sessions` fields the room's push notifications switch on
+/// (`notificationFor` in `edge/src/push-notify.ts`): the status indicator
+/// and the completed-turn marker. `updatedAt` only gates staleness, so the
+/// 10 s keepalive touch differs from its predecessor only there.
+fn session_signal(op: &RowOp) -> (Option<&Value>, Option<&Value>) {
+    let field = |name: &str| op.set.as_ref().and_then(|s| s.get(name));
+    (field("status"), field("lastCompletedTurn"))
+}
+
+/// A `chats` op that can change what a session notification sees
+/// (`chatForNotification`: existence/deletion, side-chat origin, archived,
+/// title). Freshness writes (`lastMessage*`, `lastSeenAt`, …) cannot.
+fn chat_gates_notifications(op: &RowOp) -> bool {
+    op.op != OpKind::Update
+        || op.set.as_ref().is_some_and(|s| {
+            ["title", "archived", "parentChatId"]
+                .iter()
+                .any(|k| s.contains_key(*k))
+        })
+}
+
+/// `b` writes every field `a` writes, each with a strictly newer clock.
+fn shadows(b: &RowOp, a: &RowOp) -> bool {
+    let b_set = b.set.as_ref();
+    a.set.iter().flatten().all(|(key, _)| {
+        b_set.is_some_and(|s| s.contains_key(key))
+            && hlc_newer(b.clock_for(key), Some(a.clock_for(key)))
+    })
+}
+
+// ── pending batches ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBatch {
+    pub batch: String,
+    pub ops: Vec<RowOp>,
+    /// True while the batch is in flight on the CURRENT connection (cleared
+    /// on disconnect so reconnects re-push). Not persisted meaningfully — a
+    /// restart implies a fresh connection.
+    #[serde(default, skip_serializing)]
+    pub in_flight: bool,
+}
+
+// ── the doc ─────────────────────────────────────────────────────────────────
+
+/// What [`RegistryDoc::apply_state`] decided about a `state` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateOutcome {
+    /// Delta applied over existing authoritative rows.
+    Delta,
+    /// Full state replaced local authoritative rows.
+    Replaced,
+    /// The server is BEHIND this client (wiped/reset storage): local rows were
+    /// kept and a re-seed batch was enqueued. The caller must push pending.
+    Reseeded,
+}
+
+/// Bump to force every client ONE full resync on its next boot (persisted
+/// snapshots below this epoch zero their cursor on load). 1 = the
+/// cursor-jump healing (ack/gap fixes below).
+const CURRENT_RESYNC_EPOCH: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedState {
+    v: u32,
+    /// Cursor-integrity epoch: bumping [`CURRENT_RESYNC_EPOCH`] forces every
+    /// client one full resync on its first load after upgrading (heals
+    /// snapshots whose cursor jumped past unapplied rows). Additive —
+    /// pre-epoch snapshots default to 0.
+    #[serde(default)]
+    resync_epoch: u32,
+    device_id: String,
+    server_seq: u64,
+    gc_floor: u64,
+    clock: HlcClock,
+    /// See [`RegistryDoc::local_writes`]. Additive — older snapshots default
+    /// to `false`.
+    #[serde(default)]
+    local_writes: bool,
+    rows: Vec<RegistryRow>,
+    pending: Vec<PendingBatch>,
+}
+
+/// What a save of the changes since the previous one holds (see
+/// [`RegistryDoc::delta_bytes`]): the header, the authoritative rows that
+/// changed, and the whole pending queue (small: unsent writes, coalesced).
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedDelta {
+    v: u32,
+    resync_epoch: u32,
+    server_seq: u64,
+    gc_floor: u64,
+    clock: HlcClock,
+    local_writes: bool,
+    rows: Vec<RegistryRow>,
+    pending: Vec<PendingBatch>,
+}
+
+/// The local registry replica. Pure data — no I/O, no async; the transport
+/// (`zeron_sync::RegistryClient`) and the engine host drive it under a lock.
+pub struct RegistryDoc {
+    device_id: String,
+    /// kind → id → row (server truth).
+    authoritative: HashMap<String, HashMap<String, RegistryRow>>,
+    server_seq: u64,
+    gc_floor: u64,
+    clock: HlcClock,
+    pending: Vec<PendingBatch>,
+    /// No server will ever ack (local profile): writes fold straight into
+    /// `authoritative` — queueing them grew `pending` without bound (a field
+    /// snapshot held 178k never-acked batches for 289 rows). Runtime mode,
+    /// set by the host; not persisted.
+    local_only: bool,
+    /// Writes were folded into `authoritative` that no server has seen. If
+    /// an edge ever attaches to this replica, every row re-seeds once (see
+    /// [`Self::set_local_only`]). Persisted.
+    local_writes: bool,
+    /// Bumped on every mutation (local or applied) — the engine host converts
+    /// this into watch-channel publishes and snapshot debounces.
+    generation: u64,
+    /// Parsed typed lists, kept up to date row by row (see `row_cache`).
+    cache: std::sync::Mutex<row_cache::RowCache>,
+    /// Authoritative rows changed since the last save; `None` after a change
+    /// to every row (a full replace), which only a whole save records.
+    unsaved: Option<HashSet<(String, String)>>,
+    /// Rows parsed by typed reads so far (diagnostics and tests).
+    rows_parsed: std::sync::atomic::AtomicU64,
+}
+
+impl RegistryDoc {
+    pub fn new(device_id: impl Into<String>) -> Self {
+        Self {
+            device_id: device_id.into(),
+            authoritative: HashMap::new(),
+            server_seq: 0,
+            gc_floor: 0,
+            clock: HlcClock::default(),
+            pending: Vec::new(),
+            local_only: false,
+            local_writes: false,
+            generation: 0,
+            cache: std::sync::Mutex::new(row_cache::RowCache::default()),
+            unsaved: Some(HashSet::new()),
+            rows_parsed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    // ── change tracking ─────────────────────────────────────────────────────
+
+    fn cache_mut(&mut self) -> &mut row_cache::RowCache {
+        self.cache.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// An authoritative row changed: its overlay, and what a save owes.
+    fn touch_row(&mut self, kind: &str, id: &str) {
+        self.cache_mut().touch(kind, id);
+        if let Some(unsaved) = &mut self.unsaved {
+            unsaved.insert((kind.to_owned(), id.to_owned()));
+        }
+    }
+
+    /// Pending ops on a row changed: its overlay (pending is saved whole).
+    fn touch_overlay(&mut self, kind: &str, id: &str) {
+        self.cache_mut().touch(kind, id);
+    }
+
+    fn touch_ops<'a>(&mut self, ops: impl IntoIterator<Item = &'a RowOp>) {
+        let keys: Vec<(String, String)> =
+            ops.into_iter().map(|op| (op.kind.clone(), op.id.clone())).collect();
+        for (kind, id) in keys {
+            self.touch_overlay(&kind, &id);
+        }
+    }
+
+    /// Every row may have changed.
+    fn touch_everything(&mut self) {
+        self.cache_mut().touch_all();
+        self.unsaved = None;
+    }
+
+    /// Changes whenever a row of `kind` may have changed: a publisher skips
+    /// rebuilding lists whose kind is unchanged.
+    pub fn kind_version(&self, kind: &str) -> u64 {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .version(kind)
+    }
+
+    /// Rows parsed by typed reads so far (each read re-parses only rows that
+    /// changed since the previous one).
+    pub fn rows_parsed(&self) -> u64 {
+        self.rows_parsed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Sync cursor: the last server seq this replica has fully applied.
+    pub fn cursor(&self) -> u64 {
+        self.server_seq
+    }
+
+    /// Monotonic local change counter (any mutation bumps it).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Total ops across pending batches (introspection/tests).
+    pub fn pending_ops_len(&self) -> usize {
+        self.pending.iter().map(|b| b.ops.len()).sum()
+    }
+
+    /// Switch local-only mode (see the `local_only` field). Entering it folds
+    /// any queued batches into `authoritative` — nothing can be in flight
+    /// without a transport. Leaving it after local-only writes re-seeds every
+    /// row with its ORIGINAL clocks (the server may hold some of them with
+    /// older values; a full `state` replace would otherwise drop the newer
+    /// local ones), exactly like the server-behind recovery in
+    /// [`Self::apply_state`]. Call before a transport attaches.
+    pub fn set_local_only(&mut self, local_only: bool) {
+        self.local_only = local_only;
+        if local_only {
+            let pending = std::mem::take(&mut self.pending);
+            if pending.is_empty() {
+                return;
+            }
+            self.touch_ops(pending.iter().flat_map(|b| &b.ops));
+            let ops: usize = pending.iter().map(|b| b.ops.len()).sum();
+            tracing::info!(
+                batches = pending.len(),
+                ops,
+                "registry: folded queued writes into the local-only replica"
+            );
+            self.generation += 1;
+            self.local_writes = true;
+            for batch in pending {
+                for op in &batch.ops {
+                    self.fold_op(op);
+                }
+            }
+        } else if self.local_writes {
+            self.local_writes = false;
+            let seed: Vec<RowOp> = self
+                .authoritative
+                .values()
+                .flat_map(|m| m.values())
+                .map(row_to_seed_op)
+                .collect();
+            self.enqueue_ops(seed);
+        }
+    }
+
+    /// Apply one op straight to the authoritative row — the same step the
+    /// overlay replays, made permanent.
+    fn fold_op(&mut self, op: &RowOp) {
+        let row = self.authoritative.get(&op.kind).and_then(|m| m.get(&op.id));
+        if let (Some(next), true) = apply_op(row, op) {
+            self.put_authoritative(next);
+        }
+    }
+
+    // ── persistence ─────────────────────────────────────────────────────────
+
+    // (see PersistedState::resync_epoch)
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, DocError> {
+        let rows = self
+            .authoritative
+            .values()
+            .flat_map(|m| m.values().cloned())
+            .collect();
+        let state = PersistedState {
+            v: 1,
+            resync_epoch: CURRENT_RESYNC_EPOCH,
+            device_id: self.device_id.clone(),
+            server_seq: self.server_seq,
+            gc_floor: self.gc_floor,
+            clock: self.clock.clone(),
+            local_writes: self.local_writes,
+            rows,
+            pending: self.pending.clone(),
+        };
+        Ok(serde_json::to_vec(&state)?)
+    }
+
+    // ── incremental saves ───────────────────────────────────────────────────
+
+    /// The changes since the last save ([`Self::mark_saved`]), to store after
+    /// the last whole snapshot; `None` when only a whole snapshot can record
+    /// them (a full replace changed every row). A local session-status write
+    /// becomes one row here instead of the whole registry.
+    pub fn delta_bytes(&self) -> Result<Option<Vec<u8>>, DocError> {
+        let Some(unsaved) = &self.unsaved else {
+            return Ok(None);
+        };
+        let rows = unsaved
+            .iter()
+            .filter_map(|(kind, id)| self.authoritative.get(kind)?.get(id).cloned())
+            .collect();
+        let delta = PersistedDelta {
+            v: 1,
+            resync_epoch: CURRENT_RESYNC_EPOCH,
+            server_seq: self.server_seq,
+            gc_floor: self.gc_floor,
+            clock: self.clock.clone(),
+            local_writes: self.local_writes,
+            rows,
+            pending: self.pending.clone(),
+        };
+        Ok(Some(serde_json::to_vec(&delta)?))
+    }
+
+    /// A save (whole or delta) recorded everything up to now.
+    pub fn mark_saved(&mut self) {
+        self.unsaved = Some(HashSet::new());
+    }
+
+    /// The replica a whole snapshot plus its saved deltas hold. `chain` is
+    /// the contiguous run of deltas (applied in order; the first that doesn't
+    /// decode ends it), `tail` any rows after a break. Only the tail's
+    /// pending writes are kept (they are local writes nothing else holds;
+    /// replaying one is an idempotent LWW push); its rows and cursor are
+    /// not, so the room resends what the cursor doesn't cover. Returns the
+    /// replica and whether the whole chain applied (else the next save
+    /// should be whole, to start a clean chain).
+    pub fn from_saved(
+        base: &[u8],
+        chain: &[Vec<u8>],
+        tail: &[Vec<u8>],
+        device_id: &str,
+    ) -> Result<(Self, bool), DocError> {
+        let state: PersistedState = serde_json::from_slice(base)?;
+        let mut doc = Self::from_state(state, device_id)?;
+        // Rows after a break: past an undecodable delta, plus the store's tail.
+        let mut after_break: Vec<&Vec<u8>> = Vec::new();
+        for (i, bytes) in chain.iter().enumerate() {
+            match serde_json::from_slice::<PersistedDelta>(bytes) {
+                Ok(delta) if delta.v == 1 => doc.apply_delta(delta),
+                _ => {
+                    tracing::warn!(at = i, deltas = chain.len(), "registry delta did not decode; loading up to the one before it");
+                    after_break.extend(&chain[i + 1..]);
+                    after_break.push(bytes); // counted as a break, not kept
+                    break;
+                }
+            }
+        }
+        after_break.extend(tail);
+        let clean = after_break.is_empty();
+        if !clean {
+            let mut known: HashSet<String> = doc.pending.iter().map(|b| b.batch.clone()).collect();
+            for bytes in after_break {
+                if let Ok(delta) = serde_json::from_slice::<PersistedDelta>(bytes) {
+                    for batch in delta.pending {
+                        if known.insert(batch.batch.clone()) {
+                            doc.pending.push(batch);
+                        }
+                    }
+                }
+            }
+        }
+        doc.coalesce_loaded();
+        doc.unsaved = Some(HashSet::new());
+        Ok((doc, clean))
+    }
+
+    fn apply_delta(&mut self, delta: PersistedDelta) {
+        self.server_seq = if delta.resync_epoch < CURRENT_RESYNC_EPOCH {
+            0
+        } else {
+            delta.server_seq
+        };
+        self.gc_floor = delta.gc_floor;
+        self.clock = delta.clock;
+        self.local_writes = delta.local_writes;
+        self.pending = delta.pending;
+        for row in delta.rows {
+            self.put_authoritative(row);
+        }
+        self.cache_mut().touch_all();
+    }
+
+    pub fn from_bytes(bytes: &[u8], device_id: &str) -> Result<Self, DocError> {
+        let state: PersistedState = serde_json::from_slice(bytes)?;
+        let mut doc = Self::from_state(state, device_id)?;
+        doc.coalesce_loaded();
+        Ok(doc)
+    }
+
+    fn from_state(state: PersistedState, device_id: &str) -> Result<Self, DocError> {
+        if state.v != 1 {
+            return Err(DocError::Schema(format!(
+                "unknown registry snapshot version {}",
+                state.v
+            )));
+        }
+        let mut doc = Self::new(device_id);
+        // One-shot healing resync: snapshots from before a cursor-integrity
+        // fix may have a cursor that JUMPED past rows this replica never
+        // applied (the ack/gap bugs above) — those rows are invisible and no
+        // amount of ordinary syncing refetches them. Zeroing the cursor once
+        // forces the next hello/pull to return full state; local rows are
+        // kept (and local-only ones re-seed through apply_state's full path).
+        if state.resync_epoch < CURRENT_RESYNC_EPOCH {
+            doc.server_seq = 0;
+        } else {
+            doc.server_seq = state.server_seq;
+        }
+        doc.gc_floor = state.gc_floor;
+        doc.clock = state.clock;
+        doc.local_writes = state.local_writes;
+        doc.pending = state.pending;
+        for row in state.rows {
+            doc.authoritative
+                .entry(row.kind.clone())
+                .or_default()
+                .insert(row.id.clone(), row);
+        }
+        Ok(doc)
+    }
+
+    /// Nothing is in flight after a load, so the whole queue coalesces —
+    /// this shrinks snapshots bloated before coalescing existed (178k
+    /// batches → one op per touched row). The host persists the result.
+    fn coalesce_loaded(&mut self) {
+        let before = self.pending_ops_len();
+        if self.coalesce_unsent() > 0 {
+            tracing::info!(
+                before,
+                after = self.pending_ops_len(),
+                batches = self.pending.len(),
+                "registry: compacted queued writes on load"
+            );
+        }
+    }
+
+    // ── server frames ───────────────────────────────────────────────────────
+
+    /// Apply a hello `state` frame. See [`StateOutcome`] for the three shapes.
+    pub fn apply_state(
+        &mut self,
+        seq: u64,
+        full: bool,
+        gc_floor: u64,
+        rows: Vec<RegistryRow>,
+    ) -> StateOutcome {
+        self.generation += 1;
+        if !full {
+            for row in rows {
+                self.put_authoritative(row);
+            }
+            self.server_seq = seq;
+            self.gc_floor = gc_floor;
+            return StateOutcome::Delta;
+        }
+        if seq < self.server_seq {
+            // The server lost state (reset/wipe). Local rows are the only
+            // copy: keep them and re-seed the server with ORIGINAL clocks.
+            let seed: Vec<RowOp> = self
+                .authoritative
+                .values()
+                .flat_map(|m| m.values())
+                .map(row_to_seed_op)
+                .collect();
+            for row in rows {
+                self.put_authoritative(row);
+            }
+            self.server_seq = seq;
+            self.gc_floor = gc_floor;
+            if !seed.is_empty() {
+                self.enqueue_ops(seed);
+            }
+            return StateOutcome::Reseeded;
+        }
+        // Full replace — but local-only rows the server never saw (e.g. it
+        // GC-jumped our cursor while we held unseeded rows) re-seed too.
+        let mut incoming: HashMap<String, HashMap<String, RegistryRow>> = HashMap::new();
+        for row in rows {
+            incoming
+                .entry(row.kind.clone())
+                .or_default()
+                .insert(row.id.clone(), row);
+        }
+        let mut seed: Vec<RowOp> = Vec::new();
+        for (kind, by_id) in &self.authoritative {
+            for (id, row) in by_id {
+                if !incoming.get(kind).is_some_and(|m| m.contains_key(id)) {
+                    seed.push(row_to_seed_op(row));
+                }
+            }
+        }
+        self.authoritative = incoming;
+        self.touch_everything();
+        self.server_seq = seq;
+        self.gc_floor = gc_floor;
+        if seed.is_empty() {
+            StateOutcome::Replaced
+        } else {
+            self.enqueue_ops(seed);
+            StateOutcome::Reseeded
+        }
+    }
+
+    /// Apply a `rows` broadcast (merged truth for the touched rows).
+    /// Apply one broadcast batch. Returns `false` on a SEQ GAP — frames
+    /// between the cursor and this batch were missed (a hibernating DO, a
+    /// half-dead socket): the rows still apply (fresh data), but the cursor
+    /// holds so the caller can resync (reconnect → hello/pull from the true
+    /// cursor backfills the window). Advancing across a gap made the missed
+    /// rows permanently invisible.
+    #[must_use]
+    pub fn apply_rows(&mut self, seq: u64, rows: Vec<RegistryRow>) -> bool {
+        self.generation += 1;
+        for row in rows {
+            self.put_authoritative(row);
+        }
+        if seq > self.server_seq + 1 {
+            return false;
+        }
+        if seq > self.server_seq {
+            self.server_seq = seq;
+        }
+        true
+    }
+
+    /// Retire an acked batch; returns whether it existed.
+    ///
+    /// Deliberately does NOT advance the sync cursor: the ack's `seq` is OUR
+    /// batch's position, and other devices' batches may sit between the
+    /// cursor and it. Jumping the cursor skipped those forever — on the
+    /// HTTPS transport the very next pull used the jumped cursor, so a
+    /// device that pushed anything (a seen-marker was enough) while behind
+    /// permanently missed every row its peers wrote since its last sync
+    /// (field incident: new sessions never appeared in a laptop's sidebar
+    /// while updates to already-known rows kept flowing). The cursor only
+    /// advances with actual row payloads (state/pull/contiguous broadcasts);
+    /// re-pulling our own batch is an idempotent LWW no-op.
+    pub fn ack_batch(&mut self, batch: &str, _seq: u64) -> bool {
+        let before = self.pending.len();
+        let acked: Vec<RowOp> = self
+            .pending
+            .iter()
+            .filter(|b| b.batch == batch)
+            .flat_map(|b| b.ops.iter().cloned())
+            .collect();
+        self.pending.retain(|b| b.batch != batch);
+        self.touch_ops(&acked);
+        if self.pending.len() != before {
+            self.generation += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Batches to push: everything not already in flight on this connection.
+    pub fn take_pushable(&mut self) -> Vec<PendingBatch> {
+        let mut out = Vec::new();
+        for batch in &mut self.pending {
+            if !batch.in_flight {
+                batch.in_flight = true;
+                out.push(batch.clone());
+            }
+        }
+        out
+    }
+
+    /// Connection dropped: everything unacked becomes pushable again.
+    pub fn mark_disconnected(&mut self) {
+        for batch in &mut self.pending {
+            batch.in_flight = false;
+        }
+    }
+
+    fn put_authoritative(&mut self, row: RegistryRow) {
+        self.touch_row(&row.kind, &row.id);
+        self.authoritative
+            .entry(row.kind.clone())
+            .or_default()
+            .insert(row.id.clone(), row);
+    }
+
+    // ── local writes ────────────────────────────────────────────────────────
+
+    fn now_ms() -> i64 {
+        Utc::now().timestamp_millis()
+    }
+
+    fn next_hlc(&mut self) -> String {
+        let device = self.device_id.clone();
+        self.clock.next(Self::now_ms(), &device)
+    }
+
+    fn enqueue_ops(&mut self, mut ops: Vec<RowOp>) {
+        if ops.is_empty() {
+            return;
+        }
+        self.touch_ops(&ops);
+        if self.local_only {
+            self.generation += 1;
+            self.local_writes = true;
+            for op in &ops {
+                self.fold_op(op);
+            }
+            return;
+        }
+        // The registry room rejects any batch over its op cap (500), and a
+        // rejected batch is a PERMANENT wedge: error frames carry no batch
+        // id, so the client can never retire it — it replays and fails on
+        // every reconnect, and every write queued behind it (session-status
+        // rows included) never propagates again. `delete_space` on a
+        // ≥250-chat space minted exactly such a batch. Chunk here so no
+        // writer can ever produce one; chunks apply in order, each
+        // atomically (only cross-chunk atomicity is given up).
+        const MAX_OPS_PER_BATCH: usize = 400;
+        self.generation += 1;
+        while !ops.is_empty() {
+            let tail = if ops.len() > MAX_OPS_PER_BATCH {
+                ops.split_off(MAX_OPS_PER_BATCH)
+            } else {
+                Vec::new()
+            };
+            // Batch ids only need device-lifetime uniqueness; the HLC of a
+            // fresh tick provides exactly that without a rng dependency.
+            let batch = format!("b-{}", self.next_hlc());
+            self.pending.push(PendingBatch {
+                batch,
+                ops,
+                in_flight: false,
+            });
+            ops = tail;
+        }
+        self.coalesce_unsent();
+    }
+
+    /// Collapse repeated writes to one row across the UNSENT tail of
+    /// `pending` (everything after the last in-flight batch) into single ops
+    /// via [`coalesce_ops`]; returns how many ops were folded away.
+    ///
+    /// The room treats a batch as a unit (`applyPushBatch` in
+    /// `edge/src/registry-room.ts`): validated and committed atomically,
+    /// one seq and one rows broadcast, and push notifications derived from
+    /// each `sessions` row before vs after the WHOLE batch, labelled from the
+    /// chat row after it. So:
+    /// - only single-op batches (one local write each) take part. Multi-op
+    ///   batches — cascade deletes, re-seeds, migration seeds — are written
+    ///   as units and keep every op, in place;
+    /// - a merged op lands at the LATER op's position and the earlier one is
+    ///   removed. Moving an op later only reorders it against other rows,
+    ///   which merge independently — except a session notification reads
+    ///   its chat row, so a session op never moves past a chat op that
+    ///   gates notifications, nor such a chat op past a session op;
+    /// - session ops merge only when status and completed turn match, and
+    ///   the first op of each such run (a potential notification) never
+    ///   absorbs later ones: working→needs-input→working stays three ops,
+    ///   while a run of keepalive touches folds into the run head plus one.
+    ///   Then every batch the room applies yields the same notifications as
+    ///   the unmerged queue (the merged follower can only re-cross the
+    ///   staleness window once, exactly as the touches it replaces would).
+    ///
+    /// Ack safety: in-flight batches are never touched, so an ack always
+    /// retires exactly what was pushed. A tail batch may still have been
+    /// pushed on a dead connection (its late HTTPS ack can race a
+    /// disconnect), so a batch that gained content takes a fresh id: a stale
+    /// ack then retires nothing, and a removed batch's ack finds nothing.
+    /// Re-pushing merged ops is an idempotent LWW replay.
+    fn coalesce_unsent(&mut self) -> usize {
+        let start = self
+            .pending
+            .iter()
+            .rposition(|b| b.in_flight)
+            .map_or(0, |i| i + 1);
+        if self.pending.len().saturating_sub(start) < 2 {
+            return 0;
+        }
+        let tail_ops: Vec<RowOp> = self.pending[start..]
+            .iter()
+            .flat_map(|b| b.ops.iter().cloned())
+            .collect();
+        let mut tail: Vec<(String, Vec<Option<RowOp>>, bool)> = self
+            .pending
+            .split_off(start)
+            .into_iter()
+            .map(|b| (b.batch, b.ops.into_iter().map(Some).collect(), false))
+            .collect();
+        // (kind, id) → (position of that row's latest live op in the tail,
+        // whether that op heads a session-signal run).
+        let mut last: HashMap<(String, String), ((usize, usize), bool)> = HashMap::new();
+        // chat id → position of its latest notification-gating chat op.
+        let mut gating_chat: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut folded = 0;
+        for bi in 0..tail.len() {
+            for oi in 0..tail[bi].1.len() {
+                let Some(op) = tail[bi].1[oi].as_ref() else {
+                    continue;
+                };
+                let here = (bi, oi);
+                let key = (op.kind.clone(), op.id.clone());
+                let prev = last
+                    .get(&key)
+                    .and_then(|&(at, head)| Some((at, head, tail[at.0].1[at.1].as_ref()?)));
+                let session = op.kind == KIND_SESSIONS;
+                let head = session
+                    && prev.is_none_or(|(_, _, p)| {
+                        p.op == OpKind::Delete || session_signal(p) != session_signal(op)
+                    });
+                let merged = prev.and_then(|(at, prev_head, prev_op)| {
+                    let single = tail[bi].1.len() == 1 && tail[at.0].1.len() == 1;
+                    let may_move = if session {
+                        !head && !prev_head && !gating_chat.get(&op.id).is_some_and(|&c| c > at)
+                    } else if op.kind == KIND_CHATS && chat_gates_notifications(prev_op) {
+                        !last
+                            .get(&(KIND_SESSIONS.to_string(), op.id.clone()))
+                            .is_some_and(|&(s, _)| s > at)
+                    } else {
+                        true
+                    };
+                    (single && may_move)
+                        .then(|| coalesce_ops(prev_op, op))
+                        .flatten()
+                        .map(|merged| (at, merged))
+                });
+                if let Some((at, merged)) = merged {
+                    tail[at.0].1[at.1] = None;
+                    tail[bi].1[oi] = Some(merged);
+                    tail[bi].2 = true;
+                    folded += 1;
+                }
+                let op = tail[bi].1[oi].as_ref().expect("op stays live");
+                if op.kind == KIND_CHATS && chat_gates_notifications(op) {
+                    gating_chat.insert(op.id.clone(), here);
+                }
+                last.insert(key, (here, head));
+            }
+        }
+        if folded == 0 {
+            self.pending
+                .extend(tail.into_iter().map(|(batch, ops, _)| PendingBatch {
+                    batch,
+                    ops: ops.into_iter().flatten().collect(),
+                    in_flight: false,
+                }));
+            return 0;
+        }
+        for (batch, ops, gained) in tail {
+            let ops: Vec<RowOp> = ops.into_iter().flatten().collect();
+            if ops.is_empty() {
+                continue;
+            }
+            let batch = if gained {
+                format!("b-{}", self.next_hlc())
+            } else {
+                batch
+            };
+            self.pending.push(PendingBatch {
+                batch,
+                ops,
+                in_flight: false,
+            });
+        }
+        // Merged ops replay to the same rows, but say so for every row the
+        // tail held rather than rely on that.
+        self.touch_ops(&tail_ops);
+        self.generation += 1;
+        folded
+    }
+
+    fn write(&mut self, kind: &str, id: &str, op: OpKind, set: BTreeMap<String, Value>) {
+        let hlc = self.next_hlc();
+        self.enqueue_ops(vec![RowOp {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            op,
+            set: Some(set),
+            hlc,
+            clocks: None,
+        }]);
+    }
+
+    /// An `update` carrying only the fields whose value differs from what
+    /// the row already shows (overlay included), and nothing when none do.
+    /// Every write the room applies costs it a stored row and a broadcast to
+    /// every device, and host stamps (harness session, branch, source
+    /// context) repeat on every turn while rarely changing. A missing field
+    /// equals `null`. `same` decides equality per field.
+    fn update_changed(
+        &mut self,
+        kind: &str,
+        id: &str,
+        set: BTreeMap<String, Value>,
+        same: impl Fn(&str, &Value, &Value) -> bool,
+    ) {
+        let current = self.overlay_row(kind, id);
+        let set: BTreeMap<String, Value> = set
+            .into_iter()
+            .filter(|(key, value)| {
+                let now = current
+                    .as_ref()
+                    .and_then(|row| row.fields.get(key))
+                    .unwrap_or(&Value::Null);
+                !same(key, now, value)
+            })
+            .collect();
+        if !set.is_empty() {
+            self.write(kind, id, OpKind::Update, set);
+        }
+    }
+
+    fn delete_row_ops(&mut self, keys: &[(&str, &str)]) {
+        let hlc = self.next_hlc();
+        let ops = keys
+            .iter()
+            .map(|(kind, id)| RowOp {
+                kind: (*kind).to_string(),
+                id: (*id).to_string(),
+                op: OpKind::Delete,
+                set: None,
+                hlc: hlc.clone(),
+                clocks: None,
+            })
+            .collect();
+        self.enqueue_ops(ops);
+    }
+
+    // ── overlay reads ───────────────────────────────────────────────────────
+
+    fn pending_ops(&self) -> impl Iterator<Item = &RowOp> {
+        self.pending.iter().flat_map(|b| &b.ops)
+    }
+
+    /// The row with pending ops applied, tombstones included.
+    fn overlay_row_or_tombstone(&self, kind: &str, id: &str) -> Option<RegistryRow> {
+        replay_row(
+            self.authoritative.get(kind).and_then(|m| m.get(id)),
+            self.pending_ops()
+                .filter(|op| op.kind == kind && op.id == id),
+        )
+    }
+
+    /// The row as this device should display it: authoritative + pending ops.
+    fn overlay_row(&self, kind: &str, id: &str) -> Option<RegistryRow> {
+        overlay(
+            self.authoritative.get(kind).and_then(|m| m.get(id)),
+            self.pending_ops()
+                .filter(|op| op.kind == kind && op.id == id),
+        )
+    }
+
+    /// All live rows of `kind`, overlay applied. Pending ops are grouped by
+    /// row in one pass — rescanning the queue per row made every read
+    /// O(rows × pending).
+    fn overlay_rows(&self, kind: &str) -> Vec<RegistryRow> {
+        let authoritative = self.authoritative.get(kind);
+        let mut ids: Vec<&str> = authoritative
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut ops: HashMap<&str, Vec<&RowOp>> = HashMap::new();
+        for op in self.pending_ops().filter(|op| op.kind == kind) {
+            let row_ops = ops.entry(op.id.as_str()).or_default();
+            if row_ops.is_empty() && !authoritative.is_some_and(|m| m.contains_key(&op.id)) {
+                ids.push(&op.id);
+            }
+            row_ops.push(op);
+        }
+        ids.into_iter()
+            .filter_map(|id| {
+                overlay(
+                    authoritative.and_then(|m| m.get(id)),
+                    ops.get(id).into_iter().flatten().copied(),
+                )
+            })
+            .collect()
+    }
+
+    /// One row's typed value (`None` when it doesn't parse: skipped, as a
+    /// malformed row always was).
+    fn parse_row<R: serde::de::DeserializeOwned, T>(
+        &self,
+        kind: &str,
+        row: &RegistryRow,
+        convert: fn(R) -> T,
+    ) -> Option<T> {
+        self.rows_parsed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let value = Value::Object(row.fields.clone().into_iter().collect());
+        match serde_json::from_value::<R>(value) {
+            Ok(parsed) => Some(convert(parsed)),
+            Err(err) => {
+                tracing::warn!(kind, row = %row.id, error = %err, "skipping malformed registry row");
+                None
+            }
+        }
+    }
+
+    /// Every live row of `kind` as `T`, in no particular order. Only rows
+    /// whose overlay changed since the previous read of this list are parsed
+    /// again (`row_cache`); the first read, and one after a full replace,
+    /// parse them all.
+    fn read_cached<R, T>(&self, kind: &str, convert: fn(R) -> T) -> Vec<T>
+    where
+        R: serde::de::DeserializeOwned + 'static,
+        T: Clone + Send + std::fmt::Debug + 'static,
+    {
+        let values = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read(
+                kind,
+                std::any::TypeId::of::<(R, T)>(),
+                || {
+                    self.overlay_rows(kind)
+                        .iter()
+                        .filter_map(|row| {
+                            self.parse_row(kind, row, convert).map(|v| (row.id.clone(), v))
+                        })
+                        .collect()
+                },
+                |id| {
+                    self.overlay_row(kind, id)
+                        .and_then(|row| self.parse_row(kind, &row, convert))
+                },
+            );
+        // Tests check the cache against a full read, so a mutation that
+        // forgot to say which rows it touched fails loudly.
+        #[cfg(test)]
+        {
+            let mut fresh: Vec<String> = self
+                .overlay_rows(kind)
+                .iter()
+                .filter_map(|row| {
+                    let value = Value::Object(row.fields.clone().into_iter().collect());
+                    serde_json::from_value::<R>(value)
+                        .ok()
+                        .map(|parsed| format!("{:?}", convert(parsed)))
+                })
+                .collect();
+            let mut cached: Vec<String> = values.iter().map(|v| format!("{v:?}")).collect();
+            fresh.sort();
+            cached.sort();
+            assert!(
+                fresh == cached,
+                "registry read cache for {kind} is stale: a mutation didn't record its rows"
+            );
+        }
+        values
+    }
+
+    fn row_exists(&self, kind: &str, id: &str) -> bool {
+        self.overlay_row(kind, id).is_some()
+    }
+
+    // ── typed API (the WorkspaceDoc surface) ────────────────────────────────
+
+    /// Upsert a full device row (writer discipline: callers pass their OWN device).
+    pub fn upsert_device(&mut self, device: &Device) -> Result<(), DocError> {
+        let set = fields([
+            ("id", json!(device.id)),
+            ("name", json!(device.name)),
+            ("platform", json!(device.platform)),
+            ("lastSeenAt", opt_ms(device.last_seen_at)),
+            ("createdAt", opt_ms(device.created_at)),
+            ("version", opt_str(device.version.as_deref())),
+            (
+                "cursorSdkVersion",
+                opt_str(device.cursor_sdk_version.as_deref()),
+            ),
+            ("cursorSdkEngineVersion", opt_str(device.version.as_deref())),
+            ("capabilities", json!(device.capabilities)),
+        ]);
+        self.write(KIND_DEVICES, &device.id.clone(), OpKind::Upsert, set);
+        Ok(())
+    }
+
+    /// LWW rename (settings UI; any device may write). `false` when no such row.
+    pub fn rename_device(&mut self, device_id: &str, name: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_DEVICES, device_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_DEVICES,
+            device_id,
+            OpKind::Update,
+            fields([("name", json!(name))]),
+        );
+        Ok(true)
+    }
+
+    /// A device removed from the account (Settings → Devices, from any other
+    /// device): its row tombstoned, as the edge retires a deleted Cloud
+    /// session's machine. Nothing lists or dials it after (`device_deleted`);
+    /// its chats and spaces keep their rows. The device's own engine revives
+    /// the row at its next boot (`upsert_device` is a newer write), so a
+    /// computer still signed in comes back the next time Zeron opens on it.
+    /// `false` when no such row (already gone, or never heard of).
+    pub fn delete_device(&mut self, device_id: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_DEVICES, device_id) {
+            return Ok(false);
+        }
+        self.delete_row_ops(&[(KIND_DEVICES, device_id)]);
+        Ok(true)
+    }
+
+    /// Stamp `lastSeenAt` on an existing device row (boot/shutdown only —
+    /// periodic liveness rides presence frames, never rows).
+    pub fn set_device_last_seen(
+        &mut self,
+        device_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_DEVICES, device_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_DEVICES,
+            device_id,
+            OpKind::Update,
+            fields([("lastSeenAt", json!(at.timestamp_millis()))]),
+        );
+        Ok(true)
+    }
+
+    /// Whether `id`'s device row was deleted — a tombstone, not merely an
+    /// unknown id (a Cloud session's machine leaves with its sandbox). A
+    /// device that comes back revives its row with a newer write.
+    pub fn device_deleted(&self, id: &str) -> bool {
+        self.overlay_row_or_tombstone(KIND_DEVICES, id)
+            .is_some_and(|r| r.deleted)
+    }
+
+    /// Whether `chat_id`'s row was deleted — a tombstone, not merely a chat
+    /// whose row hasn't arrived yet. Nothing brings a deleted chat back.
+    pub fn chat_deleted(&self, chat_id: &str) -> bool {
+        self.overlay_row_or_tombstone(KIND_CHATS, chat_id)
+            .is_some_and(|r| r.deleted)
+    }
+
+    pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
+        let mut devices: Vec<Device> = self
+            .read_cached::<crate::workspace::RawDevice, Device>(KIND_DEVICES, Device::from);
+        devices.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(devices)
+    }
+
+    // ── spaces ──────────────────────────────────────────────────────────────
+
+    pub fn upsert_space(&mut self, space: &Space) -> Result<(), DocError> {
+        let set = fields([
+            ("id", json!(space.id)),
+            ("deviceId", json!(space.device_id)),
+            ("path", json!(space.path)),
+            ("name", opt_str(space.name.as_deref())),
+            ("gitDetected", json!(space.git_detected)),
+            ("gitCheckedAt", opt_ms(space.git_checked_at)),
+            ("checkoutId", opt_str(space.checkout_id.as_deref())),
+            ("repositoryId", opt_str(space.repository_id.as_deref())),
+            ("githubRepo", opt_str(space.github_repo.as_deref())),
+            ("createdAt", json!(space.created_at.timestamp_millis())),
+        ]);
+        // (Its icon only when it has one: an upsert never clears a picture
+        // set meanwhile from another device.)
+        let mut set = set;
+        if let Some(icon) = &space.icon {
+            set.insert("icon".into(), json!(icon));
+        }
+        self.write(KIND_SPACES, &space.id.clone(), OpKind::Upsert, set);
+        Ok(())
+    }
+
+    /// A Space as it reads: its repository's name and icon over its own
+    /// (`repository_looks`). Sets of those two go through `rename_space` and
+    /// `set_space_icon`; never write a value read here back with `upsert_space`.
+    pub fn space(&self, space_id: &str) -> Result<Option<Space>, DocError> {
+        Ok(self.space_with_look(space_id))
+    }
+
+    pub fn read_spaces(&self) -> Result<Vec<Space>, DocError> {
+        Ok(self.spaces_with_looks())
+    }
+
+    /// LWW display-name set from any device, for every copy of its repository;
+    /// `None` clears back to the derived name (basename of path). `false` when
+    /// no such row.
+    pub fn rename_space(&mut self, space_id: &str, name: Option<&str>) -> Result<bool, DocError> {
+        Ok(self.write_look_field(space_id, "name", opt_str(name)))
+    }
+
+    /// LWW picture set from any device, for every copy of its repository, whole
+    /// (emoji, image and hue in one field); `None` clears back to the default
+    /// tile. `false` when no row.
+    pub fn set_space_icon(&mut self, space_id: &str, icon: Option<&zeron_proto::SpaceIcon>) -> Result<bool, DocError> {
+        let value = icon.map_or(Value::Null, |icon| json!(icon));
+        Ok(self.write_look_field(space_id, "icon", value))
+    }
+
+    /// Owner-stamped git presence for the space folder (ownership is asserted
+    /// by the engine layer, this is mechanism only).
+    pub fn set_space_git(
+        &mut self,
+        space_id: &str,
+        detected: bool,
+        checkout_id: Option<&str>,
+        repository_id: Option<&str>,
+        github_repo: Option<&str>,
+        checked_at: DateTime<Utc>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_SPACES, space_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_SPACES,
+            space_id,
+            OpKind::Update,
+            fields([
+                ("gitDetected", json!(detected)),
+                ("checkoutId", opt_str(checkout_id)),
+                ("repositoryId", opt_str(repository_id)),
+                ("githubRepo", opt_str(github_repo)),
+                ("gitCheckedAt", json!(checked_at.timestamp_millis())),
+            ]),
+        );
+        Ok(true)
+    }
+
+    /// Hard-delete a space and cascade to its chats: one batch tombstones the
+    /// space row and every chat/session row whose `spaceId` matches — the
+    /// server applies the batch atomically. Returns the removed chat ids so
+    /// the engine can drop local state.
+    pub fn delete_space(&mut self, space_id: &str) -> Result<DeletedSpace, DocError> {
+        let existed = self.row_exists(KIND_SPACES, space_id);
+        let chat_ids: Vec<String> = self
+            .read_chats()?
+            .into_iter()
+            .filter(|c| c.space_id.as_deref() == Some(space_id))
+            .map(|c| c.id)
+            .collect();
+        let mut keys: Vec<(&str, &str)> = Vec::with_capacity(chat_ids.len() * 2 + 1);
+        for chat_id in &chat_ids {
+            keys.push((KIND_CHATS, chat_id));
+            keys.push((KIND_SESSIONS, chat_id));
+        }
+        keys.push((KIND_SPACES, space_id));
+        self.delete_row_ops(&keys);
+        Ok(DeletedSpace { existed, chat_ids })
+    }
+
+    // ── chats ───────────────────────────────────────────────────────────────
+
+    pub fn upsert_chat(&mut self, chat: &Chat) -> Result<(), DocError> {
+        let config = match &chat.config {
+            Some(config) => serde_json::to_value(config)?,
+            None => Value::Null,
+        };
+        let set = fields([
+            ("id", json!(chat.id)),
+            ("deviceId", json!(chat.device_id)),
+            ("title", opt_str(chat.title.as_deref())),
+            ("archived", json!(chat.archived)),
+            ("cwd", opt_str(chat.cwd.as_deref())),
+            ("branch", opt_str(chat.branch.as_deref())),
+            ("checkoutId", opt_str(chat.checkout_id.as_deref())),
+            (
+                "sourceContext",
+                chat.source_context
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+            ),
+            ("config", config),
+            (
+                "lastMessagePreview",
+                opt_str(chat.last_message_preview.as_deref()),
+            ),
+            ("lastMessageAt", opt_ms(chat.last_message_at)),
+            ("createdAt", json!(chat.created_at.timestamp_millis())),
+            (
+                "harnessSessionId",
+                opt_str(chat.harness_session_id.as_deref()),
+            ),
+            (
+                "harnessSessionCwd",
+                opt_str(chat.harness_session_cwd.as_deref()),
+            ),
+            (
+                "harnessSessionHarness",
+                opt_str(chat.harness_session_harness.as_deref()),
+            ),
+            ("spaceId", opt_str(chat.space_id.as_deref())),
+            ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+            ("lastSeenAt", opt_ms(chat.last_seen_at)),
+            (
+                "roomGen",
+                chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
+            ),
+            ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+            ("childKind", opt_str(chat.child_kind.map(zeron_proto::ChildKind::as_str))),
+        ]);
+        self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
+        Ok(())
+    }
+
+    /// Claim-on-first-command row: ONLY the fields the claim actually knows
+    /// (identity, cwd, space). Absent fields carry no clocked write, so the
+    /// real `createChat` upsert — racing behind on the registry channel with
+    /// older clocks — still lands its `config`/`title` under per-field LWW
+    /// instead of losing them to `Null` deletes.
+    pub fn claim_chat(
+        &mut self,
+        chat_id: &str,
+        cwd: Option<&str>,
+        space_id: Option<&str>,
+        created_at: DateTime<Utc>,
+    ) {
+        let mut set = fields([
+            ("id", json!(chat_id)),
+            ("deviceId", json!(self.device_id())),
+            ("createdAt", json!(created_at.timestamp_millis())),
+        ]);
+        if let Some(cwd) = cwd {
+            set.insert("cwd".into(), json!(cwd));
+        }
+        if let Some(space_id) = space_id {
+            set.insert("spaceId".into(), json!(space_id));
+        }
+        self.write(KIND_CHATS, chat_id, OpKind::Upsert, set);
+    }
+
+    /// Synced seen marker (LWW) with a monotonic guard: no write when the
+    /// stored stamp is already >= `at`.
+    pub fn set_chat_seen(&mut self, chat_id: &str, at: DateTime<Utc>) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        let current = row.fields.get("lastSeenAt").and_then(Value::as_i64);
+        if current.is_some_and(|ms| ms >= at.timestamp_millis()) {
+            return Ok(true);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("lastSeenAt", json!(at.timestamp_millis()))]),
+        );
+        Ok(true)
+    }
+
+    /// A chat put to sleep until `until` (`None`: woken, its sleep cleared).
+    /// Each field is its own last write, so a sleep set on one device and an
+    /// early wake on another both land. `false` when no such row.
+    pub fn set_chat_sleep(
+        &mut self,
+        chat_id: &str,
+        until: Option<DateTime<Utc>>,
+        at: DateTime<Utc>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("sleepUntil", json!(until.map(|t| t.timestamp_millis()))),
+                ("sleptAt", json!(until.map(|_| at.timestamp_millis()))),
+                ("sleepWokeAt", Value::Null),
+            ]),
+        );
+        Ok(true)
+    }
+
+    /// A sleeping chat woken early by its host (it asked for the person, or
+    /// failed): stamped once, so the first wake is the one shown. `false`
+    /// when it isn't asleep (no row, no sleep, its time passed, or woken
+    /// already).
+    pub fn wake_chat(&mut self, chat_id: &str, at: DateTime<Utc>) -> Result<bool, DocError> {
+        let Some(sleep) = self.chat(chat_id)?.and_then(|c| c.sleep) else {
+            return Ok(false);
+        };
+        if sleep.woke_at.is_some() || sleep.until <= at {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("sleepWokeAt", json!(at.timestamp_millis()))]),
+        );
+        Ok(true)
+    }
+
+    pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, DocError> {
+        Ok(self
+            .overlay_row(KIND_CHATS, chat_id)
+            .and_then(|row| row_to::<crate::workspace::RawChat>(&row))
+            .map(Chat::from))
+    }
+
+    /// Whether `chat_id`'s row has recorded its parent: `createChat` writes
+    /// `parentChatId` either way (a null for none), a claimed row
+    /// ([`Self::claim_chat`]) doesn't.
+    pub fn chat_parent_recorded(&self, chat_id: &str) -> bool {
+        self.overlay_row(KIND_CHATS, chat_id)
+            .is_some_and(|row| row.clocks.contains_key("parentChatId"))
+    }
+
+    pub fn read_chats(&self) -> Result<Vec<Chat>, DocError> {
+        let mut chats: Vec<Chat> = self
+            .read_cached::<crate::workspace::RawChat, Chat>(KIND_CHATS, Chat::from);
+        chats.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(chats)
+    }
+
+    pub fn rename_chat(&mut self, chat_id: &str, title: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("title", json!(title))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_archived(&mut self, chat_id: &str, archived: bool) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("archived", json!(archived))]),
+        );
+        Ok(true)
+    }
+
+    /// The chat's activity times, and nothing else on its row.
+    pub fn set_chat_activity(
+        &mut self,
+        chat_id: &str,
+        last_message_at: Option<i64>,
+        created_at: Option<i64>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        let mut set = BTreeMap::new();
+        if let Some(ms) = last_message_at {
+            set.insert("lastMessageAt".to_string(), json!(ms));
+        }
+        if let Some(ms) = created_at {
+            set.insert("createdAt".to_string(), json!(ms));
+        }
+        if !set.is_empty() {
+            self.write(KIND_CHATS, chat_id, OpKind::Update, set);
+        }
+        Ok(true)
+    }
+
+    /// Re-home a chat, and nothing else on its row.
+    pub fn set_chat_host(&mut self, chat_id: &str, device_id: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("deviceId", json!(device_id))]),
+        );
+        Ok(true)
+    }
+
+    /// Flip the chat's sync room generation (docs/chat2-sync.md M2). The
+    /// host calls this in the same breath as seeding the chat2 checkpoint;
+    /// LWW per-field like every registry write, so the flip is per-chat and
+    /// instantly revertible by writing 1 back.
+    pub fn set_chat_room_gen(&mut self, chat_id: &str, room_gen: u32) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.update_changed(
+            KIND_CHATS,
+            chat_id,
+            fields([("roomGen", json!(room_gen))]),
+            same_value,
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_branch(&mut self, chat_id: &str, branch: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.update_changed(
+            KIND_CHATS,
+            chat_id,
+            fields([("branch", json!(branch))]),
+            same_value,
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_source_context(
+        &mut self,
+        chat_id: &str,
+        context: &zeron_proto::ConversationSourceContext,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        // Captured before every fresh dispatch: unchanged unless the
+        // checkout moved. `observedAt` alone moving is not a change (nothing
+        // reads it back).
+        self.update_changed(
+            KIND_CHATS,
+            chat_id,
+            fields([
+                ("sourceContext", serde_json::to_value(context)?),
+                ("branch", json!(context.branch)),
+                ("checkoutId", json!(context.checkout_id)),
+            ]),
+            |key, now, next| {
+                if key != "sourceContext" {
+                    return now == next;
+                }
+                let observed = |value: &Value| {
+                    let mut value = value.clone();
+                    if let Some(map) = value.as_object_mut() {
+                        map.remove("observedAt");
+                    }
+                    value
+                };
+                observed(now) == observed(next)
+            },
+        );
+        Ok(true)
+    }
+
+    /// Retarget the chat onto another folder — the mid-session "switch to an
+    /// existing worktree" move. Harness resume is cwd-scoped, so the next run
+    /// in the new folder starts a fresh harness conversation by design.
+    pub fn set_chat_cwd(&mut self, chat_id: &str, cwd: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.update_changed(KIND_CHATS, chat_id, fields([("cwd", json!(cwd))]), same_value);
+        Ok(true)
+    }
+
+    pub fn set_chat_checkout(
+        &mut self,
+        chat_id: &str,
+        checkout_id: &str,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.update_changed(
+            KIND_CHATS,
+            chat_id,
+            fields([("checkoutId", json!(checkout_id))]),
+            same_value,
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_config(
+        &mut self,
+        chat_id: &str,
+        config: &ChatConfig,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        let value = serde_json::to_value(config)?;
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("config", value)]),
+        );
+        Ok(true)
+    }
+
+    /// Host-side resume continuity. An empty `session_id` is the explicit
+    /// "do not resume" tombstone written after a harness rejects a resume.
+    pub fn set_chat_harness_session(
+        &mut self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        harness: Option<&str>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        // Stamped at every SessionStarted and Done, while one session
+        // usually spans many turns.
+        self.update_changed(
+            KIND_CHATS,
+            chat_id,
+            fields([
+                ("harnessSessionId", json!(session_id)),
+                ("harnessSessionCwd", json!(cwd)),
+                ("harnessSessionHarness", opt_str(harness)),
+            ]),
+            same_value,
+        );
+        Ok(true)
+    }
+
+    /// Host-side sidebar freshness: preview + timestamp of the latest message.
+    pub fn set_chat_last_message(
+        &mut self,
+        chat_id: &str,
+        preview: &str,
+        at: DateTime<Utc>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("lastMessagePreview", json!(preview)),
+                ("lastMessageAt", json!(at.timestamp_millis())),
+            ]),
+        );
+        Ok(true)
+    }
+
+    /// Tombstone: delete the chat row (and its session-status row). The
+    /// per-chat session doc remains — this removes the index entry only.
+    pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, DocError> {
+        let existed = self.row_exists(KIND_CHATS, chat_id);
+        self.delete_row_ops(&[(KIND_CHATS, chat_id), (KIND_SESSIONS, chat_id)]);
+        Ok(existed)
+    }
+
+    // ── sessions ────────────────────────────────────────────────────────────
+
+    /// Upsert a session-status row (writer discipline: each device writes only
+    /// its own runs' rows). Staleness is checked client-side via `updatedAt`.
+    pub fn upsert_session(&mut self, session: &Session) -> Result<(), DocError> {
+        let set = fields([
+            ("chatId", json!(session.chat_id)),
+            ("deviceId", json!(session.device_id)),
+            ("status", serde_json::to_value(session.status)?),
+            ("lastCompletedTurn", json!(session.last_completed_turn)),
+            ("lastTurnOutcome", json!(session.last_turn_outcome)),
+            (
+                "terminalActivity",
+                serde_json::to_value(&session.terminal_activity)?,
+            ),
+            ("startedAt", opt_ms(session.started_at)),
+            ("updatedAt", json!(session.updated_at.timestamp_millis())),
+            ("runningSubagents", json!(session.running_subagents)),
+            (
+                "backgroundTasks",
+                serde_json::to_value(&session.background_tasks)?,
+            ),
+            ("waiting", serde_json::to_value(&session.waiting)?),
+        ]);
+        self.write(KIND_SESSIONS, &session.chat_id.clone(), OpKind::Upsert, set);
+        Ok(())
+    }
+
+    pub fn read_sessions(&self) -> Result<Vec<Session>, DocError> {
+        let mut sessions: Vec<Session> = self
+            .read_cached::<crate::workspace::RawSession, Session>(KIND_SESSIONS, Session::from);
+        sessions.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        Ok(sessions)
+    }
+
+    // ── whole-doc read ──────────────────────────────────────────────────────
+
+    pub fn sidebar_preferences(&self) -> Option<SidebarPreferences> {
+        self.sidebar_pins_initialized().then(|| SidebarPreferences {
+            sections: self.sidebar_sections(),
+            pinned_session_ids: self
+                .ordered_sidebar_pins()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+        })
+    }
+
+    /// Initialize readiness and clean deleted pins from one authoritative snapshot.
+    pub fn reconcile_sidebar_pins(&mut self, authoritative: bool) -> Result<bool, DocError> {
+        if !authoritative {
+            return Ok(false);
+        }
+        let chats = self.read_chats()?;
+        self.reconcile_sidebar_pins_with(authoritative, chats.iter().map(|c| c.id.as_str()))
+    }
+
+    /// [`Self::reconcile_sidebar_pins`] with the chats already read from
+    /// this doc (`read_chats`, under the same lock): a publish reads them
+    /// for its lists anyway, and each read decodes every chat row.
+    pub fn reconcile_sidebar_pins_with<'a>(
+        &mut self,
+        authoritative: bool,
+        chat_ids: impl Iterator<Item = &'a str>,
+    ) -> Result<bool, DocError> {
+        if !authoritative {
+            return Ok(false);
+        }
+        let initialized = self.sidebar_pins_initialized();
+        self.initialize_sidebar_pins();
+        let known: std::collections::HashSet<String> = chat_ids.map(str::to_owned).collect();
+        let removed: Vec<_> = self
+            .ordered_sidebar_pins()
+            .into_iter()
+            .filter(|(id, _)| !known.contains(id))
+            .collect();
+        for (id, _) in &removed {
+            self.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+                session_id: id.clone(),
+            })?;
+        }
+        Ok(!initialized || !removed.is_empty())
+    }
+
+    pub fn read_all(&self) -> Result<WorkspaceState, DocError> {
+        Ok(WorkspaceState {
+            devices: self.read_devices()?,
+            spaces: self.read_spaces()?,
+            chats: self.read_chats()?,
+            sessions: self.read_sessions()?,
+        })
+    }
+
+    // ── migration ───────────────────────────────────────────────────────────
+
+    /// Seed from the legacy Loro workspace doc's materialized state (first
+    /// boot after the update). Every row becomes a pending upsert whose HLC
+    /// derives from the row's own newest timestamp — historical, so any
+    /// genuinely newer live write beats the migrated value; identical across
+    /// devices, so N devices seeding the same converged doc is idempotent
+    /// (equal values, deterministic device tie-break).
+    pub fn seed_from_workspace(&mut self, state: &WorkspaceState) -> Result<usize, DocError> {
+        let mut ops: Vec<RowOp> = Vec::new();
+        let mut seed = |kind: &str, id: &str, ms: i64, set: BTreeMap<String, Value>| {
+            ops.push(RowOp {
+                kind: kind.to_string(),
+                id: id.to_string(),
+                op: OpKind::Upsert,
+                set: Some(set),
+                hlc: encode_hlc(ms.max(1), 0, "migration"),
+                clocks: None,
+            });
+        };
+        for device in &state.devices {
+            let ms = newest(&[device.last_seen_at, device.created_at]);
+            seed(
+                KIND_DEVICES,
+                &device.id,
+                ms,
+                fields([
+                    ("id", json!(device.id)),
+                    ("name", json!(device.name)),
+                    ("platform", json!(device.platform)),
+                    ("lastSeenAt", opt_ms(device.last_seen_at)),
+                    ("createdAt", opt_ms(device.created_at)),
+                    ("version", opt_str(device.version.as_deref())),
+                    (
+                        "cursorSdkVersion",
+                        opt_str(device.cursor_sdk_version.as_deref()),
+                    ),
+                    ("cursorSdkEngineVersion", opt_str(device.version.as_deref())),
+                    ("capabilities", json!(device.capabilities)),
+                ]),
+            );
+        }
+        for space in &state.spaces {
+            let ms = newest(&[space.git_checked_at, Some(space.created_at)]);
+            seed(
+                KIND_SPACES,
+                &space.id,
+                ms,
+                fields([
+                    ("id", json!(space.id)),
+                    ("deviceId", json!(space.device_id)),
+                    ("path", json!(space.path)),
+                    ("name", opt_str(space.name.as_deref())),
+                    ("gitDetected", json!(space.git_detected)),
+                    ("gitCheckedAt", opt_ms(space.git_checked_at)),
+                    ("checkoutId", opt_str(space.checkout_id.as_deref())),
+                    ("repositoryId", opt_str(space.repository_id.as_deref())),
+                    ("githubRepo", opt_str(space.github_repo.as_deref())),
+                    ("createdAt", json!(space.created_at.timestamp_millis())),
+                ]),
+            );
+        }
+        for chat in &state.chats {
+            let ms = newest(&[
+                chat.last_message_at,
+                chat.last_seen_at,
+                Some(chat.created_at),
+            ]);
+            let config = match &chat.config {
+                Some(config) => serde_json::to_value(config)?,
+                None => Value::Null,
+            };
+            seed(
+                KIND_CHATS,
+                &chat.id,
+                ms,
+                fields([
+                    ("id", json!(chat.id)),
+                    ("deviceId", json!(chat.device_id)),
+                    ("title", opt_str(chat.title.as_deref())),
+                    ("archived", json!(chat.archived)),
+                    ("cwd", opt_str(chat.cwd.as_deref())),
+                    ("branch", opt_str(chat.branch.as_deref())),
+                    ("checkoutId", opt_str(chat.checkout_id.as_deref())),
+                    ("config", config),
+                    (
+                        "lastMessagePreview",
+                        opt_str(chat.last_message_preview.as_deref()),
+                    ),
+                    ("lastMessageAt", opt_ms(chat.last_message_at)),
+                    ("createdAt", json!(chat.created_at.timestamp_millis())),
+                    (
+                        "harnessSessionId",
+                        opt_str(chat.harness_session_id.as_deref()),
+                    ),
+                    (
+                        "harnessSessionCwd",
+                        opt_str(chat.harness_session_cwd.as_deref()),
+                    ),
+                    (
+                        "harnessSessionHarness",
+                        opt_str(chat.harness_session_harness.as_deref()),
+                    ),
+                    ("spaceId", opt_str(chat.space_id.as_deref())),
+                    ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+                    ("lastSeenAt", opt_ms(chat.last_seen_at)),
+                    ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+                    ("childKind", opt_str(chat.child_kind.map(zeron_proto::ChildKind::as_str))),
+                ]),
+            );
+        }
+        for session in &state.sessions {
+            let ms = newest(&[Some(session.updated_at), session.started_at]);
+            seed(
+                KIND_SESSIONS,
+                &session.chat_id,
+                ms,
+                fields([
+                    ("chatId", json!(session.chat_id)),
+                    ("deviceId", json!(session.device_id)),
+                    ("status", serde_json::to_value(session.status)?),
+                    ("lastCompletedTurn", json!(session.last_completed_turn)),
+                    ("lastTurnOutcome", json!(session.last_turn_outcome)),
+                    (
+                        "terminalActivity",
+                        serde_json::to_value(&session.terminal_activity)?,
+                    ),
+                    ("startedAt", opt_ms(session.started_at)),
+                    ("updatedAt", json!(session.updated_at.timestamp_millis())),
+                    ("runningSubagents", json!(session.running_subagents)),
+                ]),
+            );
+        }
+        let count = ops.len();
+        // Chunk so a huge legacy workspace never exceeds the server's batch cap.
+        for chunk in ops.chunks(400) {
+            self.enqueue_ops(chunk.to_vec());
+        }
+        Ok(count)
+    }
+}
+
+/// Replay `ops` (one row's, in queue order) over its authoritative state;
+/// `None` when the result is missing or a tombstone.
+fn overlay<'a>(
+    base: Option<&RegistryRow>,
+    ops: impl IntoIterator<Item = &'a RowOp>,
+) -> Option<RegistryRow> {
+    replay_row(base, ops).filter(|r| !r.deleted)
+}
+
+/// [`overlay`] keeping a tombstone (`None` only when the row is missing).
+fn replay_row<'a>(
+    base: Option<&RegistryRow>,
+    ops: impl IntoIterator<Item = &'a RowOp>,
+) -> Option<RegistryRow> {
+    let mut row = base.cloned();
+    for op in ops {
+        let (next, _) = apply_op(row.as_ref(), op);
+        if let Some(next) = next {
+            row = Some(next);
+        }
+    }
+    row
+}
+
+// ── field helpers ───────────────────────────────────────────────────────────
+
+fn fields<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, Value> {
+    entries
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
+/// Plain JSON equality, for [`RegistryDoc::update_changed`].
+fn same_value(_key: &str, now: &Value, next: &Value) -> bool {
+    now == next
+}
+
+fn opt_str(value: Option<&str>) -> Value {
+    match value {
+        Some(v) => json!(v),
+        None => Value::Null,
+    }
+}
+
+fn opt_ms(value: Option<DateTime<Utc>>) -> Value {
+    match value {
+        Some(at) => json!(at.timestamp_millis()),
+        None => Value::Null,
+    }
+}
+
+fn newest(candidates: &[Option<DateTime<Utc>>]) -> i64 {
+    candidates
+        .iter()
+        .flatten()
+        .map(|at| at.timestamp_millis())
+        .max()
+        .unwrap_or(1)
+}
+
+fn row_to<T: serde::de::DeserializeOwned>(row: &RegistryRow) -> Option<T> {
+    let value = Value::Object(row.fields.clone().into_iter().collect());
+    match serde_json::from_value::<T>(value) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            tracing::warn!(kind = %row.kind, row = %row.id, error = %err, "skipping malformed registry row");
+            None
+        }
+    }
+}
+
+// SessionStatus needs to serialize to the same strings the loro doc used
+// ("idle"/"working"/…) — zeron_proto's serde derives already use camelCase;
+// the compile-time check lives in the tests below.
+
+#[cfg(test)]
+mod tests;

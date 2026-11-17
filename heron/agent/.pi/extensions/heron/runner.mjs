@@ -79,20 +79,25 @@ if (resume) {
   prompt += `\n\n---\nThis task was already under way on another run that was cut off (its computer went offline, or the run stopped). Its log so far, newest last:\n${clip(readText("log.md"), 8000)}\n\nContinue from where it stopped: don't redo steps it finished; files it made are in your working folder.`;
 }
 
-// ---------------------------------------------------------------- the model
+// ---------------------------------------------------------------- the models
+//
+// ~/.heron/models.json lists the models that work on this computer, best
+// first (setup-computer.sh probes them). A run that fails on a limit or a
+// login error is retried on the next one.
 
-function heronModel() {
+function heronModels() {
+  if (spec.model) return [spec.model];
+  try {
+    const list = JSON.parse(fs.readFileSync(path.join(HOME, ".heron", "models.json"), "utf8"));
+    if (Array.isArray(list) && list.length) return list;
+  } catch {}
   try {
     const s = JSON.parse(fs.readFileSync(path.join(HOME, "heron", ".pi", "settings.json"), "utf8"));
-    if (s.defaultProvider && s.defaultModel) return `${s.defaultProvider}/${s.defaultModel}`;
+    if (s.defaultProvider && s.defaultModel) return [`${s.defaultProvider}/${s.defaultModel}`];
   } catch {}
-  return null;
+  return [null];
 }
-
-const args = ["-p", "--mode", "json", "--session-dir", file("session"), "--no-context-files", "--append-system-prompt", file("brief.md")];
-const model = spec.model || heronModel();
-if (model) args.push("--model", model);
-args.push("--name", `Heron task: ${spec.title}`, "--", prompt);
+const MODEL_TROUBLE = /rate.?limit|session limit|usage limit|quota|429|401|403|authenticat|expired|overloaded|subscription/i;
 
 // The chat's Zeron identity stays with the chat.
 const env = { ...process.env, HERON_THREAD_ID: spec.id || path.basename(dir) };
@@ -100,13 +105,10 @@ for (const key of Object.keys(env)) if (key.startsWith("ZERON_")) delete env[key
 
 const pi = process.env.HERON_PI || "pi";
 fs.mkdirSync(file("work"), { recursive: true });
-const child = spawn(pi, args, { cwd: file("work"), env, stdio: ["ignore", "pipe", "pipe"] });
-
 const events = fs.createWriteStream(file("events.jsonl"), { flags: "a" });
 const errors = fs.createWriteStream(file("stderr.log"), { flags: "a" });
-child.stderr.pipe(errors);
 
-let pending = "";
+let child = null;
 let lastText = "";
 let errorText = "";
 let tools = 0;
@@ -155,51 +157,80 @@ function handle(line) {
   }
 }
 
-child.stdout.on("data", (chunk) => {
-  events.write(chunk);
-  pending += chunk.toString("utf8");
-  let i;
-  while ((i = pending.indexOf("\n")) >= 0) {
-    const line = pending.slice(0, i).replace(/\r$/, "");
-    pending = pending.slice(i + 1);
-    if (line) handle(line);
-  }
-});
-
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(signal, () => {
     stopped = true;
     try {
-      child.kill("SIGTERM");
+      child?.kill("SIGTERM");
     } catch {}
   });
 }
 
-child.on("error", (err) => {
-  errorText = `Couldn't start Pi (${pi}): ${err.message}`;
-});
+/** One Pi run on `model`; resolves with its exit code. */
+function runOnce(model, text) {
+  return new Promise((resolve) => {
+    const args = ["-p", "--mode", "json", "--session-dir", file("session"), "--no-context-files", "--append-system-prompt", file("brief.md")];
+    if (model) args.push("--model", model);
+    args.push("--name", `Heron task: ${spec.title}`, "--", text);
+    errorText = "";
+    let pending = "";
+    child = spawn(pi, args, { cwd: file("work"), env, stdio: ["ignore", "pipe", "pipe"] });
+    child.stderr.on("data", (c) => errors.write(c));
+    child.stdout.on("data", (chunk) => {
+      events.write(chunk);
+      pending += chunk.toString("utf8");
+      let i;
+      while ((i = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, i).replace(/\r$/, "");
+        pending = pending.slice(i + 1);
+        if (line) handle(line);
+      }
+    });
+    child.on("error", (err) => {
+      errorText = `Couldn't start Pi (${pi}): ${err.message}`;
+    });
+    child.on("close", (code) => {
+      if (pending) handle(pending);
+      resolve(code);
+    });
+  });
+}
 
-child.on("close", (code) => {
-  if (pending) handle(pending);
-  progress(true);
-  // The lease moved on while this ran (this computer was presumed down):
-  // the new owner writes the outcome, not us.
-  const lease = read("lease.json", {});
-  if (lease.req === req && lease.attempt !== attempt) {
-    logLine(`(attempt ${attempt} on ${host} ended after the task moved to ${lease.ownerName || "another computer"})`);
-    process.exit(0);
+const stderrTail = () => {
+  try {
+    return fs.readFileSync(file("stderr.log"), "utf8").trim().split("\n").slice(-5).join("\n");
+  } catch {
+    return "";
   }
-  const state = stopped ? "stopped" : code === 0 && !errorText ? "done" : "failed";
-  let error = errorText || null;
-  if (state === "failed" && !error) {
-    const tail = fs.existsSync(file("stderr.log")) ? fs.readFileSync(file("stderr.log"), "utf8").trim().split("\n").slice(-5).join("\n") : "";
-    error = `Pi exited with code ${code}${tail ? `: ${tail}` : ""}`;
+};
+
+const models = heronModels();
+let code = 1;
+let error = null;
+for (let i = 0; i < models.length; i++) {
+  const text = i === 0 ? prompt : `${prompt}\n\n---\nAn earlier run of this task on another model stopped (${error || "model error"}). Its log so far:\n${clip(readText("log.md"), 6000)}\n\nContinue from where it stopped.`;
+  code = await runOnce(models[i], text);
+  error = errorText || (code !== 0 ? `Pi exited with code ${code}${stderrTail() ? `: ${stderrTail()}` : ""}` : null);
+  if (stopped || !error) break;
+  if (i + 1 < models.length && MODEL_TROUBLE.test(error)) {
+    logLine(`(${models[i]} failed: ${error.slice(0, 200)}; switching to ${models[i + 1]})`);
+    continue;
   }
-  fs.writeFileSync(file(`result-${req}.md`), lastText || "");
-  fs.writeFileSync(file("result.md"), lastText || "");
-  logLine(`(${state}${error ? `: ${error.slice(0, 300)}` : ""})`);
-  const now = read("status.json", {});
-  write("status.json", { ...now, state, req, attempt, host, exitCode: code, error, endedAt: Date.now(), pid: null });
-  events.end();
-  errors.end();
-});
+  break;
+}
+
+progress(true);
+// The lease moved on while this ran (this computer was presumed down):
+// the new owner writes the outcome, not us.
+const lease = read("lease.json", {});
+if (lease.req === req && lease.attempt !== attempt) {
+  logLine(`(attempt ${attempt} on ${host} ended after the task moved to ${lease.ownerName || "another computer"})`);
+  process.exit(0);
+}
+const state = stopped ? "stopped" : error ? "failed" : "done";
+fs.writeFileSync(file(`result-${req}.md`), lastText || "");
+fs.writeFileSync(file("result.md"), lastText || "");
+logLine(`(${state}${error ? `: ${error.slice(0, 300)}` : ""})`);
+write("status.json", { ...read("status.json", {}), state, req, attempt, host, exitCode: code, error: stopped ? null : error, endedAt: Date.now(), pid: null });
+events.end();
+errors.end();

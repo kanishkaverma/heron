@@ -52,15 +52,19 @@ ls -la "$DEST" "$DEST/.pi/extensions/heron"
 
 echo "== Heron's model here"
 PI="$(command -v pi || echo "$HOME/.local/bin/pi")"
-if [ ! -f "$DEST/.pi/settings.json" ] || [ -n "${HERON_REPROBE:-}" ]; then
-  for model in ${HERON_MODELS:-claude-bridge/claude-opus-5-5 anthropic/claude-opus-5-5 openai-codex/gpt-6.1-sol}; do
-    out="$(cd /tmp && timeout 90 "$PI" -p --no-session --model "$model" "Reply with just: ok" 2>/dev/null || true)"
-    if grep -qi '^ok' <<<"$out"; then
-      printf '{\n  "defaultProvider": "%s",\n  "defaultModel": "%s"\n}\n' "${model%%/*}" "${model#*/}" > "$DEST/.pi/settings.json"
-      break
-    fi
-  done
+# Every model that answers here, best first: ~/.heron/models.json (Heron and
+# its tasks fall back down the list on a limit or a login error).
+working=()
+for model in ${HERON_MODELS:-claude-bridge/claude-opus-5-5 anthropic/claude-opus-5-5 openai-codex/gpt-6.1-sol openai/gpt-6.1-sol}; do
+  out="$(cd /tmp && timeout 90 "$PI" -p --no-session --model "$model" "Reply with just: ok" 2>/dev/null || true)"
+  if grep -qi '^ok' <<<"$out"; then working+=("$model"); fi
+done
+if [ "${#working[@]}" -gt 0 ]; then
+  printf '%s\n' "${working[@]}" | python3 -c 'import json,sys; json.dump([l.strip() for l in sys.stdin if l.strip()], open(sys.argv[1],"w"), indent=1)' "$HOME/.heron/models.json"
+  first="${working[0]}"
+  printf '{\n  "defaultProvider": "%s",\n  "defaultModel": "%s"\n}\n' "${first%%/*}" "${first#*/}" > "$DEST/.pi/settings.json"
 fi
+cat "$HOME/.heron/models.json" 2>/dev/null
 cat "$DEST/.pi/settings.json" 2>/dev/null || echo "No working model found: Heron will use Pi's default here."
 
 echo "== heron-keeper"

@@ -22,6 +22,7 @@ the two writes. Logs to stdout (one line per decision).
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,15 +128,74 @@ setTimeout(() => process.exit(2), 15000);
 
 # ---------------------------------------------------------------- decisions
 
-def heron_model():
-    """This computer's Heron model: ~/heron/.pi/settings.json, provider/id."""
+MODELS = os.path.join(HOME, ".heron", "models.json")        # working models here, best first
+MODEL_STATE = os.path.join(HOME, ".heron", "model-state.json")  # {"index", "until"}: a fallback in use
+MODEL_TROUBLE = re.compile(r"rate.?limit|session limit|usage limit|quota|429|401|403|authenticat|expired|overloaded|subscription", re.I)
+FALLBACK_SECS = 3600
+
+
+def heron_models():
+    try:
+        lst = json.load(open(MODELS))
+        if isinstance(lst, list) and lst:
+            return lst
+    except Exception:
+        pass
     try:
         s = json.load(open(os.path.join(HOME, "heron", ".pi", "settings.json")))
         if s.get("defaultProvider") and s.get("defaultModel"):
-            return f"{s['defaultProvider']}/{s['defaultModel']}"
+            return [f"{s['defaultProvider']}/{s['defaultModel']}"]
     except Exception:
         pass
-    return None
+    return []
+
+
+def heron_model():
+    """The model Heron's chat uses here: the first that works, or the
+    fallback switched to after a limit (for an hour)."""
+    models = heron_models()
+    if not models:
+        return None
+    try:
+        st = json.load(open(MODEL_STATE))
+        if st.get("until", 0) > time.time():
+            return models[st.get("index", 0) % len(models)]
+    except Exception:
+        pass
+    return models[0]
+
+
+def fall_back(mcp, chat):
+    """The chat's last reply failed on a limit or a login: switch to the next
+    working model for an hour and have Heron redo the request."""
+    if chat.get("sessionStatus") != "errored":
+        return
+    models = heron_models()
+    if len(models) < 2:
+        return
+    msgs = mcp.tool("read_chat", {"chat": chat["id"], "limit": 3}).get("messages", [])
+    bad = next((m for m in reversed(msgs) if m.get("role") == "assistant" and m.get("errors")), None)
+    if not bad or not MODEL_TROUBLE.search(" ".join(bad["errors"])):
+        return
+    try:
+        st = json.load(open(MODEL_STATE))
+    except Exception:
+        st = {}
+    if st.get("handled") == bad["id"]:
+        return
+    current = chat.get("model")
+    index = (models.index(current) + 1) % len(models) if current in models else 1
+    json.dump({"index": index, "until": time.time() + FALLBACK_SECS, "handled": bad["id"]}, open(MODEL_STATE, "w"))
+    set_model(mcp, chat, models[index])
+    mcp.tool("send_message", {"chat": chat["id"], "text": f"\u27f3 {current} hit a limit; now on {models[index]}. Please redo my last request."})
+    log(f"model trouble on {current}: switched {chat['id'][:8]} to {models[index]}")
+
+
+def set_model(mcp, chat, want):
+    full = mcp.tool("get_chat", {"chat": chat["id"]})
+    ipc("Mutate", {"op": "setChatConfig", "chatId": chat["id"], "config": {
+        "harness": full.get("harness") or "pi", "model": want, "reasoning": full.get("reasoning"),
+        "modelOptions": {}, "sandbox": "danger-full-access"}})
 
 
 def iso_age(ts):
@@ -413,17 +473,23 @@ def keep_chat(mcp, cfg, devices, me, online):
             return
         host = next((d for d in devices if d["id"] == chat["deviceId"]), None)
         if chat["deviceId"] == me["id"]:
+            fall_back(mcp, chat)
             nudge_for_reports(mcp, chat)
             want = heron_model()
             if want and chat.get("model") != want:
-                full = mcp.tool("get_chat", {"chat": chat["id"]})
-                cfg_now = {"harness": full.get("harness") or "pi", "model": want,
-                           "reasoning": full.get("reasoning"), "modelOptions": {},
-                           "sandbox": "danger-full-access"}
-                ipc("Mutate", {"op": "setChatConfig", "chatId": chat["id"], "config": cfg_now})
+                set_model(mcp, chat, want)
                 log(f"model {chat.get('model')} -> {want} on {chat['id'][:8]}")
             return
         if host and online(host):
+            # Fail back: the chat is on a lower-priority computer (it took
+            # over while this one was down), this is the first online one, and
+            # the chat has been quiet for a while: bring it home.
+            order = [d["id"] for name in cfg["priority"] for d in devices if d["name"] == name and online(d)]
+            quiet = (chat.get("sessionStatus") or "idle") not in ("working", "awaitingInput") \
+                and iso_age(chat.get("lastMessageAt")) > cfg.get("failback_quiet_secs", 600)
+            if order and order[0] == me["id"] and host["id"] in order and quiet:
+                ipc("Mutate", {"op": "setChatHost", "chatId": chat["id"], "deviceId": me["id"]})
+                log(f"took {chat['id'][:8]} back from {host['name']} (quiet, this computer is preferred)")
             return
         # The host is gone: the first online computer in priority order takes over.
         names = {d["name"]: d for d in devices}

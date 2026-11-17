@@ -822,7 +822,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         renderEmptyNotice(c.emptyNotice)
         composer.running = c.running
         composer.canSteer = c.canSteer
-        composer.placeholder = c.placeholder
+        composer.placeholder = Heron.enabled ? "Message Heron" : c.placeholder
         composer.chips = c.chips
         composer.chipMenus = Dictionary(uniqueKeysWithValues: c.chips.map { chip in
             (chip.id, { [weak self] in self?.source.chipMenu(chip.id) })

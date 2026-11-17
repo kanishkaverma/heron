@@ -1156,18 +1156,17 @@ extension SessionViewController {
         return row.deviceOnline ? "on \(name)" : "\(name) is offline"
     }
 
-    /// Heron's ⋯: which computer it lives on, the transcript, signing out.
+    /// Heron's ⋯: where it's running now (computers take over from each
+    /// other on their own), the transcript, signing out.
     fileprivate func heronMenu() -> UIMenu {
         UIMenu(title: "", children: [UIDeferredMenuElement.uncached { [weak self] done in
             guard let self else { return done([]) }
             let current = self.app.row(self.chatId)?.deviceId
             let computers = self.app.hostOptions.map { host in
-                UIAction(title: host.name, subtitle: host.online ? "Online" : "Offline", image: UIImage(systemName: "laptopcomputer"), state: host.id == current ? .on : .off) { [weak self] _ in
-                    self?.heronRoot?.switchComputer(to: host.id)
-                }
+                UIAction(title: host.name, subtitle: host.id == current ? "Running Heron" : (host.online ? "Online · standing by" : "Offline"), image: UIImage(systemName: "laptopcomputer"), attributes: .disabled, state: host.id == current ? .on : .off) { _ in }
             }
             done([
-                UIMenu(title: "Computer", image: UIImage(systemName: "laptopcomputer"), children: computers),
+                UIMenu(title: "Computers", image: UIImage(systemName: "laptopcomputer"), children: computers),
                 UIAction(title: "Copy Transcript", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in
                     guard let self else { return }
                     UIPasteboard.general.string = self.engine.frame().plainText()

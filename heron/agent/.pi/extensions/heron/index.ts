@@ -17,6 +17,10 @@ import os from "node:os";
 import path from "node:path";
 
 const HOME = os.homedir();
+// Heron's memory: its own OptMem store, synced across the Heron computers
+// (Syncthing), separate from any other OptMem memory on the machine. Every
+// command the agent runs inherits this.
+process.env.MEMORY_DIR = process.env.HERON_MEMORY_DIR || path.join(HOME, ".heron", "memory");
 const ROOT = process.env.HERON_THREADS_DIR || path.join(HOME, ".heron", "threads");
 const HERE = (() => {
   try {
@@ -262,6 +266,104 @@ function finishedUnreported(sessionFile) {
   });
 }
 
+// ---------------------------------------------------------------- catch-up
+//
+// The Heron chat can move between computers (heron-keeper takes it over when
+// its computer goes offline). The new computer's Pi starts a fresh session,
+// so the first run there reads the chat's earlier messages from Zeron (every
+// computer has the synced transcript) and gets them as context.
+
+const CATCHUP_MESSAGES = 40;
+const CATCHUP_CHARS = 16000;
+
+function zeronMcp() {
+  try {
+    const config = JSON.parse(process.env.ZERON_PI_MCP || "");
+    return config?.command ? config : null;
+  } catch {
+    return null;
+  }
+}
+
+/** One Zeron MCP tool call through a short-lived `zeron mcp`. */
+function zeronTool(config, name, args, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(config.command, config.args || [], {
+      env: { ...process.env, ...(config.env || {}) },
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let buf = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("zeron mcp timed out"));
+    }, timeoutMs);
+    const send = (msg) => child.stdin.write(JSON.stringify(msg) + "\n");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.id === 1) {
+          send({ jsonrpc: "2.0", method: "notifications/initialized" });
+          send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: args } });
+        } else if (msg.id === 2) {
+          clearTimeout(timer);
+          child.kill();
+          if (msg.error) return reject(new Error(JSON.stringify(msg.error)));
+          const text = (msg.result?.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
+          try {
+            resolve(JSON.parse(text));
+          } catch {
+            resolve(text);
+          }
+        }
+      }
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "heron", version: "1" } } });
+  });
+}
+
+/** The chat's earlier messages as context, or null when there are none. */
+async function catchUp(prompt, sinceMs = 0) {
+  const config = zeronMcp();
+  const chat = config?.env?.ZERON_CHAT_ID;
+  if (!chat) return null;
+  const read = await zeronTool(config, "read_chat", { chat, limit: CATCHUP_MESSAGES, include_tools: false });
+  // Only what this session hasn't seen: messages after its last entry
+  // (all of them for a fresh session).
+  const messages = (read?.messages || []).filter((m) => (m.text || "").trim() && (m.createdAt || 0) > sinceMs);
+  // The newest user message is the one this run is answering.
+  const last = messages[messages.length - 1];
+  if (last && last.role === "user" && (!prompt || prompt.includes(last.text.trim().slice(0, 200)) || last.text.includes(String(prompt).trim().slice(0, 200)))) {
+    messages.pop();
+  }
+  if (!messages.length) return null;
+  const lines = [];
+  let total = 0;
+  for (const m of messages.slice().reverse()) {
+    const who = m.role === "user" ? "Person" : "Heron (you)";
+    let t = m.text.trim();
+    if (t.length > 1500) t = `${t.slice(0, 1500)} […]`;
+    const line = `${who} (${m.createdAtIso || ""}): ${t}`;
+    if (total + line.length > CATCHUP_CHARS) break;
+    lines.unshift(line);
+    total += line.length;
+  }
+  const how = sinceMs ? "your session here is missing its latest messages" : "your session here started fresh";
+  return `[Heron catch-up] This chat ran on another computer and has moved to this one (${os.hostname()}); ${how}. These are the messages you haven't seen, oldest first, from the chat's synced transcript. Carry on from them; don't mention the move unless asked.\n\n${lines.join("\n\n")}`;
+}
+
 // ---------------------------------------------------------------- extension
 
 export default function heron(pi) {
@@ -270,6 +372,12 @@ export default function heron(pi) {
   let ctxRef = null;
   /** Reports found when this process started: they ride along with the next run. */
   let carried = [];
+  /** First run of this process: catch up on messages from other computers. */
+  let catchUpPending = false;
+  /** When this session last saw a message (0: never). */
+  let sessionSeenMs = 0;
+  /** Messages from other computers, kept in the prompt (see before_agent_start). */
+  let catchUpSection = null;
 
   const sessionOf = (ctx) => {
     try {
@@ -311,6 +419,17 @@ export default function heron(pi) {
     // Reports that finished while no Heron process was up go out with the
     // next run (most likely the message that brought this process up).
     carried = finishedUnreported(sessionFile).map((t) => t.id);
+    try {
+      const entries = ctx.sessionManager?.getEntries?.() || [];
+      sessionSeenMs = entries
+        .filter((e) => e.type === "message")
+        .reduce((max, e) => Math.max(max, Date.parse(e.timestamp || "") || 0), 0);
+      const saved = entries.filter((e) => e.type === "custom" && e.customType === "heron-catchup").pop();
+      catchUpSection = saved?.data?.text || null;
+      catchUpPending = Boolean(zeronMcp()?.env?.ZERON_CHAT_ID);
+    } catch {
+      catchUpPending = false;
+    }
     startWatching();
   });
 
@@ -321,22 +440,37 @@ export default function heron(pi) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     ctxRef = ctx;
-    if (!carried.length) return;
-    const ids = carried;
-    carried = [];
-    const reports = [];
-    for (const id of ids) {
-      const t = allThreads().find((x) => x.id === id);
-      if (t && claim(t)) reports.push(report({ ...t, status: readJson(path.join(t.dir, "status.json"), t.status) }));
+    // Catch-up rides in a prompt section (an extra message here would
+    // scramble the host's transcript), saved in the session so a restarted
+    // process keeps it.
+    if (catchUpPending && event.messageType !== "custom") {
+      catchUpPending = false;
+      try {
+        const fresh = await catchUp(event.prompt, sessionSeenMs);
+        if (fresh) {
+          catchUpSection = (catchUpSection ? `${catchUpSection}\n\n${fresh}` : fresh).slice(-CATCHUP_CHARS * 2);
+          pi.appendEntry("heron-catchup", { text: catchUpSection });
+        }
+      } catch {}
     }
-    if (!reports.length) return;
-    return {
-      message: {
-        customType: "heron-thread",
-        content: `While you were away, ${reports.length === 1 ? "a background thread" : `${reports.length} background threads`} finished:\n\n${reports.join("\n\n---\n\n")}`,
-        display: false,
-      },
-    };
+    if (catchUpSection && event.systemPromptOptions?.sections) {
+      event.systemPromptOptions.sections.heron_catchup = catchUpSection;
+    }
+    // Reports that finished while no Heron process was up: delivered after
+    // this run, the same way a live thread's report is.
+    if (carried.length) {
+      const ids = carried;
+      carried = [];
+      for (const id of ids) {
+        const t = allThreads().find((x) => x.id === id);
+        if (t && claim(t)) {
+          pi.sendMessage(
+            { customType: "heron-thread", content: report({ ...t, status: readJson(path.join(t.dir, "status.json"), t.status) }), display: false, details: { thread: t.id } },
+            { triggerTurn: true, deliverAs: "followUp" },
+          );
+        }
+      }
+    }
   });
 
   pi.registerTool({

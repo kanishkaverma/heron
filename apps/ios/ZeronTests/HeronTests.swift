@@ -1,78 +1,54 @@
 import XCTest
 @testable import Zeron
 
-/// How Heron finds its one chat: which computer, which folder, which chat,
-/// and when to make them.
+/// How Heron finds its one chat, wherever it runs.
 final class HeronTests: XCTestCase {
     private typealias D = HeronWorld.Device
-    private typealias P = HeronWorld.Project
     private typealias C = HeronWorld.Chat
 
     private let air = D(id: "dev-air", name: "air", online: true)
-    private let mac = D(id: "dev-mac", name: "MacBook Pro", online: false)
+    private let zeph = D(id: "dev-zeph", name: "zeph", online: false)
 
-    private func chat(_ id: String, title: String = "Heron", project: String? = "p-heron", device: String = "dev-air",
+    private func chat(_ id: String, title: String = "Heron", cwd: String? = "~/heron", device: String = "dev-air",
                       parent: String? = nil, archived: Bool = false, created: Int64 = 1) -> C {
-        C(id: id, title: title, projectId: project, deviceId: device, parentId: parent, archived: archived, createdAtMs: created)
+        C(id: id, title: title, cwd: cwd, deviceId: device, parentId: parent, archived: archived, createdAtMs: created)
     }
-
-    private let heronProject = P(id: "p-heron", path: "/Users/me/heron", deviceId: "dev-air")
 
     func testWaitsForTheWorkspace() {
-        let world = HeronWorld(synced: false, devices: [air], projects: [], chats: [])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: nil, savedChat: nil), .waitForSync)
+        XCTAssertEqual(HeronStep.next(HeronWorld(synced: false, devices: [air], chats: []), savedChat: nil), .waitForSync)
     }
 
-    func testAsksWhichComputerWhenThereAreSeveral() {
-        let world = HeronWorld(synced: true, devices: [air, mac], projects: [], chats: [])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: nil, savedChat: nil), .pickComputer([air, mac]))
-        // A remembered computer that's gone asks again.
-        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-gone", savedChat: nil), .pickComputer([air, mac]))
+    /// No chat yet: a computer's heron-keeper makes it; the app says whether one is up.
+    func testWaitsForAComputerToMakeTheChat() {
+        XCTAssertEqual(HeronStep.next(HeronWorld(synced: true, devices: [air, zeph], chats: []), savedChat: nil), .waitForChat(online: true))
+        XCTAssertEqual(HeronStep.next(HeronWorld(synced: true, devices: [zeph], chats: []), savedChat: nil), .waitForChat(online: false))
     }
 
-    /// Even one computer is asked about: right after signing in the list may
-    /// still be arriving.
-    func testAsksEvenWithOneComputer() {
-        let world = HeronWorld(synced: true, devices: [air], projects: [], chats: [])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: nil, savedChat: nil), .pickComputer([air]))
-        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: nil), .createProject(deviceId: "dev-air"))
+    /// The chat is the same one whichever computer runs it now.
+    func testFollowsTheChatToAnotherComputer() {
+        let world = HeronWorld(synced: true, devices: [air, zeph], chats: [chat("c-heron", device: "dev-zeph")])
+        XCTAssertEqual(HeronStep.next(world, savedChat: "c-heron"), .open(chatId: "c-heron", deviceId: "dev-zeph", unarchive: false))
     }
 
-    func testMakesTheChatInTheHeronFolder() {
-        let other = P(id: "p-code", path: "/Users/me/code", deviceId: "dev-air")
-        let world = HeronWorld(synced: true, devices: [air, mac], projects: [other, heronProject],
-                               chats: [chat("c-code", title: "Fix the build", project: "p-code")])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: nil), .createChat(projectId: "p-heron", deviceId: "dev-air"))
-    }
-
-    func testOpensTheRememberedChat() {
-        let world = HeronWorld(synced: true, devices: [air, mac], projects: [heronProject],
-                               chats: [chat("c-old", created: 1), chat("c-mine", created: 5)])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: "c-mine"), .open(chatId: "c-mine", deviceId: "dev-air", unarchive: false))
-    }
-
-    /// A reinstall (nothing remembered) finds the chat that's already there,
-    /// never a subagent's or a side chat's, and brings an archived one back.
-    func testFindsTheExistingChatAfterAReinstall() {
-        let world = HeronWorld(synced: true, devices: [air], projects: [heronProject], chats: [
-            chat("c-sub", title: "Background: inbox triage", parent: "c-heron", created: 9),
-            chat("c-other", title: "Something else", created: 0),
-            chat("c-heron", archived: true, created: 3),
+    /// Only the top-level chat in ~/heron titled Heron counts; the original
+    /// (oldest) wins, live before archived.
+    func testPicksTheOneHeronChat() {
+        let world = HeronWorld(synced: true, devices: [air], chats: [
+            chat("c-sub", parent: "c-heron", created: 0),
+            chat("c-code", title: "Fix the build", cwd: "~/code", created: 0),
+            chat("c-legacy", cwd: "/Users/me/heron", created: 0),
+            chat("c-old-archived", archived: true, created: 1),
+            chat("c-heron", created: 5),
+            chat("c-newer", created: 9),
         ])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: nil), .open(chatId: "c-heron", deviceId: "dev-air", unarchive: true))
+        XCTAssertEqual(HeronStep.next(world, savedChat: nil), .open(chatId: "c-heron", deviceId: "dev-air", unarchive: false))
+        XCTAssertEqual(HeronStep.next(world, savedChat: "c-newer"), .open(chatId: "c-newer", deviceId: "dev-air", unarchive: false))
+        XCTAssertEqual(HeronStep.next(world, savedChat: "c-code"), .open(chatId: "c-heron", deviceId: "dev-air", unarchive: false))
     }
 
-    func testChatsOnAnotherComputerDontCount() {
-        let macProject = P(id: "p-mac-heron", path: "/Users/me/heron/", deviceId: "dev-mac")
-        let world = HeronWorld(synced: true, devices: [air, mac], projects: [macProject, heronProject],
-                               chats: [chat("c-mac", project: "p-mac-heron", device: "dev-mac")])
-        XCTAssertEqual(HeronStep.next(world, savedDevice: "dev-air", savedChat: "c-mac"), .createChat(projectId: "p-heron", deviceId: "dev-air"))
-    }
-
-    func testPinsTheFirstOfferedPreferredModel() {
-        XCTAssertEqual(Heron.pick(from: ["anthropic/claude-opus-5-5", "claude-bridge/claude-opus-5-5"]), "claude-bridge/claude-opus-5-5")
-        XCTAssertEqual(Heron.pick(from: ["openai/gpt-5", "anthropic/claude-opus-5-5"]), "anthropic/claude-opus-5-5")
-        XCTAssertNil(Heron.pick(from: ["openai/gpt-5"]))
+    func testBringsBackAnArchivedHeron() {
+        let world = HeronWorld(synced: true, devices: [air], chats: [chat("c-heron", archived: true)])
+        XCTAssertEqual(HeronStep.next(world, savedChat: nil), .open(chatId: "c-heron", deviceId: "dev-air", unarchive: true))
     }
 
     func testHeronFolderPaths() {

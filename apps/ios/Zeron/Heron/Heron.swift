@@ -19,51 +19,12 @@ enum Heron {
     /// The agent harness. The folder's AGENTS.md and Pi extension make it Heron.
     static let harness = "pi"
 
-    /// The models Heron runs on, best first; the first one the computer
-    /// offers is pinned on the chat. Left to itself the chat inherits
-    /// whatever Pi reports (a bare model id that can resolve to a provider
-    /// whose login has lapsed on that computer).
-    static let preferredModels = [
-        "claude-bridge/claude-opus-5-5",
-        "anthropic/claude-opus-5-5",
-        "claude-bridge/claude-opus-5",
-        "anthropic/claude-opus-5",
-    ]
+    // MARK: Remembered (this phone)
 
-    /// The model to pin, from what the computer offers (nil: leave it).
-    static func pick(from offered: [String]) -> String? {
-        preferredModels.first { offered.contains($0) }
-    }
-
-    // MARK: Remembered choices (this phone)
-
-    private static let deviceKey = "heron.deviceId"
-
-    /// The computer Heron runs on.
-    static var deviceId: String? {
-        get { UserDefaults.standard.string(forKey: deviceKey) }
-        set { UserDefaults.standard.set(newValue, forKey: deviceKey) }
-    }
-
-    static func chatId(on device: String) -> String? {
-        UserDefaults.standard.string(forKey: "heron.chat.\(device)")
-    }
-
-    static func setChatId(_ id: String?, on device: String) {
-        UserDefaults.standard.set(id, forKey: "heron.chat.\(device)")
-    }
-
-    /// A computer named on launch (`-heron-computer <name or id>`): set up
-    /// installs pick the computer without a tap.
-    static var launchComputer: String? {
-        let args = ProcessInfo.processInfo.arguments
-        guard let i = args.firstIndex(of: "-heron-computer"), i + 1 < args.count else { return nil }
-        return args[i + 1]
-    }
-
-    static func forget() {
-        if let device = deviceId { setChatId(nil, on: device) }
-        deviceId = nil
+    /// The Heron chat this phone last opened.
+    static var chatId: String? {
+        get { UserDefaults.standard.string(forKey: "heron.chatId") }
+        set { UserDefaults.standard.set(newValue, forKey: "heron.chatId") }
     }
 
     /// Whether `path` is a Heron folder (`…/heron`).
@@ -89,16 +50,10 @@ struct HeronWorld: Equatable {
         let online: Bool
     }
 
-    struct Project: Equatable {
-        let id: String
-        let path: String
-        let deviceId: String
-    }
-
     struct Chat: Equatable {
         let id: String
         let title: String
-        let projectId: String?
+        let cwd: String?
         let deviceId: String
         let parentId: String?
         let archived: Bool
@@ -109,7 +64,6 @@ struct HeronWorld: Equatable {
     var synced: Bool
     /// Computers that can run agents.
     var devices: [Device]
-    var projects: [Project]
     /// Every chat, archived ones included.
     var chats: [Chat]
 }
@@ -118,47 +72,29 @@ struct HeronWorld: Equatable {
 enum HeronStep: Equatable {
     /// The workspace hasn't arrived yet.
     case waitForSync
-    /// No computer chosen (or the chosen one is gone): ask which.
-    case pickComputer([HeronWorld.Device])
-    /// The chat exists: open it (bringing it back first if it was archived).
+    /// No Heron chat yet: the computers' heron-keeper makes one. `online`:
+    /// whether any computer is up to do it.
+    case waitForChat(online: Bool)
+    /// Open it (bringing it back first if it was archived).
     case open(chatId: String, deviceId: String, unarchive: Bool)
-    /// The Heron folder is a project there, but there's no chat yet.
-    case createChat(projectId: String, deviceId: String)
-    /// The computer has no Heron project yet.
-    case createProject(deviceId: String)
 
-    /// Decide from what's known. `savedDevice`/`savedChat` are this phone's
-    /// remembered choices.
-    static func next(_ world: HeronWorld, savedDevice: String?, savedChat: String?) -> HeronStep {
+    /// The Heron chat is the one conversation, wherever it runs: top-level,
+    /// working in `~/heron` (which every Heron computer has), titled Heron.
+    /// heron-keeper moves it to an online computer when its own goes down.
+    static func isHeronChat(_ c: HeronWorld.Chat) -> Bool {
+        c.parentId == nil && c.title == Heron.chatTitle && ["~/heron", "~/heron/"].contains(c.cwd ?? "")
+    }
+
+    static func next(_ world: HeronWorld, savedChat: String?) -> HeronStep {
         guard world.synced else { return .waitForSync }
-        // Never picked for you: the device list fills in over a moment after
-        // signing in, so "only one computer" can be a list still arriving.
-        guard let device = savedDevice, world.devices.contains(where: { $0.id == device }) else {
-            return .pickComputer(world.devices)
+        let herons = world.chats.filter(isHeronChat)
+        // The one this phone opened before, while it's still a Heron chat;
+        // otherwise the live one first, the oldest (the original) first.
+        let pick = herons.first { $0.id == savedChat && !$0.archived }
+            ?? herons.sorted { ($0.archived ? 1 : 0, $0.createdAtMs) < ($1.archived ? 1 : 0, $1.createdAtMs) }.first
+        guard let chat = pick else {
+            return .waitForChat(online: world.devices.contains(where: \.online))
         }
-        // The chat this phone made or opened before.
-        if let saved = savedChat, let chat = world.chats.first(where: { $0.id == saved && $0.deviceId == device && $0.parentId == nil }) {
-            return .open(chatId: chat.id, deviceId: device, unarchive: chat.archived)
-        }
-        let projects = world.projects.filter { $0.deviceId == device && Heron.isHeronFolder($0.path) }
-        let projectIds = Set(projects.map(\.id))
-        // Another phone's (or a reinstall's) Heron chat in that folder:
-        // titled Heron first, then any top-level chat there; live before
-        // archived; the oldest — the original — first.
-        let candidates = world.chats.filter { chat in
-            chat.deviceId == device && chat.parentId == nil && chat.projectId.map(projectIds.contains) == true
-        }
-        let best = candidates.sorted { a, b in
-            let ka = (a.title == Heron.chatTitle ? 0 : 1, a.archived ? 1 : 0, a.createdAtMs)
-            let kb = (b.title == Heron.chatTitle ? 0 : 1, b.archived ? 1 : 0, b.createdAtMs)
-            return ka < kb
-        }.first
-        if let best {
-            return .open(chatId: best.id, deviceId: device, unarchive: best.archived)
-        }
-        if let project = projects.first {
-            return .createChat(projectId: project.id, deviceId: device)
-        }
-        return .createProject(deviceId: device)
+        return .open(chatId: chat.id, deviceId: chat.deviceId, unarchive: chat.archived)
     }
 }

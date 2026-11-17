@@ -10,6 +10,10 @@
 # - lets Zeron keep an idle chat's agent up for 12 h instead of 30 min, so a
 #   background thread's report can wake the Heron chat hours later
 #   (ZERON_SESSION_IDLE_MS on the Zeron engine; restarts the engine)
+# - picks the model Heron runs on here (the first that answers, best first)
+#   into ~/heron/.pi/settings.json
+# - installs heron-keeper (launchd / systemd user service): takes the Heron
+#   chat over when the computer it's on goes offline
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -46,6 +50,66 @@ if not any(v and (dest == k or dest.startswith(k.rstrip("/") + "/")) for k, v in
 PY
 ls -la "$DEST" "$DEST/.pi/extensions/heron"
 
+echo "== Heron's model here"
+PI="$(command -v pi || echo "$HOME/.local/bin/pi")"
+if [ ! -f "$DEST/.pi/settings.json" ] || [ -n "${HERON_REPROBE:-}" ]; then
+  for model in ${HERON_MODELS:-claude-bridge/claude-opus-5-5 anthropic/claude-opus-5-5 openai-codex/gpt-6.1-sol}; do
+    out="$(cd /tmp && timeout 90 "$PI" -p --no-session --model "$model" "Reply with just: ok" 2>/dev/null || true)"
+    if grep -qi '^ok' <<<"$out"; then
+      printf '{\n  "defaultProvider": "%s",\n  "defaultModel": "%s"\n}\n' "${model%%/*}" "${model#*/}" > "$DEST/.pi/settings.json"
+      break
+    fi
+  done
+fi
+cat "$DEST/.pi/settings.json" 2>/dev/null || echo "No working model found: Heron will use Pi's default here."
+
+echo "== heron-keeper"
+cp "$HERE/heron/keeper/heron-keeper.py" "$HOME/.heron/heron-keeper.py"
+NODE_DIR="$(dirname "$(command -v node || echo /opt/homebrew/bin/node)")"
+case "$(uname)" in
+  Darwin)
+    kplist="$HOME/Library/LaunchAgents/com.kanishkaverma.heron-keeper.plist"
+    cat > "$kplist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.kanishkaverma.heron-keeper</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>$HOME/.heron/heron-keeper.py</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$NODE_DIR:/opt/homebrew/bin:$HOME/.local/bin:/usr/bin:/bin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/.heron/keeper.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.heron/keeper.log</string>
+</dict></plist>
+PLIST
+    launchctl bootout "gui/$(id -u)/com.kanishkaverma.heron-keeper" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$kplist"
+    ;;
+  Linux)
+    mkdir -p "$HOME/.config/systemd/user"
+    cat > "$HOME/.config/systemd/user/heron-keeper.service" <<UNIT
+[Unit]
+Description=Heron keeper: keeps the Heron chat on an online computer
+After=network-online.target
+
+[Service]
+Environment=PATH=$NODE_DIR:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 $HOME/.heron/heron-keeper.py
+Restart=always
+RestartSec=10
+StandardOutput=append:$HOME/.heron/keeper.log
+StandardError=append:$HOME/.heron/keeper.log
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now heron-keeper.service
+    systemctl --user restart heron-keeper.service
+    ;;
+esac
+sleep 2; tail -2 "$HOME/.heron/keeper.log" 2>/dev/null || true
+
 echo "== Zeron idle window: ${IDLE_MS} ms"
 case "$(uname)" in
   Darwin)
@@ -63,7 +127,7 @@ case "$(uname)" in
     fi
     ;;
   Linux)
-    unit="$(systemctl --user list-unit-files 2>/dev/null | awk '/zeron/ {print $1; exit}')"
+    unit="$( (systemctl --user list-unit-files 2>/dev/null || true) | awk '/^zeron/ {print $1}' | head -1 || true)"
     if [ -n "$unit" ]; then
       mkdir -p "$HOME/.config/systemd/user/$unit.d"
       printf '[Service]\nEnvironment=ZERON_SESSION_IDLE_MS=%s\n' "$IDLE_MS" > "$HOME/.config/systemd/user/$unit.d/heron.conf"

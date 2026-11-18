@@ -110,7 +110,30 @@ const errors = fs.createWriteStream(file("stderr.log"), { flags: "a" });
 
 let child = null;
 let lastText = "";
+let turnText = ""; // what the agent said last in the current turn
 let errorText = "";
+
+// ---------------------------------------------------------------- the report
+//
+// The report is what the agent said at the end of a turn. A later turn (a
+// Monitor's late notice, a nudge from the runner) usually ends with a short
+// note like "that notice changes nothing": it must not replace the report.
+// Such a note is appended to the report instead. Anything said after the
+// runner has accepted the finish is always appended.
+let report = "";
+let notes = [];
+function commitTurn(afterFinish) {
+  const t = turnText.trim();
+  turnText = "";
+  if (!t || t === report || notes.includes(t)) return;
+  if (report && (afterFinish || (report.length >= 300 && t.length < report.length / 2))) notes.push(t);
+  else {
+    report = t;
+    notes = [];
+  }
+}
+const finalReport = () =>
+  notes.length ? `${report}\n\n---\nLater note${notes.length > 1 ? "s" : ""} (after the report):\n\n${notes.join("\n\n")}` : report;
 let tools = 0;
 let lastTool = "";
 let lastProgress = 0;
@@ -144,6 +167,7 @@ function handle(line) {
     const said = content.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
     if (said) {
       lastText = said;
+      turnText = said;
       logLine(`> ${said.replace(/\n+/g, " ").slice(0, 600)}`);
     }
     errorText = e.message.stopReason === "error" ? e.message.errorMessage || "The model returned an error." : "";
@@ -388,6 +412,9 @@ function runOnce(model, text) {
     args.push("--name", `Heron task: ${spec.title}`);
     errorText = "";
     lastText = ""; // a run that failed on a limit said only that; it is not the report
+    turnText = "";
+    report = "";
+    notes = [];
     let pending = "";
     let busy = true; // an agent run is (about to be) under way
     let settles = 0;
@@ -395,6 +422,7 @@ function runOnce(model, text) {
     let nudgedAt = -1; // the settle we last nudged after
     let waitingSince = 0;
     let workEndedAt = 0;
+    let liveAtSettle = -1; // the settle count when live work was last seen
     let finishing = false;
     let checking = false;
     child = spawn(pi, args, { cwd: file("work"), env, stdio: ["pipe", "pipe", "pipe"] });
@@ -426,6 +454,7 @@ function runOnce(model, text) {
         if (busy || finishing) return;
         if (live.length) {
           workEndedAt = 0;
+          liveAtSettle = settles;
           if (!waitingSince) {
             waitingSince = Date.now();
             logLine(`(not finished: still running\n${waitNote(live)})`);
@@ -443,6 +472,12 @@ function runOnce(model, text) {
           return;
         }
         if (!waitingSince) return finish();
+        // The work ended and a turn has run since (its notice woke the agent,
+        // or it polled until the end): that turn gave the report.
+        if (settles > liveAtSettle) {
+          logLine("(background work finished; the agent has reported)");
+          return finish();
+        }
         // The work it waited on is over and no turn has picked that up.
         if (!workEndedAt) workEndedAt = Date.now();
         if (Date.now() - workEndedAt < GRACE_MS) return;
@@ -496,6 +531,7 @@ function runOnce(model, text) {
         if (e.type === "agent_settled") {
           busy = false;
           settles += 1;
+          commitTurn(finishing);
           check();
         }
       }
@@ -506,6 +542,7 @@ function runOnce(model, text) {
     child.on("close", (code) => {
       clearInterval(timer);
       if (pending) handle(pending);
+      commitTurn(finishing);
       resolve(finishing && code === null ? 0 : code);
     });
     prompt(text);
@@ -554,8 +591,9 @@ if (lease.req === req && lease.attempt !== attempt) {
   process.exit(0);
 }
 const state = stopped ? "stopped" : error ? "failed" : "done";
-fs.writeFileSync(file(`result-${req}.md`), lastText || "");
-fs.writeFileSync(file("result.md"), lastText || "");
+const result = finalReport() || lastText || "";
+fs.writeFileSync(file(`result-${req}.md`), result);
+fs.writeFileSync(file("result.md"), result);
 logLine(`(${state}${error ? `: ${error.slice(0, 300)}` : ""})`);
 write("status.json", { ...read("status.json", {}), state, req, attempt, host, exitCode: code, error: stopped ? null : error, endedAt: Date.now(), pid: null });
 events.end();

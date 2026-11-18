@@ -12,7 +12,7 @@
 //
 // --resume: an earlier attempt was cut off (its computer went down, or the
 // run died). The prompt carries that attempt's log so this one continues.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -110,7 +110,30 @@ const errors = fs.createWriteStream(file("stderr.log"), { flags: "a" });
 
 let child = null;
 let lastText = "";
+let turnText = ""; // what the agent said last in the current turn
 let errorText = "";
+
+// ---------------------------------------------------------------- the report
+//
+// The report is what the agent said at the end of a turn. A later turn (a
+// Monitor's late notice, a nudge from the runner) usually ends with a short
+// note like "that notice changes nothing": it must not replace the report.
+// Such a note is appended to the report instead. Anything said after the
+// runner has accepted the finish is always appended.
+let report = "";
+let notes = [];
+function commitTurn(afterFinish) {
+  const t = turnText.trim();
+  turnText = "";
+  if (!t || t === report || notes.includes(t)) return;
+  if (report && (afterFinish || (report.length >= 300 && t.length < report.length / 2))) notes.push(t);
+  else {
+    report = t;
+    notes = [];
+  }
+}
+const finalReport = () =>
+  notes.length ? `${report}\n\n---\nLater note${notes.length > 1 ? "s" : ""} (after the report):\n\n${notes.join("\n\n")}` : report;
 let tools = 0;
 let lastTool = "";
 let lastProgress = 0;
@@ -144,6 +167,7 @@ function handle(line) {
     const said = content.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
     if (said) {
       lastText = said;
+      turnText = said;
       logLine(`> ${said.replace(/\n+/g, " ").slice(0, 600)}`);
     }
     errorText = e.message.stopReason === "error" ? e.message.errorMessage || "The model returned an error." : "";
@@ -160,41 +184,379 @@ function handle(line) {
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(signal, () => {
     stopped = true;
+    killLiveWork();
     try {
       child?.kill("SIGTERM");
     } catch {}
   });
 }
 
-/** One Pi run on `model`; resolves with its exit code. */
+// ---------------------------------------------------------------- live work
+//
+// A run may not finish while work it started is still going: a background
+// process (`cmd &`, nohup, a Monitor), or a Zeron chat it created or sent a
+// message to. Pi runs in RPC mode so it stays up between turns (a Monitor's
+// completion wakes it); when it settles with live work left, the runner
+// doesn't accept the finish: it tells the agent to wait, and when the work
+// ends it asks for the report.
+
+const threadId = env.HERON_THREAD_ID;
+const SHELLS = /^(\S*\/)?(ba|z|fi|da|k)?sh(\s|$)/;
+const tracked = new Map(); // pid -> command: processes seen under Pi's shells
+const chatIds = new Map(); // Zeron chats this run created or messaged -> when
+const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const CHAT_TOOLS = /create_chats?|send_messages?|wait_for_turn/;
+
+function ps() {
+  const out = spawnSync("ps", ["-axww", "-o", "pid=,ppid=,stat=,command="], { encoding: "utf8" }).stdout || "";
+  const rows = new Map();
+  for (const line of out.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (m) rows.set(Number(m[1]), { ppid: Number(m[2]), stat: m[3], cmd: m[4] });
+  }
+  return rows;
+}
+
+function kidsOf(rows) {
+  const kids = new Map();
+  for (const [pid, r] of rows) {
+    if (!kids.has(r.ppid)) kids.set(r.ppid, []);
+    kids.get(r.ppid).push(pid);
+  }
+  return kids;
+}
+
+function subtree(kids, root) {
+  const out = new Set();
+  const stack = [root];
+  while (stack.length) {
+    const p = stack.pop();
+    for (const k of kids.get(p) || []) if (!out.has(k)) out.add(k), stack.push(k);
+  }
+  return out;
+}
+
+/** Pi's own process: the launcher may be a shell script that didn't exec. */
+function piPid(rows, kids) {
+  let p = child?.pid;
+  while (p && rows.has(p) && SHELLS.test(rows.get(p).cmd) && (kids.get(p) || []).length === 1) p = kids.get(p)[0];
+  return p;
+}
+
+/** Processes under Pi's shells (tool calls, Monitors), remembered so a job
+ * that outlives its shell (`cmd &`) is still known after it is orphaned. */
+function trackProcesses() {
+  if (!child?.pid) return;
+  const rows = ps();
+  const kids = kidsOf(rows);
+  for (const top of kids.get(piPid(rows, kids)) || []) {
+    if (!SHELLS.test(rows.get(top).cmd)) continue; // an MCP server or the model's helper
+    for (const p of [top, ...subtree(kids, top)]) tracked.set(p, rows.get(p).cmd);
+  }
+}
+
+/** Processes marked as this thread's: its id in the environment (Pi sets
+ * HERON_THREAD_ID; macOS hides it for system binaries) or a working folder
+ * inside the thread's folder. */
+function markedProcesses() {
+  const found = new Set();
+  let root = path.resolve(dir);
+  try {
+    root = fs.realpathSync(dir);
+  } catch {}
+  if (process.platform === "linux") {
+    const uid = process.getuid();
+    for (const name of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        if (fs.statSync(`/proc/${name}`).uid !== uid) continue;
+        const cwd = fs.readlinkSync(`/proc/${name}/cwd`);
+        if (cwd === root || cwd.startsWith(`${root}/`)) { found.add(Number(name)); continue; }
+        if (fs.readFileSync(`/proc/${name}/environ`, "latin1").split("\0").includes(`HERON_THREAD_ID=${threadId}`)) found.add(Number(name));
+      } catch {}
+    }
+    return found;
+  }
+  const withEnv = spawnSync("ps", ["-E", "-axww", "-o", "pid=,command="], { encoding: "utf8", maxBuffer: 64 << 20 }).stdout || "";
+  const marker = ` HERON_THREAD_ID=${threadId}`;
+  for (const line of withEnv.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s/);
+    if (m && (line.includes(`${marker} `) || line.endsWith(marker))) found.add(Number(m[1]));
+  }
+  const cwds = spawnSync(fs.existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : "lsof", ["-a", "-d", "cwd", "-u", String(process.getuid()), "-Fpn"], { encoding: "utf8", maxBuffer: 64 << 20 }).stdout || "";
+  let pid = 0;
+  for (const line of cwds.split("\n")) {
+    if (line[0] === "p") pid = Number(line.slice(1));
+    else if (line[0] === "n") {
+      const cwd = line.slice(1);
+      if (cwd === root || cwd.startsWith(`${root}/`)) found.add(pid);
+    }
+  }
+  return found;
+}
+
+/** Background processes this run started that are still running. */
+function liveProcesses() {
+  const rows = ps();
+  const kids = kidsOf(rows);
+  const skip = new Set([process.pid]);
+  for (let p = process.ppid; p > 1 && rows.has(p) && !skip.has(p); p = rows.get(p).ppid) skip.add(p); // whoever started the runner
+  for (const p of kids.get(process.pid) || []) skip.add(p); // Pi itself, and ps/lsof
+  if (child?.pid) {
+    const me = piPid(rows, kids);
+    skip.add(me);
+    for (const top of kids.get(me) || []) {
+      if (!SHELLS.test(rows.get(top).cmd)) for (const p of [top, ...subtree(kids, top)]) skip.add(p);
+    }
+  }
+  const live = new Set();
+  for (const [p, cmd] of tracked) if (rows.get(p)?.cmd === cmd) live.add(p);
+  for (const p of markedProcesses()) if (rows.has(p)) live.add(p);
+  for (const p of [...live]) if (skip.has(p) || !rows.has(p) || rows.get(p).stat.startsWith("Z")) live.delete(p);
+  // Name each job once: its topmost live process.
+  return [...live].filter((p) => !live.has(rows.get(p).ppid)).map((p) => ({ kind: "process", pid: p, what: `process ${p}: ${rows.get(p).cmd.slice(0, 120)}` }));
+}
+
+function zeronExe() {
+  for (const p of ["/Applications/Zeron.app/Contents/MacOS/zeron", path.join(HOME, ".local", "bin", "zeron")]) if (fs.existsSync(p)) return p;
+  return "zeron";
+}
+
+/** The Zeron chats this run created or messaged that are still working. */
+function liveChats() {
+  if (!chatIds.size) return Promise.resolve([]);
+  return new Promise((resolve) => {
+    const p = spawn(zeronExe(), ["mcp"], { env, stdio: ["pipe", "pipe", "ignore"] });
+    const ids = [...chatIds.keys()];
+    const found = [];
+    let buf = "";
+    let left = ids.length;
+    const done = () => {
+      clearTimeout(timer);
+      try { p.kill(); } catch {}
+      resolve(found);
+    };
+    const timer = setTimeout(done, 20000);
+    p.on("error", done);
+    p.stdout.on("data", (c) => {
+      buf += c.toString("utf8");
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.id === 0) {
+          p.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+          ids.forEach((chat, n) => p.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: n + 1, method: "tools/call", params: { name: "get_chat", arguments: { chat } } })}\n`));
+          continue;
+        }
+        if (typeof msg.id !== "number") continue;
+        try {
+          const res = msg.result;
+          if (res && !res.isError) {
+            const c = JSON.parse(res.content.map((x) => x.text || "").join(""));
+            const heron = c.title === "Heron" && /^~\/heron\/?$/.test(c.cwd || "");
+            const starting = Date.now() - (chatIds.get(ids[msg.id - 1]) || 0) < 20000 && c.sessionStatus === "idle"; // just messaged
+            if (!heron && (c.sessionStatus === "working" || starting)) found.push({ kind: "chat", id: c.id, what: `Zeron chat ${c.id} "${c.title || ""}" (still working)` });
+          } else if (res?.isError) chatIds.delete(ids[msg.id - 1]); // not a chat id
+        } catch {}
+        if (--left <= 0) done();
+      }
+    });
+    p.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "heron-runner", version: "1" } } })}\n`);
+  });
+}
+
+async function liveWork() {
+  return [...liveProcesses(), ...(await liveChats())];
+}
+
+const chatCalls = new Set(); // tool calls that create or message a chat
+function noteChats(e) {
+  if (e.type !== "tool_execution_start" && e.type !== "tool_execution_end") return;
+  let s;
+  try { s = JSON.stringify(e.type === "tool_execution_start" ? e.args : e.result); } catch { return; }
+  if (!s) return;
+  if (e.type === "tool_execution_start" ? !CHAT_TOOLS.test(s) && !CHAT_TOOLS.test(e.toolName || "") : !chatCalls.has(e.toolCallId) && !CHAT_TOOLS.test(s)) return;
+  if (e.type === "tool_execution_start") chatCalls.add(e.toolCallId);
+  else chatCalls.delete(e.toolCallId);
+  for (const id of s.match(UUID) || []) chatIds.set(id.toLowerCase(), Date.now());
+}
+
+const WAIT_NUDGES = 3; // tell the agent to wait at most this often; then just wait
+const MAX_WAIT_MS = 4 * 3600 * 1000; // give up waiting on background work after this
+const GRACE_MS = 20000; // after the work ends, let a Monitor's notice start a turn first
+
+const waitNote = (live) => live.map((w) => `- ${w.what}`).join("\n");
+const nudgeText = (live) =>
+  `[Heron runner] You ended your turn, but work you started is still running:\n${waitNote(live)}\n\n` +
+  "The task can't finish while it runs: nobody would get its result. Wait for it now (block on it: a Monitor's notice will wake you, or poll it in a foreground loop, or wait_for_turn on a chat), then give your final report. " +
+  "If you don't need it any more, stop it (kill the process, monitor_stop, interrupt the chat) and then report.";
+const finishedText =
+  "[Heron runner] The background work you were waiting on has finished. Check its result, then give your final report.";
+
+function setWaiting(live) {
+  const waitingOn = live ? live.map((w) => w.what) : undefined;
+  const st = read("status.json", {});
+  if (JSON.stringify(st.waitingOn) === JSON.stringify(waitingOn)) return;
+  write("status.json", { ...st, waitingOn });
+}
+
+/** One Pi run on `model` (RPC mode): resolves with its exit code once the
+ * agent has settled with no live work left. */
 function runOnce(model, text) {
   return new Promise((resolve) => {
-    const args = ["-p", "--mode", "json", "--session-dir", file("session"), "--no-context-files", "--append-system-prompt", file("brief.md")];
+    const args = ["--mode", "rpc", "--session-dir", file("session"), "--no-context-files", "--append-system-prompt", file("brief.md")];
     if (model) args.push("--model", model);
-    args.push("--name", `Heron task: ${spec.title}`, "--", text);
+    args.push("--name", `Heron task: ${spec.title}`);
     errorText = "";
     lastText = ""; // a run that failed on a limit said only that; it is not the report
+    turnText = "";
+    report = "";
+    notes = [];
     let pending = "";
-    child = spawn(pi, args, { cwd: file("work"), env, stdio: ["ignore", "pipe", "pipe"] });
+    let busy = true; // an agent run is (about to be) under way
+    let settles = 0;
+    let nudged = 0;
+    let nudgedAt = -1; // the settle we last nudged after
+    let waitingSince = 0;
+    let workEndedAt = 0;
+    let liveAtSettle = -1; // the settle count when live work was last seen
+    let finishing = false;
+    let checking = false;
+    child = spawn(pi, args, { cwd: file("work"), env, stdio: ["pipe", "pipe", "pipe"] });
+    const send = (cmd) => {
+      try {
+        child.stdin.write(`${JSON.stringify(cmd)}\n`);
+      } catch {}
+    };
+    const prompt = (message) => {
+      busy = true;
+      send({ type: "prompt", message });
+    };
+    const finish = () => {
+      if (finishing) return;
+      finishing = true;
+      clearInterval(timer);
+      setWaiting(null);
+      try {
+        child.stdin.end();
+      } catch {}
+      setTimeout(() => { try { child.kill("SIGTERM"); } catch {} }, 30000).unref();
+    };
+    const check = async () => {
+      if (busy || finishing || checking) return;
+      checking = true;
+      try {
+        if (stopped || errorText) return finish(); // a model error: the caller may retry on another model
+        const live = await liveWork();
+        if (busy || finishing) return;
+        if (live.length) {
+          workEndedAt = 0;
+          liveAtSettle = settles;
+          if (!waitingSince) {
+            waitingSince = Date.now();
+            logLine(`(not finished: still running\n${waitNote(live)})`);
+          }
+          setWaiting(live);
+          if (Date.now() - waitingSince > MAX_WAIT_MS) {
+            logLine(`(gave up waiting after ${MAX_WAIT_MS / 3600000}h)`);
+            return finish();
+          }
+          if (nudgedAt !== settles && nudged < WAIT_NUDGES) {
+            nudged += 1;
+            nudgedAt = settles;
+            prompt(nudgeText(live));
+          }
+          return;
+        }
+        if (!waitingSince) return finish();
+        // The work ended and a turn has run since (its notice woke the agent,
+        // or it polled until the end): that turn gave the report.
+        if (settles > liveAtSettle) {
+          logLine("(background work finished; the agent has reported)");
+          return finish();
+        }
+        // The work it waited on is over and no turn has picked that up.
+        if (!workEndedAt) workEndedAt = Date.now();
+        if (Date.now() - workEndedAt < GRACE_MS) return;
+        logLine("(background work finished; asking for the report)");
+        waitingSince = 0;
+        workEndedAt = 0;
+        setWaiting(null);
+        prompt(finishedText);
+      } finally {
+        checking = false;
+      }
+    };
+    const timer = setInterval(() => {
+      trackProcesses();
+      check();
+    }, 2000);
+    child.stdin.on("error", () => {});
     child.stderr.on("data", (c) => errors.write(c));
     child.stdout.on("data", (chunk) => {
-      events.write(chunk);
       pending += chunk.toString("utf8");
       let i;
       while ((i = pending.indexOf("\n")) >= 0) {
         const line = pending.slice(0, i).replace(/\r$/, "");
         pending = pending.slice(i + 1);
-        if (line) handle(line);
+        if (!line) continue;
+        let e;
+        try {
+          e = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (e.type === "extension_ui_request") {
+          // Nobody can answer a dialog: decline it.
+          if (["select", "confirm", "input", "editor"].includes(e.method)) send({ type: "extension_ui_response", id: e.id, cancelled: true });
+          continue;
+        }
+        if (e.type === "message_update") continue; // streaming deltas; message_end has the text
+        events.write(`${line}\n`);
+        if (e.type === "response") {
+          if (e.command === "prompt" && (!e.success || e.data?.disposition === "handled")) {
+            if (!e.success) errorText = e.error || "Pi rejected the prompt.";
+            busy = false;
+            check();
+          }
+          continue;
+        }
+        if (e.type === "agent_start") busy = true;
+        if (e.type === "tool_execution_start") trackProcesses();
+        noteChats(e);
+        handle(line);
+        if (e.type === "agent_settled") {
+          busy = false;
+          settles += 1;
+          commitTurn(finishing);
+          check();
+        }
       }
     });
     child.on("error", (err) => {
       errorText = `Couldn't start Pi (${pi}): ${err.message}`;
     });
     child.on("close", (code) => {
+      clearInterval(timer);
       if (pending) handle(pending);
-      resolve(code);
+      commitTurn(finishing);
+      resolve(finishing && code === null ? 0 : code);
     });
+    prompt(text);
   });
+}
+
+/** On stop: end the background work this thread started. */
+function killLiveWork() {
+  try {
+    for (const w of liveProcesses()) {
+      try { process.kill(-w.pid, "SIGTERM"); } catch {}
+      try { process.kill(w.pid, "SIGTERM"); } catch {}
+    }
+  } catch {}
 }
 
 const stderrTail = () => {
@@ -229,8 +591,9 @@ if (lease.req === req && lease.attempt !== attempt) {
   process.exit(0);
 }
 const state = stopped ? "stopped" : error ? "failed" : "done";
-fs.writeFileSync(file(`result-${req}.md`), lastText || "");
-fs.writeFileSync(file("result.md"), lastText || "");
+const result = finalReport() || lastText || "";
+fs.writeFileSync(file(`result-${req}.md`), result);
+fs.writeFileSync(file("result.md"), result);
 logLine(`(${state}${error ? `: ${error.slice(0, 300)}` : ""})`);
 write("status.json", { ...read("status.json", {}), state, req, attempt, host, exitCode: code, error: stopped ? null : error, endedAt: Date.now(), pid: null });
 events.end();

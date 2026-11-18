@@ -423,6 +423,127 @@ def own_duties(t, me):
         start_run(t, attempt, resume=attempt > 1)
 
 
+# ---------------------------------------------------------------- status board
+#
+# The board (~/.heron/shared/status: `st`, status.json, index.html) is served
+# from one computer (BOARD_HOST). Its keeper mirrors every thread there each
+# tick as job "t:<thread id>" with "auto": true. Heron's own entries (`st job`,
+# no "auto") are never touched.
+
+BOARD_DIR = os.path.join(HOME, ".heron", "shared", "status")
+BOARD_HOST = "nishka-server"
+BOARD_KEEP_SECS = 24 * 3600   # finished threads stay this long
+BOARD_KEEP_FINISHED = 15       # and at most this many of them
+BOARD_RENDER_SECS = 60         # re-render (the "ago"s) at least this often
+board_state = {"rendered": 0}
+
+
+def board_module():
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    path = os.path.join(BOARD_DIR, "st")
+    loader = SourceFileLoader("heron_status_board", path)
+    spec = importlib.util.spec_from_loader("heron_status_board", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def clip(text, n):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def first_sentence(text):
+    text = re.sub(r"\*\*|`|^\s*[#>]+\s*", "", text or "", flags=re.M).strip()
+    m = re.match(r"(.+?[.!?])(\s|$)", " ".join(text.split()))
+    return m.group(1) if m else text
+
+
+def thread_board_entry(t, now):
+    """The board entry for one thread, or None to leave it off."""
+    req, st, lease = t["request"]["req"], t["status"], t["lease"]
+    spec = read_json(os.path.join(t["dir"], "spec.json"), {})
+    title = clip(spec.get("title") or t["id"], 80)
+    mine = st.get("req") == req
+    where = (st.get("host") if mine else None) or lease.get("ownerName") or ""
+    on = f"on {where}" if where else ""
+    stopping = t["stop"].get("req") == req
+    if mine and st.get("state") in FINAL:
+        state = st["state"]
+        at = (st.get("endedAt") or 0) / 1000 or now
+        if now - at > BOARD_KEEP_SECS:
+            return None
+        if state == "done":
+            result = ""
+            try:
+                result = open(os.path.join(t["dir"], f"result-{req}.md")).read()
+            except OSError:
+                try:
+                    result = open(os.path.join(t["dir"], "result.md")).read()
+                except OSError:
+                    pass
+            note = clip(first_sentence(result), 140) or on
+        elif state == "failed":
+            note = clip(f"{on}: {st.get('error') or 'failed'}", 140)
+        else:
+            note = "Stopped."
+    elif mine and st.get("state") == "running":
+        state, at = "running", (st.get("startedAt") or 0) / 1000 or now
+        note = on
+        if st.get("attempt", 1) > 1:
+            note += f" (attempt {st['attempt']})"
+        if st.get("waitingOn"):
+            note += " · waiting on: " + "; ".join(clip(w, 60) for w in st["waitingOn"][:2])
+        if stopping:
+            note += " · stopping"
+    elif stopping:
+        return None
+    else:
+        state = "queued"
+        at = (lease.get("at") if lease.get("req") == req else None) or (spec.get("createdAt") or 0) / 1000 or now
+        note = f"starting {on}" if lease.get("req") == req else "waiting for a computer"
+    return {"title": title, "state": state, "note": clip(note, 160), "t": at, "auto": True,
+            "computer": where, "thread": t["id"]}
+
+
+def sync_board(me):
+    """Mirror the threads into the status board (only on BOARD_HOST)."""
+    if me.get("name") != config().get("board_host", BOARD_HOST):
+        return
+    if not os.path.exists(os.path.join(BOARD_DIR, "st")):
+        return
+    now = time.time()
+    want = {}
+    for t in tasks():
+        e = thread_board_entry(t, now)
+        if e:
+            want[f"t:{t['id']}"] = e
+    finished = sorted((k for k, e in want.items() if e["state"] in FINAL), key=lambda k: -want[k]["t"])
+    for k in finished[BOARD_KEEP_FINISHED:]:
+        del want[k]
+    st = board_module()
+    import fcntl
+    with open(os.path.join(HOME, ".heron", ".board.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        d = st.load()
+        jobs = d.setdefault("jobs", {})
+        have = {k: v for k, v in jobs.items() if v.get("auto")}
+        changed = have != want
+        if changed:
+            for k in have:
+                if k not in want:
+                    del jobs[k]
+            for k, e in want.items():
+                if have.get(k) != e:
+                    jobs[k] = e
+                    log(f"board: {k} {e['state']}")
+            st.save(d)
+        if changed or now - board_state["rendered"] >= BOARD_RENDER_SECS:
+            st.render(d)
+            board_state["rendered"] = now
+
+
 def tick(cfg, state):
     try:
         mcp = Mcp()
@@ -430,6 +551,10 @@ def tick(cfg, state):
         log("zeron unreachable:", str(e)[:200])
         if state.get("me"):
             schedule(None, state["me"], None, cfg)
+            try:
+                sync_board(state["me"])
+            except Exception as e:
+                log("board error:", str(e)[:200])
         return
     try:
         devices = mcp.tool("list_devices")["devices"]
@@ -441,6 +566,10 @@ def tick(cfg, state):
             keep_chat(mcp, cfg, devices, me, online)
         finally:
             schedule(devices, me, online, cfg)
+            try:
+                sync_board(me)
+            except Exception as e:
+                log("board error:", str(e)[:200])
     except Exception as e:
         if state.get("me"):
             schedule(None, state["me"], None, cfg)

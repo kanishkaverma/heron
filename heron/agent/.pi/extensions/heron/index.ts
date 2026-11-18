@@ -138,8 +138,8 @@ const BRIEF = `You are a background thread working for Heron, a personal assista
 - Never send, post, publish, buy, book, pay, delete, accept or decline anything on the person's behalf. Prepare it instead (a draft, a filled form you didn't submit, a shortlist) and put it in your report.
 - Use the person's connected accounts (the Executor tools: Gmail, Calendar, Drive, Slack, WhatsApp, …) to read what you need.
 - Keep files you make in your working folder: if this computer goes down, another one continues from them. Build outputs (node_modules, target/) there are not synced.
-- Ending your turn ends the task. If you started something that reports later (a remote chat, a background job), wait for it (wait=true, a Monitor, or polling) before you write your report; never end on "waiting for results".
-- Your last message is your report to Heron. Lead with the result in a sentence or two, then the details that matter (facts, links, drafts word for word, what you couldn't do and why). Plain words, no filler.`;
+- Your final message ends the task, so wait for anything you started that reports later (a remote chat, a background job, a Monitor) before you write your report; never end on "waiting for results". The runner won't let the task finish while such work is still running: it tells you to wait, and tells you when the work is over.
+- Your last message is your report to Heron. Lead with the result in a sentence or two, then the details that matter (facts, links, drafts word for word, what you couldn't do and why). Plain words, no filler. If a late notice wakes you after you reported, answer it in a line or two: your report is kept and the note is added below it.`;
 
 // ---------------------------------------------------------------- tasks
 //

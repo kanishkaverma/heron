@@ -26,7 +26,8 @@ pub(crate) struct DemoChat {
     pub preview: &'static str,
     pub harness: HarnessId,
     pub model: &'static str,
-    pub reasoning: ReasoningLevel,
+    /// None: made without one (as Heron's chat is), so it runs the agent's default.
+    pub reasoning: Option<ReasoningLevel>,
     pub branch: Option<&'static str>,
     pub pr: Option<(u64, ChangeRequestState, &'static str)>,
     pub status: Option<SessionStatus>,
@@ -59,7 +60,7 @@ pub(crate) fn chats() -> Vec<DemoChat> {
         preview,
         harness: ClaudeCode,
         model: "claude-fable-5",
-        reasoning: XHigh,
+        reasoning: Some(XHigh),
         branch: None,
         pr: None,
         status: None,
@@ -105,7 +106,7 @@ pub(crate) fn chats() -> Vec<DemoChat> {
         DemoChat {
             harness: Codex,
             model: "gpt-5.6-terra",
-            reasoning: High,
+            reasoning: Some(High),
             branch: Some("fix/tool-colors"),
             pr: Some((77, Closed, "Refine tool group colors")),
             last_ago_ms: 15 * MIN,
@@ -153,7 +154,7 @@ pub(crate) fn chats() -> Vec<DemoChat> {
             sleep: Some((-30 * MIN, DAY)),
             harness: Codex,
             model: "gpt-6-astra",
-            reasoning: Ultra,
+            reasoning: Some(Ultra),
             ..chat(
                 "chat-ios-scroll",
                 Some("space-mobile"),
@@ -177,7 +178,7 @@ pub(crate) fn chats() -> Vec<DemoChat> {
         DemoChat {
             last_ago_ms: 2 * HOUR,
             model: "claude-sonnet-5",
-            reasoning: Medium,
+            reasoning: None,
             ..chat(
                 "chat-home",
                 None,
@@ -235,7 +236,7 @@ pub(crate) fn chats() -> Vec<DemoChat> {
             parent: Some("chat-veil"),
             harness: Codex,
             model: "gpt-5.6-terra",
-            reasoning: High,
+            reasoning: Some(High),
             last_ago_ms: 6 * MIN,
             ..chat(
                 "chat-side-easing",
@@ -261,7 +262,7 @@ pub(crate) fn chats() -> Vec<DemoChat> {
             archived: true,
             harness: Codex,
             model: "gpt-5.5",
-            reasoning: High,
+            reasoning: Some(High),
             last_ago_ms: 6 * DAY,
             created_ago_ms: 7 * DAY,
             ..chat(
@@ -461,7 +462,7 @@ pub(crate) fn seed(
             config: Some(ChatConfig {
                 harness: demo.harness,
                 model: (!demo.model.is_empty()).then(|| demo.model.into()),
-                reasoning: Some(demo.reasoning),
+                reasoning: demo.reasoning,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
                 access: Default::default(),

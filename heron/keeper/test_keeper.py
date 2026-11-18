@@ -276,15 +276,15 @@ class Tasks(unittest.TestCase):
 
 
 class FakeMcp:
-    def __init__(self, chats, messages=()):
-        self.chats, self.messages, self.calls = chats, list(messages), []
+    def __init__(self, chats, messages=(), reasoning=None):
+        self.chats, self.messages, self.calls, self.reasoning = chats, list(messages), [], reasoning
 
     def tool(self, name, args=None):
         self.calls.append((name, args or {}))
         if name == "list_chats":
             return {"chats": self.chats}
         if name == "get_chat":
-            return {"harness": "pi", "reasoning": None}
+            return {"harness": "pi", "reasoning": self.reasoning}
         if name == "read_chat":
             return {"messages": self.messages}
         if name == "create_chat":
@@ -304,6 +304,7 @@ class Chat(unittest.TestCase):
         K.THREADS = os.path.join(self.tmp, "threads")
         K.MODELS = os.path.join(self.tmp, "models.json")
         K.MODEL_STATE = os.path.join(self.tmp, "model-state.json")
+        K.MODEL_APPLIED = os.path.join(self.tmp, "model-applied.json")
         K.write_json(K.MODELS, ["claude", "gpt"])
         self.ipc, self.logs = [], []
         K.ipc = lambda method, params: self.ipc.append(params)
@@ -367,6 +368,30 @@ class Chat(unittest.TestCase):
         self.keep(AIR, FakeMcp([self.chat(AIR, model="something-else")]))
         self.assertEqual([p["config"]["model"] for p in self.ipc], ["claude"])
 
+    def test_a_model_the_person_picks_is_kept(self):
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="something-else")]))
+        self.ipc.clear()
+        # they pick another model in the app: the keeper leaves it, tick after tick
+        for _ in range(3):
+            self.keep(AIR, FakeMcp([self.chat(AIR, model="gpt-new")]))
+        self.assertEqual([p for p in self.ipc if p.get("op") == "setChatConfig"], [])
+
+    def test_a_picked_model_still_falls_back_on_a_limit_and_comes_back_after(self):
+        self.keep(AIR, FakeMcp([self.chat(AIR)]))  # on claude already
+        bad = [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="gpt-new", sessionStatus="errored")], bad))
+        self.assertEqual(self.ipc[-1]["config"]["model"], "gpt")
+        self.ipc.clear()
+        K.write_json(K.MODEL_STATE, {**K.read_json(K.MODEL_STATE), "until": 0})  # the limit resets
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="gpt")]))
+        self.assertEqual([p["config"]["model"] for p in self.ipc], ["claude"])
+
+    def test_a_chat_that_comes_back_is_put_on_this_computers_model(self):
+        self.keep(ZEPH, FakeMcp([self.chat(ZEPH)]))  # zeph hosted it once, on claude
+        self.keep(ZEPH, FakeMcp([self.chat(AIR)]))   # then air did
+        self.keep(ZEPH, FakeMcp([self.chat(ZEPH, model="air-only-model")]))  # and it's back
+        self.assertEqual([p["config"]["model"] for p in self.ipc if p.get("op") == "setChatConfig"], ["claude"])
+
     def test_a_limit_error_falls_back_to_the_next_model_once(self):
         errored = self.chat(AIR, sessionStatus="errored")
         bad = [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]
@@ -380,11 +405,106 @@ class Chat(unittest.TestCase):
         self.assertEqual(again.did("send_message"), [])
         self.assertEqual(K.heron_model(), "gpt")  # and it stays on the fallback for the hour
 
+    def test_the_fallback_lasts_until_the_limit_resets(self):
+        # 11:52 in Vancouver; Claude says the limit resets at 2pm there.
+        from zoneinfo import ZoneInfo
+        van = ZoneInfo("America/Vancouver")
+        now = datetime.datetime(2026, 11, 17, 11, 52, tzinfo=van).timestamp()
+        text = "Claude quota exceeded — rate limit (five_hour) — resets 2:00:00 PM: You've hit your session limit · resets 2pm (America/Vancouver)"
+        reset = datetime.datetime(2026, 11, 17, 14, 0, tzinfo=van).timestamp()
+        self.assertEqual(K.limit_reset(text, now), reset)
+        self.assertEqual(K.limit_reset("resets 9:30am (America/Vancouver)", now),
+                         datetime.datetime(2026, 11, 18, 9, 30, tzinfo=van).timestamp())  # tomorrow
+        self.assertIsNone(K.limit_reset("429 rate limit reached", now))
+        self.assertIsNone(K.limit_reset("resets 2pm (Not/AZone)", now))
+        # the keeper, at 11:52: on the fallback until just after 2pm, not for an hour
+        real_time = K.time.time
+        K.time.time = lambda: now
+        try:
+            self.keep(AIR, FakeMcp([self.chat(AIR, sessionStatus="errored")], [{"id": "m1", "role": "assistant", "errors": [text]}]))
+            self.assertEqual(K.heron_model(), "gpt")
+            K.time.time = lambda: reset - 60   # 1:59pm
+            self.assertEqual(K.heron_model(), "gpt")
+            K.time.time = lambda: reset + 300  # 2:05pm
+            self.assertEqual(K.heron_model(), "claude")
+        finally:
+            K.time.time = real_time
+        until = K.read_json(K.MODEL_STATE)["until"]
+        self.assertTrue(reset < until < reset + 600)
+
+    def test_an_unknown_reset_time_falls_back_for_an_hour(self):
+        errored = self.chat(AIR, sessionStatus="errored")
+        self.keep(AIR, FakeMcp([errored], [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]))
+        left = K.read_json(K.MODEL_STATE)["until"] - K.time.time()
+        self.assertAlmostEqual(left, K.FALLBACK_SECS, delta=5)
+
+    def test_a_model_switch_keeps_the_picked_thinking_level(self):
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="something-else")], reasoning="high"))
+        bad = [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]
+        self.keep(AIR, FakeMcp([self.chat(AIR, sessionStatus="errored")], bad, reasoning="high"))
+        self.assertEqual([p["config"]["model"] for p in self.ipc][:2], ["claude", "gpt"])
+        self.assertEqual({p["config"]["reasoning"] for p in self.ipc}, {"high"})
+
     def test_an_ordinary_error_does_not_switch_models(self):
         mcp = FakeMcp([self.chat(AIR, sessionStatus="errored")], [{"id": "m1", "role": "assistant", "errors": ["tool crashed"]}])
         self.keep(AIR, mcp)
         self.assertEqual(self.ipc, [])
         self.assertEqual(mcp.did("send_message"), [])
+
+
+class PiSync(unittest.TestCase):
+    """maybe_pi_sync: a minute after the keeper starts, then every 30 minutes."""
+
+    def test_runs_a_minute_after_start_then_every_half_hour(self):
+        clock = [1_000_000.0]
+        started = []
+
+        class Proc:
+            def poll(self):
+                return 0
+
+        tmp = tempfile.mkdtemp(prefix="heron-keeper-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        open(os.path.join(tmp, "pi_sync.py"), "w").close()
+        real_time, real_popen, real_file = K.time.time, K.subprocess.Popen, K.__file__
+        K.__file__ = os.path.join(tmp, "heron-keeper.py")
+        K.time.time = lambda: clock[0]
+        K.subprocess.Popen = lambda *a, **k: started.append(clock[0]) or Proc()
+        try:
+            state = {}
+            for _ in range(int(3 * K.PI_SYNC_EVERY / 10)):   # 90 minutes of 10 s ticks
+                K.maybe_pi_sync(state)
+                clock[0] += 10
+        finally:
+            K.time.time, K.subprocess.Popen, K.__file__ = real_time, real_popen, real_file
+        offsets = [round(t - 1_000_000) for t in started]
+        self.assertEqual(offsets, [60, 60 + K.PI_SYNC_EVERY, 60 + 2 * K.PI_SYNC_EVERY])
+
+
+class PiSyncSkipTest(unittest.TestCase):
+    """pi_sync.share: a skill removed on purpose (skip_skills) stays removed."""
+
+    def test_a_skipped_skill_is_not_shared_linked_or_kept_linked(self):
+        spec = importlib.util.spec_from_file_location("pi_sync", os.path.join(HERE, "pi_sync.py"))
+        P = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(P)
+        tmp = tempfile.mkdtemp(prefix="heron-pisync-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        P.SHARED = os.path.join(tmp, "shared")
+        pool, mine_dir = os.path.join(P.SHARED, "skills"), os.path.join(tmp, "agents-skills")
+        for name in ("keep", "gone", "gone-too"):
+            os.makedirs(os.path.join(pool, name))
+            open(os.path.join(pool, name, "SKILL.md"), "w").close()
+        os.makedirs(os.path.join(mine_dir, "local-gone"))
+        open(os.path.join(mine_dir, "local-gone", "SKILL.md"), "w").close()
+        os.symlink(os.path.join(pool, "gone-too"), os.path.join(mine_dir, "gone-too"))  # linked in earlier
+        json.dump({"skip_skills": ["gone", "gone-too", "local-gone"]}, open(os.path.join(P.SHARED, "pi-sync.json"), "w"))
+
+        P.share("skills", P.local_items([mine_dir]), mine_dir)
+
+        self.assertEqual(sorted(os.listdir(mine_dir)), ["keep", "local-gone"])  # own copy stays, pool link gone
+        self.assertFalse(os.path.exists(os.path.join(pool, "local-gone")))       # never shared
+        self.assertTrue(os.path.islink(os.path.join(mine_dir, "keep")))
 
 
 if __name__ == "__main__":

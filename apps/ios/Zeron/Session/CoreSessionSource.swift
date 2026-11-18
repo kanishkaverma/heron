@@ -23,11 +23,11 @@ final class CoreSessionSource: SessionSource {
     /// host doesn't open until it answers.
     private var hostHarnesses: [HarnessInfo] = []
     private var harnessesDevice = ""
-    /// What a chat with no model of its own runs: its host's default (the
-    /// catalog's first model), by "device|harness". Seeded from the built-in
-    /// list so the chip never shows a bare provider name, then the host's.
-    private var defaultModels: [String: ModelPickerRow] = [:]
-    private var defaultModelsLoading: Set<String> = []
+    /// The host's models by "device|harness": what a chat with no model of
+    /// its own runs (the first) and the chat's effort ladder. Seeded from the
+    /// built-in list so the chips answer at once, then the host's.
+    private var models: [String: [ModelInfo]] = [:]
+    private var modelsLoading: Set<String> = []
     private weak var engine: TranscriptView?
 
     init(app: AppModel, client: CoreClient, handle: SessionHandle, chatId: String) {
@@ -110,6 +110,10 @@ final class CoreSessionSource: SessionSource {
         }
         if let r = row?.reasoning, !r.isEmpty {
             chips.append(ComposerChip(id: "effort", title: reasoningLabel(level: r), symbol: "gauge.with.dots.needle.67percent"))
+        } else if let row, !reasoningLevels(for: row).isEmpty {
+            // No effort of its own (Heron's chat is made without one): it
+            // runs the agent's default until one is picked here.
+            chips.append(ComposerChip(id: "effort", title: "Default", symbol: "gauge.with.dots.needle.67percent"))
         }
         if let pr = row?.pullRequest {
             let state: SessionRowVM.PR = switch pr.state { case .open: .open; case .merged: .merged; case .closed: .closed }
@@ -365,22 +369,32 @@ final class CoreSessionSource: SessionSource {
     /// provider. The built-in list answers at once; the host's (or Cloud's)
     /// own list replaces it when it arrives.
     private func defaultModel(for row: SessionRow) -> ModelPickerRow? {
-        let harness = row.harness ?? "claude-code"
+        hostModels(harness: row.harness ?? "claude-code").first.map { ModelPickerRow(id: $0.id, label: $0.label, detail: $0.description) }
+    }
+
+    /// The efforts the chat's model offers (its provider's default model's,
+    /// when the list doesn't name it).
+    private func reasoningLevels(for row: SessionRow) -> [String] {
+        let list = hostModels(harness: row.harness ?? "claude-code")
+        return (list.first { $0.id == row.model } ?? list.first)?.reasoningLevels ?? []
+    }
+
+    /// The host's models for `harness`: the built-in list at once, the
+    /// host's (or Cloud's) own when it arrives.
+    private func hostModels(harness: String) -> [ModelInfo] {
         let key = "\(hostDevice)|\(harness)"
-        if defaultModels[key] == nil, let first = fallbackModels(harness: harness).first {
-            defaultModels[key] = ModelPickerRow(id: first.id, label: first.label, detail: first.description)
-        }
-        if !hostDevice.isEmpty, defaultModelsLoading.insert(key).inserted {
+        if models[key] == nil { models[key] = fallbackModels(harness: harness) }
+        if !hostDevice.isEmpty, modelsLoading.insert(key).inserted {
             let device = hostDevice
             Task { @MainActor [weak self] in
-                guard let self, let first = await self.client.listModels(deviceId: device, harness: harness).first else { return }
-                let row = ModelPickerRow(id: first.id, label: first.label, detail: first.description)
-                guard self.defaultModels[key] != row else { return }
-                self.defaultModels[key] = row
+                guard let self else { return }
+                let list = await self.client.listModels(deviceId: device, harness: harness)
+                guard !list.isEmpty, self.models[key] != list else { return }
+                self.models[key] = list
                 self.refresh()
             }
         }
-        return defaultModels[key]
+        return models[key] ?? []
     }
 
     /// The providers a chat on this host can move to: Cloud runs Claude

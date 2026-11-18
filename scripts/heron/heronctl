@@ -21,6 +21,8 @@
 Every command takes --hosts air,zeph,mbp to narrow it. Computers and how to
 reach them: HOSTS below, overridden per computer by ~/.heron/hosts.json
 (a list of {"name", "ssh", ...}). The computer you are on is used directly.
+A computer is reached by its ssh alias when this computer's ~/.ssh/config has
+one, else as user@ its Tailscale name, so no ssh config is needed.
 
 Remote work is a Python script piped to `ssh HOST python3 -`, so nothing is
 ever quoted for a remote shell (the MacBook's login shell is fish).
@@ -42,11 +44,18 @@ ROOT = os.environ.get("HERON_ROOT") or os.path.dirname(os.path.dirname(os.path.d
 HOME = os.path.expanduser("~")
 
 # name: what you type; device: its name in Zeron (the keeper's priority list);
-# ssh: the ssh target; hostnames: how it names itself (to spot "this computer").
+# ssh: the ssh alias, used when ~/.ssh/config defines it; tailscale + user: the
+# fallback target, its MagicDNS name (zeph is "zeph-1" because it re-joined the
+# tailnet on 2026-10-27 while the old "zeph" record held the name; its public
+# Funnel links use zeph-1, so it stays); hostnames: how it names itself (to
+# spot "this computer").
 HOSTS = [
-    {"name": "air", "device": "nishka-server", "ssh": "air", "hostnames": ["nishka-server", "openclaw"]},
-    {"name": "zeph", "device": "zeph", "ssh": "zeph", "hostnames": ["zeph", "zeph-1"]},
-    {"name": "mbp", "device": "Kanishka\u2019s MacBook Pro", "ssh": "mbp", "hostnames": ["kanishkas-macbook-pro"]},
+    {"name": "air", "device": "nishka-server", "ssh": "air", "tailscale": "openclaw", "user": "nishka",
+     "hostnames": ["nishka-server", "openclaw"]},
+    {"name": "zeph", "device": "zeph", "ssh": "zeph", "tailscale": "zeph-1", "user": "nishka",
+     "hostnames": ["zeph", "zeph-1"]},
+    {"name": "mbp", "device": "Kanishka\u2019s MacBook Pro", "ssh": "mbp", "tailscale": "personal-macbook", "user": "nishka",
+     "hostnames": ["kanishkas-macbook-pro", "personal-macbook"]},
 ]
 
 # What a deploy installs: source in this checkout -> path under ~ on every computer.
@@ -426,8 +435,31 @@ def hosts(only=None):
     return table
 
 
+def ssh_target(host):
+    """The ssh alias if ~/.ssh/config gives it a HostName, else user@tailscale-name."""
+    if "target" not in host:
+        alias = target = host["ssh"]
+        if host.get("tailscale"):
+            try:
+                out = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=10).stdout
+                hostname = next((l.split(None, 1)[1] for l in out.splitlines() if l.startswith("hostname ")), alias)
+            except (OSError, subprocess.TimeoutExpired):
+                hostname = alias
+            if hostname.lower() == alias.lower():  # no alias here: ssh would look "zeph" up in DNS
+                target = (host["user"] + "@" if host.get("user") else "") + host["tailscale"]
+        host["target"] = target
+    return host["target"]
+
+
+TS_CHECK = "Tailscale SSH requires an additional check"
+
+
 def ssh_cmd(host, *remote):
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host["ssh"]] + list(remote)
+    target = ssh_target(host)
+    # accept-new only on the Tailscale fallback: a first visit by Tailscale name records its key
+    # instead of failing in batch mode. An ssh alias keeps the user's own host-key settings.
+    opts = ["-o", "StrictHostKeyChecking=accept-new"] if target != host["ssh"] else []
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"] + opts + [target] + list(remote)
 
 
 def remote(host, call, timeout=90):
@@ -435,15 +467,51 @@ def remote(host, call, timeout=90):
     Returns the value, or raises RuntimeError with what went wrong."""
     script = REMOTE + "\nprint(%r + json.dumps(%s))\n" % (MARK, call)
     cmd = ["python3", "-"] if host["local"] else ssh_cmd(host, "python3 -")
-    try:
-        p = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    code, out, err = run(cmd, script, timeout)
+    if TS_CHECK in err:  # it would wait for a browser login forever: give up at once
+        raise RuntimeError("Tailscale SSH on %s wants a browser check: run `ssh %s true` and open the "
+                           "login.tailscale.com link it prints" % (host["name"], ssh_target(host)))
+    if code is None:
         raise RuntimeError("no answer in %ds" % timeout)
-    for line in p.stdout.splitlines():
+    for line in out.splitlines():
         if line.startswith(MARK):
             return json.loads(line[len(MARK):])
-    err = (p.stderr.strip().splitlines() or ["exit %d" % p.returncode])[-1]
+    err = (err.strip().splitlines() or ["exit %d" % code])[-1]
     raise RuntimeError(err[:300])
+
+
+def run(cmd, data, timeout):
+    """subprocess.run(cmd, input=data) that also stops early on a Tailscale SSH
+    check prompt. Returns (exit code or None on timeout, stdout, stderr)."""
+    import threading
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out, err = [], []
+
+    def feed():
+        try:
+            p.stdin.write(data)
+            p.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def pump(f, acc, watch):
+        for line in f:
+            acc.append(line)
+            if watch and TS_CHECK in line:
+                p.kill()
+    readers = [threading.Thread(target=pump, args=(p.stdout, out, False), daemon=True),
+               threading.Thread(target=pump, args=(p.stderr, err, True), daemon=True)]
+    for t in [threading.Thread(target=feed, daemon=True)] + readers:
+        t.start()
+    try:
+        code = p.wait(timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        code = None
+    for t in readers:
+        t.join(5)
+    return code, "".join(out), "".join(err)
 
 
 def each(table, call, timeout=90):

@@ -130,6 +130,9 @@ setTimeout(() => process.exit(2), 15000);
 
 MODELS = os.path.join(HOME, ".heron", "models.json")        # working models here, best first
 MODEL_STATE = os.path.join(HOME, ".heron", "model-state.json")  # {"index", "until"}: a fallback in use
+# {"chat", "model"}: the model the keeper last put the chat on while this computer hosts it.
+# A different model after that is the person's pick from the app, and stays.
+MODEL_APPLIED = os.path.join(HOME, ".heron", "model-applied.json")
 MODEL_TROUBLE = re.compile(r"rate.?limit|session limit|usage limit|quota|429|401|403|authenticat|expired|overloaded|subscription", re.I)
 FALLBACK_SECS = 3600
 # "You've hit your session limit · resets 2pm (America/Vancouver)"
@@ -499,10 +502,16 @@ def keep_chat(mcp, cfg, devices, me, online):
             fall_back(mcp, chat)
             nudge_for_reports(mcp, chat)
             want = heron_model()
-            if want and chat.get("model") != want:
-                set_model(mcp, chat, want)
-                log(f"model {chat.get('model')} -> {want} on {chat['id'][:8]}")
+            applied = {"chat": chat["id"], "model": want}
+            if want and read_json(MODEL_APPLIED) != applied:
+                if chat.get("model") != want:
+                    set_model(mcp, chat, want)
+                    log(f"model {chat.get('model')} -> {want} on {chat['id'][:8]}")
+                write_json(MODEL_APPLIED, applied)
             return
+        # Hosted elsewhere: when it comes back, put it on this computer's model again.
+        if os.path.exists(MODEL_APPLIED):
+            os.remove(MODEL_APPLIED)
         if host and online(host):
             # Fail back: the chat is on a lower-priority computer (it took
             # over while this one was down), this is the first online one, and

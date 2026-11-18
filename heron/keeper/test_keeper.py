@@ -304,6 +304,7 @@ class Chat(unittest.TestCase):
         K.THREADS = os.path.join(self.tmp, "threads")
         K.MODELS = os.path.join(self.tmp, "models.json")
         K.MODEL_STATE = os.path.join(self.tmp, "model-state.json")
+        K.MODEL_APPLIED = os.path.join(self.tmp, "model-applied.json")
         K.write_json(K.MODELS, ["claude", "gpt"])
         self.ipc, self.logs = [], []
         K.ipc = lambda method, params: self.ipc.append(params)
@@ -366,6 +367,30 @@ class Chat(unittest.TestCase):
     def test_the_host_puts_the_chat_on_its_own_working_model(self):
         self.keep(AIR, FakeMcp([self.chat(AIR, model="something-else")]))
         self.assertEqual([p["config"]["model"] for p in self.ipc], ["claude"])
+
+    def test_a_model_the_person_picks_is_kept(self):
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="something-else")]))
+        self.ipc.clear()
+        # they pick another model in the app: the keeper leaves it, tick after tick
+        for _ in range(3):
+            self.keep(AIR, FakeMcp([self.chat(AIR, model="gpt-new")]))
+        self.assertEqual([p for p in self.ipc if p.get("op") == "setChatConfig"], [])
+
+    def test_a_picked_model_still_falls_back_on_a_limit_and_comes_back_after(self):
+        self.keep(AIR, FakeMcp([self.chat(AIR)]))  # on claude already
+        bad = [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="gpt-new", sessionStatus="errored")], bad))
+        self.assertEqual(self.ipc[-1]["config"]["model"], "gpt")
+        self.ipc.clear()
+        K.write_json(K.MODEL_STATE, {**K.read_json(K.MODEL_STATE), "until": 0})  # the limit resets
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="gpt")]))
+        self.assertEqual([p["config"]["model"] for p in self.ipc], ["claude"])
+
+    def test_a_chat_that_comes_back_is_put_on_this_computers_model(self):
+        self.keep(ZEPH, FakeMcp([self.chat(ZEPH)]))  # zeph hosted it once, on claude
+        self.keep(ZEPH, FakeMcp([self.chat(AIR)]))   # then air did
+        self.keep(ZEPH, FakeMcp([self.chat(ZEPH, model="air-only-model")]))  # and it's back
+        self.assertEqual([p["config"]["model"] for p in self.ipc if p.get("op") == "setChatConfig"], ["claude"])
 
     def test_a_limit_error_falls_back_to_the_next_model_once(self):
         errored = self.chat(AIR, sessionStatus="errored")

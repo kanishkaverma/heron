@@ -474,5 +474,31 @@ class PiSync(unittest.TestCase):
         self.assertEqual(offsets, [60, 60 + K.PI_SYNC_EVERY, 60 + 2 * K.PI_SYNC_EVERY])
 
 
+class PiSyncSkipTest(unittest.TestCase):
+    """pi_sync.share: a skill removed on purpose (skip_skills) stays removed."""
+
+    def test_a_skipped_skill_is_not_shared_linked_or_kept_linked(self):
+        spec = importlib.util.spec_from_file_location("pi_sync", os.path.join(HERE, "pi_sync.py"))
+        P = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(P)
+        tmp = tempfile.mkdtemp(prefix="heron-pisync-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        P.SHARED = os.path.join(tmp, "shared")
+        pool, mine_dir = os.path.join(P.SHARED, "skills"), os.path.join(tmp, "agents-skills")
+        for name in ("keep", "gone", "gone-too"):
+            os.makedirs(os.path.join(pool, name))
+            open(os.path.join(pool, name, "SKILL.md"), "w").close()
+        os.makedirs(os.path.join(mine_dir, "local-gone"))
+        open(os.path.join(mine_dir, "local-gone", "SKILL.md"), "w").close()
+        os.symlink(os.path.join(pool, "gone-too"), os.path.join(mine_dir, "gone-too"))  # linked in earlier
+        json.dump({"skip_skills": ["gone", "gone-too", "local-gone"]}, open(os.path.join(P.SHARED, "pi-sync.json"), "w"))
+
+        P.share("skills", P.local_items([mine_dir]), mine_dir)
+
+        self.assertEqual(sorted(os.listdir(mine_dir)), ["keep", "local-gone"])  # own copy stays, pool link gone
+        self.assertFalse(os.path.exists(os.path.join(pool, "local-gone")))       # never shared
+        self.assertTrue(os.path.islink(os.path.join(mine_dir, "keep")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, warnings="ignore")

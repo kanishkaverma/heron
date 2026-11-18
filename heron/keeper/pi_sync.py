@@ -22,7 +22,11 @@ On each computer it:
   5. updates Pi when another computer runs a newer version;
   6. publishes its session-history index, so `hist` (the history_search and
      history_read tools) on the other computers can read this one's sessions.
-Nothing is ever removed.
+Nothing is ever removed, except what shared/pi-sync.json says was removed on
+purpose: {"skip_packages": [...], "skip_skills": [...], "skip_extensions": [...],
+"skip_tools": [...]}. A skipped package is never installed; a skipped skill,
+extension or tool is never shared into the pool or linked in, and a link this
+script made into the pool for it is taken away (the computer's own copy stays).
 """
 import datetime
 import json
@@ -119,7 +123,14 @@ def share(kind, mine, link_dir):
     pool = os.path.join(SHARED, kind)
     os.makedirs(pool, exist_ok=True)
     os.makedirs(link_dir, exist_ok=True)
-    added = linked = 0
+    skip = skip_list(kind)
+    mine = {name: path for name, path in mine.items() if name not in skip}
+    added = linked = unlinked = 0
+    for name in sorted(skip):
+        link = os.path.join(link_dir, name)
+        if os.path.islink(link) and in_pool(link):
+            os.remove(link)  # one of ours: the skill/extension was removed on purpose
+            unlinked += 1
     for name, path in mine.items():
         dest = os.path.join(pool, name)
         if not os.path.lexists(dest) or newest_mtime(path) > newest_mtime(dest) + 60:
@@ -129,7 +140,7 @@ def share(kind, mine, link_dir):
             except Exception as e:
                 log(f"couldn't share {kind}/{name}: {e}")
     for name in sorted(os.listdir(pool)):
-        if name.startswith(".") or name.endswith(".incoming") or ".sync-conflict-" in name or name in mine:
+        if name.startswith(".") or name.endswith(".incoming") or ".sync-conflict-" in name or name in mine or name in skip:
             continue
         link = os.path.join(link_dir, name)
         if os.path.lexists(link):
@@ -139,8 +150,8 @@ def share(kind, mine, link_dir):
                 continue
         os.symlink(os.path.join(pool, name), link)
         linked += 1
-    if added or linked:
-        log(f"{kind}: shared {added}, linked in {linked}")
+    if added or linked or unlinked:
+        log(f"{kind}: shared {added}, linked in {linked}" + (f", unlinked {unlinked} skipped" if unlinked else ""))
 
 
 # ---------------------------------------------------------------- packages, MCP, version
@@ -214,11 +225,12 @@ def others():
     return out
 
 
-def skip_list():
-    """Packages never copied between computers: ~/.heron/shared/pi-sync.json
-    {"skip_packages": ["remote-pi", ...]} (a package removed on purpose)."""
+def skip_list(kind="packages"):
+    """What is never copied between computers, because it was removed on purpose:
+    ~/.heron/shared/pi-sync.json {"skip_packages": ["remote-pi", ...],
+    "skip_skills": ["gmcli", ...], "skip_extensions": [...], "skip_tools": [...]}."""
     try:
-        return set(json.load(open(os.path.join(SHARED, "pi-sync.json"))).get("skip_packages", []))
+        return set(json.load(open(os.path.join(SHARED, "pi-sync.json"))).get(f"skip_{kind}", []))
     except Exception:
         return set()
 

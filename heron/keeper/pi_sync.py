@@ -300,6 +300,7 @@ def main():
     sync_packages(mine, peers)
     sync_mcp(peers)
     write_manifest()
+    log(f"done ({len(peers)} other computers)")
 
 
 if __name__ == "__main__":

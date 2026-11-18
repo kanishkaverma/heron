@@ -380,11 +380,73 @@ class Chat(unittest.TestCase):
         self.assertEqual(again.did("send_message"), [])
         self.assertEqual(K.heron_model(), "gpt")  # and it stays on the fallback for the hour
 
+    def test_the_fallback_lasts_until_the_limit_resets(self):
+        # 11:52 in Vancouver; Claude says the limit resets at 2pm there.
+        from zoneinfo import ZoneInfo
+        van = ZoneInfo("America/Vancouver")
+        now = datetime.datetime(2026, 11, 17, 11, 52, tzinfo=van).timestamp()
+        text = "Claude quota exceeded — rate limit (five_hour) — resets 2:00:00 PM: You've hit your session limit · resets 2pm (America/Vancouver)"
+        reset = datetime.datetime(2026, 11, 17, 14, 0, tzinfo=van).timestamp()
+        self.assertEqual(K.limit_reset(text, now), reset)
+        self.assertEqual(K.limit_reset("resets 9:30am (America/Vancouver)", now),
+                         datetime.datetime(2026, 11, 18, 9, 30, tzinfo=van).timestamp())  # tomorrow
+        self.assertIsNone(K.limit_reset("429 rate limit reached", now))
+        self.assertIsNone(K.limit_reset("resets 2pm (Not/AZone)", now))
+        # the keeper, at 11:52: on the fallback until just after 2pm, not for an hour
+        real_time = K.time.time
+        K.time.time = lambda: now
+        try:
+            self.keep(AIR, FakeMcp([self.chat(AIR, sessionStatus="errored")], [{"id": "m1", "role": "assistant", "errors": [text]}]))
+            self.assertEqual(K.heron_model(), "gpt")
+            K.time.time = lambda: reset - 60   # 1:59pm
+            self.assertEqual(K.heron_model(), "gpt")
+            K.time.time = lambda: reset + 300  # 2:05pm
+            self.assertEqual(K.heron_model(), "claude")
+        finally:
+            K.time.time = real_time
+        until = K.read_json(K.MODEL_STATE)["until"]
+        self.assertTrue(reset < until < reset + 600)
+
+    def test_an_unknown_reset_time_falls_back_for_an_hour(self):
+        errored = self.chat(AIR, sessionStatus="errored")
+        self.keep(AIR, FakeMcp([errored], [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]))
+        left = K.read_json(K.MODEL_STATE)["until"] - K.time.time()
+        self.assertAlmostEqual(left, K.FALLBACK_SECS, delta=5)
+
     def test_an_ordinary_error_does_not_switch_models(self):
         mcp = FakeMcp([self.chat(AIR, sessionStatus="errored")], [{"id": "m1", "role": "assistant", "errors": ["tool crashed"]}])
         self.keep(AIR, mcp)
         self.assertEqual(self.ipc, [])
         self.assertEqual(mcp.did("send_message"), [])
+
+
+class PiSync(unittest.TestCase):
+    """maybe_pi_sync: a minute after the keeper starts, then every 30 minutes."""
+
+    def test_runs_a_minute_after_start_then_every_half_hour(self):
+        clock = [1_000_000.0]
+        started = []
+
+        class Proc:
+            def poll(self):
+                return 0
+
+        tmp = tempfile.mkdtemp(prefix="heron-keeper-test-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        open(os.path.join(tmp, "pi_sync.py"), "w").close()
+        real_time, real_popen, real_file = K.time.time, K.subprocess.Popen, K.__file__
+        K.__file__ = os.path.join(tmp, "heron-keeper.py")
+        K.time.time = lambda: clock[0]
+        K.subprocess.Popen = lambda *a, **k: started.append(clock[0]) or Proc()
+        try:
+            state = {}
+            for _ in range(int(3 * K.PI_SYNC_EVERY / 10)):   # 90 minutes of 10 s ticks
+                K.maybe_pi_sync(state)
+                clock[0] += 10
+        finally:
+            K.time.time, K.subprocess.Popen, K.__file__ = real_time, real_popen, real_file
+        offsets = [round(t - 1_000_000) for t in started]
+        self.assertEqual(offsets, [60, 60 + K.PI_SYNC_EVERY, 60 + 2 * K.PI_SYNC_EVERY])
 
 
 if __name__ == "__main__":

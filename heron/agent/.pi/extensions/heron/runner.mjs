@@ -173,6 +173,7 @@ function runOnce(model, text) {
     if (model) args.push("--model", model);
     args.push("--name", `Heron task: ${spec.title}`, "--", text);
     errorText = "";
+    lastText = ""; // a run that failed on a limit said only that; it is not the report
     let pending = "";
     child = spawn(pi, args, { cwd: file("work"), env, stdio: ["ignore", "pipe", "pipe"] });
     child.stderr.on("data", (c) => errors.write(c));

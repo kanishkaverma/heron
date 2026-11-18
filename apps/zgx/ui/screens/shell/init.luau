@@ -44,6 +44,8 @@ local host = require("@app/screens/settings/host")
 -- (The look chosen, applied as it loads.)
 local appearance = require("@app/screens/shell/appearance")
 local motion = require("@ds/motion")
+-- Heron's window: this shell with one chat and nowhere else to go.
+local heron = require("@app/screens/heron")
 
 local TITLE_H = 38
 
@@ -81,8 +83,24 @@ return function(): Node
 	-- window's fit for room (screens/shell/fit: still open, back as the
 	-- window widens), and the most it may take.
 	local collapsed = ui.computed(function(): boolean
-		return view.collapsed:get() or not fit.current:get().sidebar
+		return heron.on or view.collapsed:get() or not fit.current:get().sidebar
 	end)
+	-- Heron: the window is on its one chat, whatever else moves it (and the
+	-- launch never settles on another: screens/shell/route).
+	local function on_heron_chat(): boolean
+		local id = heron.chat:get()
+		local at = route.current:get()
+		return id ~= nil and at.name == "session" and at.session == id
+	end
+	if heron.on then
+		route.launched:set(true)
+		ui.effect(function()
+			local id = heron.chat:get()
+			if id and not on_heron_chat() then
+				route.open_session(id)
+			end
+		end)
+	end
 	local function sidebar_limit(): number
 		return fit.sidebar_room:get()
 	end
@@ -320,8 +338,17 @@ return function(): Node
 	-- Each on its key now (Settings → Shortcuts rebinds it at once). A
 	-- command's key goes to its menu item before any `on_key` hears it, so
 	-- each but ⌘1–9 tells the sidebar's ⌘ hints a key went down itself.
+	if heron.on then
+		-- (No tab to close first: the window.)
+		runs["shell.close"] = function()
+			ui.invoke("close")
+		end
+	end
 	for _, k in keys.LIST do
 		local run = runs[k.id]
+		if heron.on and not heron.ALLOWED[k.id] then
+			run = nil
+		end
 		if run then
 			local jump = string.match(k.id, "^shell%.session_%d$") ~= nil
 			ui.command {
@@ -379,7 +406,7 @@ return function(): Node
 		local state = auth.state:get()
 		if state == "signed_in" then
 			was_signed_in = true
-		elseif state == "signed_out" and was_signed_in then
+		elseif state == "signed_out" and was_signed_in and not heron.on then
 			was_signed_in = false
 			ui.invoke("app.onboard")
 		end
@@ -539,21 +566,23 @@ return function(): Node
 				min_h = 0,
 				w_full = true,
 				-- (Settings stand in its place and the page's, under the top bar.)
-				ui.div {
-					h_full = true,
-					shrink = 0,
-					hidden = in_settings,
-					boundary.screen(boundary.named("shell.boundary.screen.sidebar"), "@app/screens/shell/sidebar", function(Sidebar): Node
-						return Sidebar { collapsed = collapsed :: any, limit = sidebar_limit, direct = sidebar_direct, top = 42 }
-					end),
-				},
+				if heron.on
+					then nil
+					else ui.div {
+						h_full = true,
+						shrink = 0,
+						hidden = in_settings,
+						boundary.screen(boundary.named("shell.boundary.screen.sidebar"), "@app/screens/shell/sidebar", function(Sidebar): Node
+							return Sidebar { collapsed = collapsed :: any, limit = sidebar_limit, direct = sidebar_direct, top = 42 }
+						end),
+					},
 				boundary.screen(boundary.named("shell.boundary.screen.page"), "@app/screens/shell/page", function(Page): Node
 					return Page { files = files, width = window_w, away = in_settings, settings = settings_view }
 				end, { pass = true }),
 			},
 			-- The rail, while the sidebar is collapsed: floating over the page at
 			-- the window's bottom left. (Not mounted while `view.rail` is off.)
-			if view.rail
+			if view.rail and not heron.on
 				then ui.div {
 					id = "shell-rail",
 					absolute = true,
@@ -694,12 +723,32 @@ return function(): Node
 		-- The engine's updates watched, whatever shows (C's
 		-- screens/engine/update: an idle engine of this app's that's out of
 		-- date restarted on the spot; it draws nothing).
-		boundary.screen(boundary.named("shell.boundary.screen.update_watch"), "@app/screens/engine/update", function(update): Node
-			return update.Watch()
-		end, { pass = true }),
+		-- (Not Heron's: the engine is Zeron's to update.)
+		if heron.on
+			then nil
+			else boundary.screen(boundary.named("shell.boundary.screen.update_watch"), "@app/screens/engine/update", function(update): Node
+				return update.Watch()
+			end, { pass = true }),
+		-- Heron, until its chat is open: what's happening, over the window.
+		if heron.on
+			then ui.show(
+				function(): boolean
+					return not on_heron_chat()
+				end,
+				ui.div {
+					absolute = true,
+					left = 0,
+					right = 0,
+					top = 0,
+					bottom = 0,
+					heron.Status(),
+					ui.div { absolute = true, left = 0, right = 0, top = 0, h = TITLE_H, window_drag = true },
+				}
+			)
+			else nil,
 		-- The palette (⌘K, or the sidebar's Search): over everything, taking
 		-- no room of its own.
-		ui.div {
+		if heron.on then nil else ui.div {
 			absolute = true,
 			left = 0,
 			top = 0,

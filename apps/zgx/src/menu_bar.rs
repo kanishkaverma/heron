@@ -230,6 +230,11 @@ impl Menus {
             eprintln!("zeron-zgx: menus: {} is the host's; the script's is left out", command.id);
             return;
         }
+        // Heron's bar: only what its one chat has a use for. (A command's
+        // key is its menu item's, so what's left out has no shortcut either.)
+        if crate::heron::ON && !heron_keeps(&command.id, &title) {
+            return;
+        }
         if !self.ids.insert(command.id.clone()) {
             eprintln!("zeron-zgx: menus: {} is declared twice; shown once", command.id);
             return;
@@ -308,14 +313,27 @@ impl Menus {
         if let Some(preview) = preview {
             entries.push(AppMenuEntry::item(format!("Keep {}…", clean(&preview.name)), plugins::KEEP_TEMPLATE));
         }
-        let mut back = AppMenuEntry::item(USE_ZERON_TITLE, plugins::USE_ZERON_TEMPLATE);
-        if let Some(key) = accelerator(DEFAULT_INTERFACE_KEY) {
-            back = back.accelerator(key);
+        // (Not in Heron's bar: templates are Zeron's, and it runs none.)
+        if !crate::heron::ON {
+            let mut back = AppMenuEntry::item(USE_ZERON_TITLE, plugins::USE_ZERON_TEMPLATE);
+            if let Some(key) = accelerator(DEFAULT_INTERFACE_KEY) {
+                back = back.accelerator(key);
+            }
+            entries.push(back);
         }
-        entries.push(back);
+        if entries.last().is_some_and(|e| *e == AppMenuEntry::Separator) {
+            entries.pop();
+        }
         self.menus.retain(|m| !m.entries.is_empty());
         self.menus
     }
+}
+
+/// Whether Heron's bar keeps a script's command: finding in the chat,
+/// closing the window, dictating, reloading the scripts, and the view's zoom.
+fn heron_keeps(id: &str, title: &str) -> bool {
+    matches!(id, "shell.find" | "shell.close" | "shell.dictate" | "shell.reload_interface")
+        || matches!(title, "Zoom In" | "Zoom Out" | "Actual Size")
 }
 
 /// `text` without the NULs a menu refuses, trimmed.

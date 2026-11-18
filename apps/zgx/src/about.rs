@@ -121,6 +121,11 @@ impl Desktop {
     /// The app's own updater, in an install that updates itself (a macOS
     /// app bundle); none in a development build.
     fn start() -> Option<Rc<Self>> {
+        // Heron.app never updates itself: what the updater installs is
+        // Zeron.app, and the channel is Zeron's to choose (src/heron.rs).
+        if crate::heron::ON {
+            return None;
+        }
         let install = zeron_update::detect_install();
         if !install.supports_desktop_update() {
             return None;

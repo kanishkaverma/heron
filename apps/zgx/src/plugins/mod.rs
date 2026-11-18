@@ -1097,6 +1097,10 @@ pub fn set_view(handle: zgx::compose::ViewHandle) {
 /// whatever `.active` says until you pick a template on the Templates page,
 /// and the terminals templates started are closed. The window follows.
 pub fn use_zeron_template() {
+    // (Templates are Zeron's: Heron runs none and chooses none.)
+    if crate::heron::ON {
+        return;
+    }
     preview::enter_safe();
     if let Some(root) = templates_root()
         && let Err(error) = live::set_active(&root, live::BUILTIN)

@@ -12,6 +12,7 @@ local route = require("@app/screens/shell/route")
 local fit = require("@app/screens/shell/fit")
 local boundary = require("@app/screens/shell/boundary")
 local locale = require("@ds/locale")
+local heron = require("@app/screens/heron")
 
 -- The actions' last width, kept across a reload of the scripts.
 local actions_width = ui.state("shell_titlebar_actions_w", 0)
@@ -161,6 +162,18 @@ return function(props: Props): Node
 			}
 		),
 	}
+	-- Heron: the window's own buttons, and nothing to press.
+	if heron.on then
+		return ui.div {
+			id = "titlebar",
+			absolute = true,
+			left = 0,
+			right = 0,
+			top = 0,
+			pointer_events = "none",
+			ds.TitleBar { collapsed = props.collapsed, bare = true },
+		}
+	end
 	return ui.div {
 		id = "titlebar",
 		absolute = true,

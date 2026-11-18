@@ -33,6 +33,7 @@ local DropOverlay = require("@ds/drop_overlay")
 local Dock = require("@app/screens/chat/dock")
 local control = require("@ds/control")
 local Glass = require("@ds/glass")
+local heron = require("@app/screens/heron")
 
 export type Props = {
 	files: State<boolean>,
@@ -2017,7 +2018,7 @@ return function(props: Props): Node
 		panel_edge,
 		-- The sessions open, along the whole top bar: from just past the sidebar's
 		-- "…" (with it shut, past Back and Forward) to the panel toggle.
-		session_tabs.Strip {
+		if heron.on then nil else session_tabs.Strip {
 			window_x = function(): number
 				-- (The row ends at the window's right: where it starts is what its
 				-- width leaves, followed as the sidebar moves.)
@@ -2042,7 +2043,7 @@ return function(props: Props): Node
 		},
 		-- What there is to update, beside the panel toggle (and Expand, with the
 		-- panel open): nothing with nothing to say.
-		ui.show(updates.shown, ui.div {
+		if heron.on then nil else ui.show(updates.shown, ui.div {
 			absolute = true,
 			right = function(): number
 				local toggle = 24 + 8 + ds.TitleBar.actions_right()

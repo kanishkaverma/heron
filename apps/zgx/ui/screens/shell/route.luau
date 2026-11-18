@@ -53,6 +53,7 @@
 -- move (`M.launched`).
 
 local sessions = require("@account/sessions")
+local heron = require("@app/screens/heron")
 local look = require("@app/screens/shell/project_look")
 
 local M = {}
@@ -168,7 +169,8 @@ function M.make()
 	router = ui.router {
 		routes = ROUTES,
 		initial = entries[1],
-		scheme = "zeron",
+		-- (`zeron://` links are Zeron's window's, not Heron's.)
+		scheme = if heron.on then nil else "zeron",
 		-- Back steps through every place since launch, however many (zgx
 		-- keeps the last 100 unless told). What a reload replays is
 		-- `HISTORY_MAX`'s.
@@ -440,6 +442,10 @@ ui.effect(function()
 	-- (The chats read first: an early return keeps following them.)
 	local now = sessions.now:get()
 	local late = given_up:get()
+	-- (Heron's window goes to its one chat itself: screens/shell.)
+	if heron.on then
+		return
+	end
 	if M.launched:peek() then
 		return
 	end

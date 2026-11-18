@@ -52,6 +52,9 @@ export type Props = {
 	-- Where the actions' width is kept (a named state of the caller's, so it
 	-- outlives a reload of the scripts); its own otherwise.
 	read actions_width: State<number>?,
+	-- No sidebar toggle, Back or Forward: a window with nowhere else to go
+	-- (Heron's).
+	read bare: boolean?,
 }
 
 -- Zeron's metrics. The bar: 38 tall, its row padded 4 at the top, so its
@@ -442,6 +445,7 @@ local TitleBar = ui.component(function(props: Props): Node
 			left = toggle_in(full_screen_now(), false),
 			top = middle(false) - CONTROL / 2,
 			items = "center",
+			hidden = props.bare == true,
 			pointer_events = "auto",
 			-- (Between its controls, the bar is still the window's to move:
 			-- they keep their presses, the gaps between them move it.)

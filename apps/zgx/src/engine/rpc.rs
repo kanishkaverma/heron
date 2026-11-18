@@ -427,7 +427,11 @@ impl Rpc {
     /// A unary call: its `ok`, or its `err`.
     pub fn call(&self, method: &str, params: Value) -> Pin<Box<dyn Future<Output = Result<Value, String>>>> {
         let reply: Reply = Rc::default();
-        if self.is_closed() {
+        if crate::heron::refuses(method) {
+            // (Heron is a window onto Zeron's engine: src/heron.rs.)
+            eprintln!("zeron-zgx: heron: {method} is Zeron's to ask, not sent");
+            reply.borrow_mut().0 = Some(Err("Heron doesn't do this: use Zeron".into()));
+        } else if self.is_closed() {
             reply.borrow_mut().0 = Some(Err("closed".into()));
         } else {
             let id = self.send(method, params);

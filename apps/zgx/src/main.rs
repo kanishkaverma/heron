@@ -49,6 +49,7 @@ mod files;
 mod fonts;
 mod github;
 mod haptics;
+mod heron;
 mod heap;
 mod images;
 mod intro_handoff;
@@ -155,7 +156,13 @@ use zgx_script::{ScriptHost, Shared, Value};
 
 /// Where `ui.persist` keeps its files: the Zeron app's (the beta), apart from
 /// development builds', which are staging's.
-const APP_ID: &str = if cfg!(feature = "beta") { "zeron" } else { "zeron-zgx" };
+const APP_ID: &str = if heron::ON {
+    "heron"
+} else if cfg!(feature = "beta") {
+    "zeron"
+} else {
+    "zeron-zgx"
+};
 
 /// Setup's window, in points: room for a step and its footer, no more.
 const ONBOARDING_SIZE: (f64, f64) = (680., 500.);
@@ -321,7 +328,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // Where a launch opens (`opening`). Asking for `intro` still plays it.
-    if matches!(screen, Screen::Intro) && !asked_for_intro {
+    if heron::ON {
+        // Heron has no setup of its own: its one window, which says so when
+        // Zeron isn't there or isn't signed in (ui/screens/heron).
+        screen = Screen::Main;
+    } else if matches!(screen, Screen::Intro) && !asked_for_intro {
         let session = auth::session_exists();
         match opening(session, session && finished_setup_before(), welcomed(), onboarded()) {
             Opening::Intro => {}
@@ -343,7 +354,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The Zeron app's links (`zeron://`: a clicked banner, a chat's link),
     // delivered to the app as Zeron.app's are (src/links.rs).
-    if cfg!(feature = "beta") {
+    // (Not Heron's: the links and the banners are Zeron.app's.)
+    if cfg!(feature = "beta") && !heron::ON {
         application = application
             .application_id("sh.zeron.app")?
             .on_application_event(|event, _| {
@@ -355,7 +367,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
     }
     // A clicked banner: Zeron forward on its chat (src/links.rs).
-    links::take_banner_clicks();
+    if !heron::ON {
+        links::take_banner_clicks();
+    }
     let options = match screen {
         Screen::Intro => intro_window(),
         Screen::Onboarding => onboarding_window(),
@@ -377,9 +391,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     // Quitting: an update downloaded and never restarted for installs now,
     // so the next launch is on it (src/about.rs).
-    about::install_on_quit();
-    // Reload Zeron: the windows closed, a fresh launch in this one's place.
-    relaunch::after_quit();
+    // (Heron never updates itself, or starts itself again.)
+    if !heron::ON {
+        about::install_on_quit();
+        // Reload Zeron: the windows closed, a fresh launch in this one's place.
+        relaunch::after_quit();
+    }
     Ok(())
 }
 
@@ -543,6 +560,16 @@ fn open(cx: &mut WindowContext, entry: &str, inspect: bool) {
 /// The main window: app.luau as the shell (`window` = "main"), where setup
 /// is app.luau as onboarding.
 fn open_main(cx: &mut WindowContext, inspect: bool) {
+    // Heron: the shell from this app's own scripts, as its one chat
+    // (`window` = "heron"). No templates or plugins (they're Zeron's, kept in
+    // Zeron's data), nothing carried from Zeron's settings.
+    if heron::ON {
+        let host = script_host(cx, "app.luau");
+        host.shared("window", "heron");
+        serve(cx, host, "app.luau", inspect);
+        heap::install(cx);
+        return;
+    }
     // The active template laid over Zeron's own, in `<data>/templates/.live/`
     // (src/plugins/live.rs): the host's file is fixed as it's made, so it's
     // that folder's, whichever template is in use.
@@ -834,7 +861,10 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         // What a tool row opens to: its whole output or diff, fetched.
         tool_details::install(&host);
         // Appshots: the frontmost window, captured on its shortcut.
-        appshots::install(cx, &host);
+        // (Not Heron's: the shortcut is one for the whole Mac, and Zeron's.)
+        if !heron::ON {
+            appshots::install(cx, &host);
+        }
         // The panel's terminal tabs (src/terminal.rs).
         terminal::install(cx, &host);
         // The panel's home: run actions, the branch's totals (src/session_home.rs).
@@ -1264,7 +1294,7 @@ fn zeron_glass() -> Glass {
 /// blur, which the theme's `background` tints (the shipping app's glass).
 fn zeron_window(width: f64, height: f64) -> WindowOptions {
     WindowOptions {
-        title: "Zeron".into(),
+        title: if heron::ON { "Heron" } else { "Zeron" }.into(),
         width,
         height,
         decorations: cfg!(target_os = "macos"),
@@ -1291,9 +1321,9 @@ fn onboarding_window() -> WindowOptions {
 /// The main window: resizable, its frame kept across launches.
 fn main_window() -> WindowOptions {
     placed(WindowOptions {
-        min_size: Some((760., 500.)),
-        frame_autosave: Some("zeron-zgx-main".into()),
-        ..zeron_window(1240., 820.)
+        min_size: Some(if heron::ON { (420., 480.) } else { (760., 500.) }),
+        frame_autosave: Some(if heron::ON { "heron-main" } else { "zeron-zgx-main" }.into()),
+        ..if heron::ON { zeron_window(720., 860.) } else { zeron_window(1240., 820.) }
     })
 }
 

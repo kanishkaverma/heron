@@ -33,8 +33,11 @@ after you sign in there is only a chat.
 | `heron/agent/AGENTS.md` | Who Heron is: memory, how to talk, drafts-first, threads, accounts |
 | `heron/agent/.pi/extensions/heron/` | The background threads: `thread_start` / `_list` / `_read` / `_message` / `_stop`, a detached runner, and the report that wakes the chat; catch-up when the chat arrives from another computer |
 | `heron/keeper/heron-keeper.py` | Runs on every Heron computer: makes the Heron chat, keeps it on this computer's working model, takes it over when its computer is offline (priority: air, zeph, MacBook Pro) |
+| `heron/keeper/pi_sync.py` | Keeps Pi's skills, extensions and tools the same on every computer, and publishes each computer's session-history index to `~/.heron/shared/history`, so `history_search` / `history_read` cover all of them |
+| `heron/agent/memo-fix` | Corrects or removes one memory (`~/.heron/memo-fix`) |
 | `scripts/heron/memory-sync.py` | Syncthing for `~/.heron/memory` between the Heron computers |
 | `scripts/heron/setup-computer.sh` | Sets up a computer: OptMem, `~/heron`, its working model, heron-keeper, a 12 h idle window for Zeron |
+| `scripts/heron/package-mac-app.sh` | Heron.app for the Mac: the Heron chat in a window onto the Zeron already running there (zgx built with `--features heron`; `apps/zgx/src/heron.rs`, `apps/zgx/ui/screens/heron/`). `--install` puts it in /Applications |
 | `scripts/heron/sim.sh` | The fast loop: build, install, launch and screenshot in the iOS Simulator |
 | `scripts/heron/install-on-iphone.sh` | Downloads CI's archive, signs it with your team, installs it on your iPhone |
 | `.github/workflows/heron-ios.yml` | CI: unsigned device archive, plus unit and UI tests with screenshots in the simulator |

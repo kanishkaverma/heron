@@ -190,9 +190,11 @@ impl Config {
         Ok(Self {
             port,
             data_dir,
-            bin: exe.and_then(zeron_launch::engine_executable),
+            // (Heron attaches to the engine Zeron.app runs and never starts
+            // one: src/heron.rs.)
+            bin: if crate::heron::ON { None } else { exe.and_then(zeron_launch::engine_executable) },
             home: None,
-            spawn: true,
+            spawn: !crate::heron::ON,
             edge: edge.into(),
             client: client.into(),
             callback_port,

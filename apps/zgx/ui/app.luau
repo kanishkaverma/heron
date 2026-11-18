@@ -10,7 +10,14 @@ ds.setup()
 -- The language chosen (Settings → General), before any screen builds.
 require("@app/screens/language")
 
-if ui.shared("window", "onboarding"):peek() == "main" then
+local window = ui.shared("window", "onboarding"):peek()
+-- Heron's window (screens/heron): the shell, cut down to its one chat. No
+-- plugins: they're Zeron's.
+if window == "heron" then
+	local shell = require("@app/screens/shell")
+	return shell()
+end
+if window == "main" then
 	-- Plugins: their page in Settings, and what they're shown of Zeron.
 	require("@app/screens/plugins")
 	local shell = require("@app/screens/shell")

@@ -138,6 +138,11 @@ StandardError=append:$HOME/.heron/keeper.log
 [Install]
 WantedBy=default.target
 UNIT
+    # Task runs (runner.mjs) start in the keeper's cgroup: a keeper restart
+    # (a deploy, this script) must stop only the keeper, not every running task.
+    mkdir -p "$HOME/.config/systemd/user/heron-keeper.service.d"
+    printf '[Service]\n# Task runs (runner.mjs) live in this cgroup; restarting the keeper must not kill them.\nKillMode=process\n' \
+      > "$HOME/.config/systemd/user/heron-keeper.service.d/keep-task-runs.conf"
     systemctl --user daemon-reload
     systemctl --user enable --now heron-keeper.service
     systemctl --user restart heron-keeper.service

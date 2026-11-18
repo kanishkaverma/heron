@@ -455,9 +455,11 @@ TS_CHECK = "Tailscale SSH requires an additional check"
 
 
 def ssh_cmd(host, *remote):
-    # accept-new: a first visit by Tailscale name records its key instead of failing in batch mode.
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new",
-            ssh_target(host)] + list(remote)
+    target = ssh_target(host)
+    # accept-new only on the Tailscale fallback: a first visit by Tailscale name records its key
+    # instead of failing in batch mode. An ssh alias keeps the user's own host-key settings.
+    opts = ["-o", "StrictHostKeyChecking=accept-new"] if target != host["ssh"] else []
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"] + opts + [target] + list(remote)
 
 
 def remote(host, call, timeout=90):

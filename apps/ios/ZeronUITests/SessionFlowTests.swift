@@ -752,7 +752,9 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 5))
         input.tap()
         input.typeText("Then add a TL;DR.")
-        app.buttons["Queue message"].tap()
+        // Send steers while working; queue explicitly from the long-press menu.
+        app.buttons["composer-send"].press(forDuration: 0.8)
+        app.buttons["Queue for next turn"].tap()
         XCTAssertTrue(app.buttons["More queue actions"].waitForExistence(timeout: 5))
         app.navigationBars.buttons.element(boundBy: 0).tap()
         let accessory = app.buttons["new-session"]

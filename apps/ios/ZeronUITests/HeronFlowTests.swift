@@ -50,4 +50,35 @@ final class HeronFlowTests: XCTestCase {
         XCTAssertFalse(app.buttons["Terminal"].exists)
         snapshot(app, "4-menu")
     }
+
+    /// Regression: the chat is made without an effort, and the effort chip
+    /// only showed one already set, so it could never be changed.
+    func testThinkingLevelCanBeChanged() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-demo", "-fast", "-fresh-demo"]
+        app.launch()
+        let input = app.textViews["composer-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 20))
+        input.tap()
+        let chip = app.buttons["composer-chip-effort"]
+        XCTAssertTrue(chip.waitForExistence(timeout: 20), "an effort chip on a chat without one")
+        XCTAssertTrue(chip.label.contains("Default"), "got \(chip.label)")
+        snapshot(app, "5-effort-default")
+        chip.tap()
+        let high = app.buttons["High"].firstMatch
+        XCTAssertTrue(high.waitForExistence(timeout: 5), "the model's levels load")
+        snapshot(app, "6-effort-menu")
+        high.tap()
+        XCTAssertTrue(app.buttons["composer-chip-effort"].waitForLabel(containing: "High", timeout: 5))
+        snapshot(app, "7-effort-high")
+        // (The demo reseeds its chats on launch, so keeping it across a
+        // relaunch is the host's job, not something this can check.)
+    }
+}
+
+private extension XCUIElement {
+    func waitForLabel(containing text: String, timeout: TimeInterval) -> Bool {
+        let match = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", text), object: self)
+        return XCTWaiter.wait(for: [match], timeout: timeout) == .completed
+    }
 }

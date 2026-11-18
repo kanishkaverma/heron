@@ -276,15 +276,15 @@ class Tasks(unittest.TestCase):
 
 
 class FakeMcp:
-    def __init__(self, chats, messages=()):
-        self.chats, self.messages, self.calls = chats, list(messages), []
+    def __init__(self, chats, messages=(), reasoning=None):
+        self.chats, self.messages, self.calls, self.reasoning = chats, list(messages), [], reasoning
 
     def tool(self, name, args=None):
         self.calls.append((name, args or {}))
         if name == "list_chats":
             return {"chats": self.chats}
         if name == "get_chat":
-            return {"harness": "pi", "reasoning": None}
+            return {"harness": "pi", "reasoning": self.reasoning}
         if name == "read_chat":
             return {"messages": self.messages}
         if name == "create_chat":
@@ -437,6 +437,13 @@ class Chat(unittest.TestCase):
         self.keep(AIR, FakeMcp([errored], [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]))
         left = K.read_json(K.MODEL_STATE)["until"] - K.time.time()
         self.assertAlmostEqual(left, K.FALLBACK_SECS, delta=5)
+
+    def test_a_model_switch_keeps_the_picked_thinking_level(self):
+        self.keep(AIR, FakeMcp([self.chat(AIR, model="something-else")], reasoning="high"))
+        bad = [{"id": "m1", "role": "assistant", "errors": ["429 rate limit reached"]}]
+        self.keep(AIR, FakeMcp([self.chat(AIR, sessionStatus="errored")], bad, reasoning="high"))
+        self.assertEqual([p["config"]["model"] for p in self.ipc][:2], ["claude", "gpt"])
+        self.assertEqual({p["config"]["reasoning"] for p in self.ipc}, {"high"})
 
     def test_an_ordinary_error_does_not_switch_models(self):
         mcp = FakeMcp([self.chat(AIR, sessionStatus="errored")], [{"id": "m1", "role": "assistant", "errors": ["tool crashed"]}])

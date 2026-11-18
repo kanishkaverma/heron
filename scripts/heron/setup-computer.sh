@@ -73,8 +73,27 @@ for model in ${HERON_MODELS:-claude-bridge/claude-opus-5-5 anthropic/claude-opus
 done
 if [ "${#working[@]}" -gt 0 ]; then
   printf '%s\n' "${working[@]}" | python3 -c 'import json,sys; json.dump([l.strip() for l in sys.stdin if l.strip()], open(sys.argv[1],"w"), indent=1)' "$HOME/.heron/models.json"
-  first="${working[0]}"
-  printf '{\n  "defaultProvider": "%s",\n  "defaultModel": "%s"\n}\n' "${first%%/*}" "${first#*/}" > "$DEST/.pi/settings.json"
+  # Keeps what else is in the file. Compaction: Heron compacts at about 400k
+  # tokens (reserve = context window - 400k), or with ~20% left on a smaller window.
+  python3 - "$DEST/.pi/settings.json" "${working[0]}" <<'PY'
+import json, sys
+path, first = sys.argv[1:]
+try:
+    s = json.load(open(path))
+except Exception:
+    s = {}
+s["defaultProvider"], s["defaultModel"] = first.split("/", 1)
+overrides = s.setdefault("compaction", {}).setdefault("modelOverrides", {})
+for model, reserve in {
+    "claude-bridge/claude-opus-5-5": 600000,   # 1M
+    "anthropic/claude-opus-5-5": 600000,       # 1M
+    "openai-codex/gpt-6.1-sol": 100000,        # 500K
+    "openai-codex/gpt-6.2-sol": 100000,        # 500K
+    "openai-codex/gpt-6.2-astra": 55000,       # 272K: compacts at ~217K
+}.items():
+    overrides.setdefault(model, {"reserveTokens": reserve})
+json.dump(s, open(path, "w"), indent=2)
+PY
 fi
 cat "$HOME/.heron/models.json" 2>/dev/null
 cat "$DEST/.pi/settings.json" 2>/dev/null || echo "No working model found: Heron will use Pi's default here."

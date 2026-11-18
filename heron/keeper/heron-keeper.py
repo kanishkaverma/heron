@@ -132,6 +132,26 @@ MODELS = os.path.join(HOME, ".heron", "models.json")        # working models her
 MODEL_STATE = os.path.join(HOME, ".heron", "model-state.json")  # {"index", "until"}: a fallback in use
 MODEL_TROUBLE = re.compile(r"rate.?limit|session limit|usage limit|quota|429|401|403|authenticat|expired|overloaded|subscription", re.I)
 FALLBACK_SECS = 3600
+# "You've hit your session limit · resets 2pm (America/Vancouver)"
+LIMIT_RESET = re.compile(r"resets\s+(\d{1,2})(?::(\d\d))?\s*([ap])\.?m\.?\s*\(([^)]+)\)", re.I)
+
+
+def limit_reset(text, now=None):
+    """When the limit in `text` resets (epoch seconds), or None if it doesn't say."""
+    m = LIMIT_RESET.search(text or "")
+    if not m:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(m.group(4).strip())
+    except Exception:
+        return None
+    hour = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "p" else 0)
+    local = datetime.datetime.fromtimestamp(time.time() if now is None else now, tz)
+    at = local.replace(hour=hour, minute=int(m.group(2) or 0), second=0, microsecond=0)
+    if at <= local:
+        at += datetime.timedelta(days=1)
+    return at.timestamp()
 
 
 def heron_models():
@@ -167,7 +187,8 @@ def heron_model():
 
 def fall_back(mcp, chat):
     """The chat's last reply failed on a limit or a login: switch to the next
-    working model for an hour and have Heron redo the request."""
+    working model until the limit resets (an hour when the error doesn't say)
+    and have Heron redo the request."""
     if chat.get("sessionStatus") != "errored":
         return
     models = heron_models()
@@ -185,7 +206,9 @@ def fall_back(mcp, chat):
         return
     current = chat.get("model")
     index = (models.index(current) + 1) % len(models) if current in models else 1
-    json.dump({"index": index, "until": time.time() + FALLBACK_SECS, "handled": bad["id"]}, open(MODEL_STATE, "w"))
+    reset = limit_reset(" ".join(bad["errors"]))
+    until = reset + 120 if reset and reset - time.time() < 8 * 3600 else time.time() + FALLBACK_SECS
+    json.dump({"index": index, "until": until, "handled": bad["id"]}, open(MODEL_STATE, "w"))
     set_model(mcp, chat, models[index])
     mcp.tool("send_message", {"chat": chat["id"], "text": f"\u27f3 {current} hit a limit; now on {models[index]}. Please redo my last request."})
     log(f"model trouble on {current}: switched {chat['id'][:8]} to {models[index]}")
@@ -514,7 +537,8 @@ def maybe_pi_sync(state):
     proc = state.get("pi_sync")
     if proc and proc.poll() is None:
         return
-    if time.time() - state.get("pi_sync_at", time.time() - PI_SYNC_EVERY + 60) < PI_SYNC_EVERY:
+    state.setdefault("pi_sync_at", time.time() - PI_SYNC_EVERY + 60)  # first run a minute after start
+    if time.time() - state["pi_sync_at"] < PI_SYNC_EVERY:
         return
     state["pi_sync_at"] = time.time()
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi_sync.py")

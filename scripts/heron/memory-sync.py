@@ -24,7 +24,11 @@ ST_HOME = os.path.join(HOME, ".heron", "syncthing")
 FOLDERS = [
     ("heron-memory", "Heron memory", os.path.join(HOME, ".heron", "memory"), []),
     ("heron-threads", "Heron tasks", os.path.join(HOME, ".heron", "threads"),
-     ["session", "events.jsonl", "stderr.log", "*.tmp", "(?d).DS_Store"]),
+     # (?d): a task removed on another computer can still be deleted here.
+     # Build output (a repo a task built in its work folder) never syncs: one
+     # cargo target/ is tens of thousands of files and stalls every other task.
+     ["(?d)session", "(?d)events.jsonl", "(?d)stderr.log", "*.tmp", "(?d).DS_Store",
+      "(?d)node_modules", "(?d)target", "(?d)DerivedData", "(?d).build"]),
     ("heron-shared", "Heron shared Pi setup", os.path.join(HOME, ".heron", "shared"),
      ["node_modules", "*.incoming", ".*.json.tmp", "(?d).DS_Store"]),
 ]

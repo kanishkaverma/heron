@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 @testable import Zeron
 
@@ -56,5 +57,36 @@ final class HeronTests: XCTestCase {
         XCTAssertTrue(Heron.isHeronFolder("/home/me/Heron/"))
         XCTAssertFalse(Heron.isHeronFolder("/Users/me/heron-notes"))
         XCTAssertEqual(Heron.folder(inHome: "/Users/me/"), "/Users/me/heron")
+    }
+
+    /// While Heron works, tapping send steers the message into the running
+    /// turn rather than queueing it behind the whole turn; a harness that
+    /// can't steer mid-turn still queues.
+    @MainActor
+    func testSendWhileWorkingSteers() {
+        XCTAssertEqual(Heron.busyDelivery, .steer)
+        XCTAssertEqual(sendWhileWorking(canSteer: true), .steer)
+        XCTAssertEqual(sendWhileWorking(canSteer: false), .queue)
+    }
+
+    @MainActor
+    private func sendWhileWorking(canSteer: Bool) -> DeliveryMode? {
+        let composer = ComposerBar()
+        composer.preferredDelivery = Heron.busyDelivery
+        composer.running = true
+        composer.canSteer = canSteer
+        composer.text = "One more thing"
+        var sent: DeliveryMode?
+        composer.onSend = { _, _, mode in sent = mode; return .sent }
+        let button = Self.find(in: composer) { $0.accessibilityIdentifier == "composer-send" } as? UIButton
+        XCTAssertEqual(button?.accessibilityLabel, canSteer ? "Steer" : "Queue message")
+        button?.sendActions(for: .touchUpInside)
+        return sent
+    }
+
+    private static func find(in view: UIView, _ match: (UIView) -> Bool) -> UIView? {
+        if match(view) { return view }
+        for sub in view.subviews { if let hit = find(in: sub, match) { return hit } }
+        return nil
     }
 }

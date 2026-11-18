@@ -76,7 +76,10 @@ final class CoreSessionSource: SessionSource {
         // turn is about to start on the current provider).
         let sendPending = c.sendState == .sending || c.sendState == .queued
         canSwitchProvider = hostSwitchesProviders && !turnRunning && !sendPending
-        if canSwitchProvider, harnessesDevice != hostDevice {
+        // Read the host's agents as soon as the chat's host is known, even
+        // mid-turn: they also say whether the agent steers mid-turn, and a
+        // chat opened while it works must offer steering too.
+        if !hostDevice.isEmpty, harnessesDevice != hostDevice {
             let device = hostDevice
             harnessesDevice = device
             Task { @MainActor [weak self] in

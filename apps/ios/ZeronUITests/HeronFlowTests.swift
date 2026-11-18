@@ -50,4 +50,26 @@ final class HeronFlowTests: XCTestCase {
         XCTAssertFalse(app.buttons["Terminal"].exists)
         snapshot(app, "4-menu")
     }
+
+    /// A message sent while Heron works goes into the running turn (steer),
+    /// not into a queue that waits for the whole turn to end.
+    func testSendWhileWorkingSteersInsteadOfQueueing() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-demo", "-fresh-demo", "-longreply"]
+        app.launch()
+        let input = app.textViews["composer-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 20))
+        input.tap()
+        input.typeText("Write a long reply please.")
+        app.buttons["composer-send"].tap()
+        XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 5), "Heron is working")
+        input.tap()
+        input.typeText("Also check tomorrow")
+        XCTAssertTrue(app.buttons["Steer"].waitForExistence(timeout: 2), "send steers while Heron works")
+        app.buttons["Steer"].tap()
+        let echo = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'You: Also check'")).firstMatch
+        XCTAssertTrue(echo.waitForExistence(timeout: 5), "the message is in the chat at once")
+        XCTAssertFalse(app.buttons["More queue actions"].exists, "nothing waits in the queue")
+        snapshot(app, "5-steered")
+    }
 }

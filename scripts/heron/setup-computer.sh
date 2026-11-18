@@ -7,6 +7,10 @@
 # - installs OptMem (Heron's memory) at ~/.optmem, or updates it
 # - puts Heron's AGENTS.md and Pi extension in ~/heron (the folder the
 #   Heron chat runs in; the iPhone app makes it a Zeron project)
+# - puts memo-fix (corrects or removes one memory) in ~/.heron
+# - installs bun, which runs hist: the history_search / history_read tools
+#   over every computer's past sessions (heron-keeper's pi_sync shares the
+#   tool and each computer's index)
 # - lets Zeron keep an idle chat's agent up for 12 h instead of 30 min, so a
 #   background thread's report can wake the Heron chat hours later
 #   (ZERON_SESSION_IDLE_MS on the Zeron engine; restarts the engine)
@@ -25,6 +29,13 @@ echo "== OptMem"
 curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh >/dev/null
 "$HOME/.optmem/memo" config | head -3
 
+echo "== bun (runs hist, the session-history search)"
+if ! command -v bun >/dev/null && [ ! -x "$HOME/.bun/bin/bun" ]; then
+  curl -fsSL https://bun.sh/install | bash >/dev/null
+fi
+mkdir -p "$HOME/.local/bin"
+[ -x "$HOME/.bun/bin/bun" ] && ln -sf "$HOME/.bun/bin/bun" "$HOME/.local/bin/bun"
+
 echo "== $DEST"
 mkdir -p "$DEST/.pi/extensions/heron"
 if [ -f "$DEST/AGENTS.md" ] && ! cmp -s "$SRC/AGENTS.md" "$DEST/AGENTS.md"; then
@@ -33,6 +44,7 @@ fi
 cp "$SRC/AGENTS.md" "$DEST/AGENTS.md"
 cp "$SRC/.pi/extensions/heron/index.ts" "$SRC/.pi/extensions/heron/runner.mjs" "$DEST/.pi/extensions/heron/"
 mkdir -p "$HOME/.heron/threads"
+cp "$SRC/memo-fix" "$HOME/.heron/memo-fix" && chmod +x "$HOME/.heron/memo-fix"
 # Pi loads a folder's .pi/extensions only once the folder is trusted.
 python3 - "$DEST" <<'PY'
 import json, os, sys

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Correct Heron's memory. OptMem only appends; this rewrites one memory.
+
+  memo-fix edit <id> "<new text>"   replace memory #id (keeps its date)
+  memo-fix remove <id>              blank memory #id out
+
+A memory's id is its position in the log, so a removed memory keeps its slot
+and reads "(removed)". Summaries built from the memory are dropped: run
+`~/.optmem/memo nap` afterwards to write them again.
+
+It uses OptMem's own lock, record format and size limit (loaded from
+~/.optmem/memo). It works on $MEMORY_DIR, and on Heron's memory
+(~/.heron/memory) when that is not set: never on OptMem's default store,
+which is somebody else's memory. The memory folder is synced, so a correction
+made on one computer reaches the others.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+MEMO = os.path.expanduser("~/.optmem/memo")
+REMOVED = "(removed)"
+
+
+def load_memo():
+    loader = importlib.machinery.SourceFileLoader("optmem_memo", MEMO)
+    spec = importlib.util.spec_from_loader("optmem_memo", loader)
+    memo = importlib.util.module_from_spec(spec)
+    loader.exec_module(memo)
+    return memo
+
+
+def main():
+    args = sys.argv[1:]
+    if not ((len(args) == 3 and args[0] == "edit") or (len(args) == 2 and args[0] == "remove")):
+        print(__doc__.strip())
+        sys.exit(0 if not args else 1)
+    if not os.environ.get("MEMORY_DIR"):
+        os.environ["MEMORY_DIR"] = os.environ.get("HERON_MEMORY_DIR") or os.path.expanduser("~/.heron/memory")
+    memo = load_memo()
+    d = memo.store()
+    memo.config(d)
+    if not args[1].isdigit():
+        memo.die("'%s' is not a memory id. Use the number after #." % args[1])
+    i = int(args[1])
+    text = memo.check(args[2]) if args[0] == "edit" else REMOVED
+
+    lock = memo.locked(d)
+    try:
+        memo.repair(memo.log_path(d), memo.LOG_REC)
+        if i >= memo.log_len(d):
+            memo.die("No memory #%d. The last one is #%d." % (i, memo.log_len(d) - 1))
+        _, date, old = memo.log_get(d, i)
+        with open(memo.log_path(d), "r+b") as f:
+            f.seek(i * memo.LOG_REC)
+            f.write(memo.pad("#%d %s %s" % (i, date, text), memo.LOG_REC))
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        lock.close()
+
+    # The summaries that covered this memory still say the old thing.
+    gone = memo.tree_drop(d, i - i % 2, i - i % 2 + 2)
+    print("#%d was: %s" % (i, old))
+    print("#%d now: %s" % (i, text))
+    if gone:
+        print("Dropped %s. Run: %s nap" % (memo.plural(len(gone), "summary"), memo.ME))
+
+
+if __name__ == "__main__":
+    main()

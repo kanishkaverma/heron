@@ -7,6 +7,8 @@ every Heron computer:
 
   shared/skills/<name>/       every computer's skills (links resolved, no node_modules)
   shared/extensions/<name>    every computer's global Pi extensions
+  shared/tools/<name>         every computer's Pi tools (~/.pi/agent/tools, e.g. hist)
+  shared/history/<host>.db    each computer's session-history index (`hist publish`)
   shared/hosts/<host>.json    each computer's Pi version, packages and MCP servers
 
 On each computer it:
@@ -17,7 +19,9 @@ On each computer it:
      one of a kind it already covers (two loop packages, two web-search packages)
      and local-folder packages that don't exist here;
   4. adds MCP servers it lacks (when their command exists here);
-  5. updates Pi when another computer runs a newer version.
+  5. updates Pi when another computer runs a newer version;
+  6. publishes its session-history index, so `hist` (the history_search and
+     history_read tools) on the other computers can read this one's sessions.
 Nothing is ever removed.
 """
 import datetime
@@ -34,6 +38,7 @@ AGENT = os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agen
 SHARED = os.path.join(HOME, ".heron", "shared")
 SKILL_DIRS = [os.path.join(HOME, ".agents", "skills"), os.path.join(AGENT, "skills")]
 EXT_DIR = os.path.join(AGENT, "extensions")
+TOOLS_DIR = os.path.join(AGENT, "tools")
 HOST = socket.gethostname().split(".")[0]
 # Per-machine files a tool installs and rewrites itself.
 EXT_SKIP = {"herdr-agent-state.ts", ".DS_Store"}
@@ -267,10 +272,28 @@ def sync_version(mine, peers):
         log(f"pi {mine['pi']} -> {pi_version()} ({'ok' if out.returncode == 0 else out.stderr.strip()[-200:]})")
 
 
+def publish_history():
+    hist = os.path.join(TOOLS_DIR, "hist", "hist.ts")
+    bun = shutil.which("bun") or os.path.join(HOME, ".bun", "bin", "bun")
+    if not (os.path.exists(hist) and os.path.exists(bun)):
+        log("history not published: needs bun and ~/.pi/agent/tools/hist here")
+        return
+    try:
+        out = run([bun, hist, "publish"], timeout=1800)
+    except Exception as e:
+        log(f"history not published: {e}")
+        return
+    said = (out.stdout or out.stderr).strip().splitlines()[-1:] or ["?"]
+    if out.returncode != 0 or not said[0].startswith("up to date"):
+        log(f"history: {said[0][-200:]}")
+
+
 def main():
     os.makedirs(SHARED, exist_ok=True)
     share("skills", local_items(SKILL_DIRS), SKILL_DIRS[0])
     share("extensions", local_items([EXT_DIR], EXT_SKIP), EXT_DIR)
+    share("tools", local_items([TOOLS_DIR]), TOOLS_DIR)
+    publish_history()
     mine = write_manifest()
     peers = others()
     sync_version(mine, peers)

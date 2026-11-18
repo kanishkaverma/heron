@@ -18,6 +18,14 @@ enum Heron {
     static let chatTitle = "Heron"
     /// The agent harness. The folder's AGENTS.md and Pi extension make it Heron.
     static let harness = "pi"
+    /// What tapping send does while Heron is working: steer the message into
+    /// the running turn, so the agent reads it at its next step (Pi takes it
+    /// once the current tool calls return) instead of after the whole turn.
+    /// Heron hands long work to background threads and should take the next
+    /// request while it works. The send button's long-press still offers
+    /// "Queue for next turn" and "Stop and send"; a message with images, or a
+    /// harness that can't steer mid-turn, still queues.
+    static let busyDelivery: DeliveryMode = .steer
 
     // MARK: Remembered (this phone)
 

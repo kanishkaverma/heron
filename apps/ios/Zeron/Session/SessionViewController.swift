@@ -162,6 +162,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             return .sent
         }
         composer.onStop = { [weak self] in self?.source.stop() }
+        if Heron.enabled { composer.preferredDelivery = Heron.busyDelivery }
         composer.text = Drafts.load(chatId)
         composer.mentionSearch = { [weak self] q in await self?.source.searchFiles(q) ?? [] }
         composer.onHeightChange = { [weak self] in self?.view.setNeedsLayout() }

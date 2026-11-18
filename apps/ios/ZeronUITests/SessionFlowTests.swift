@@ -97,7 +97,7 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(input.waitForExistence(timeout: 10), "composer returns after answering")
     }
 
-    func testQueueWhileWorking() {
+    func testSteerWhileWorkingAndExplicitlyQueue() {
         let app = launch(["-route", "chat:chat-home", "-longreply"], fast: false)
         let input = app.textViews["composer-input"]
         XCTAssertTrue(input.waitForExistence(timeout: 10))
@@ -107,14 +107,24 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 5))
         input.tap()
         input.typeText("Then add a TL;DR.")
-        XCTAssertTrue(app.buttons["Queue message"].waitForExistence(timeout: 2))
-        app.buttons["Queue message"].tap()
+        XCTAssertTrue(app.buttons["Steer"].waitForExistence(timeout: 2))
+        app.buttons["Steer"].tap()
+        let echo = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'You: Then add a TL;DR.'")).firstMatch
+        XCTAssertTrue(echo.waitForExistence(timeout: 5), "steering appears in the conversation immediately")
+        XCTAssertFalse(app.buttons["More queue actions"].exists, "tapping send does not queue")
+        snapshot(app, "steered")
+
+        input.tap()
+        input.typeText("Save this for the next turn.")
+        app.buttons["composer-send"].press(forDuration: 0.8)
+        app.buttons["Queue for next turn"].tap()
         XCTAssertTrue(app.buttons["More queue actions"].waitForExistence(timeout: 5))
         snapshot(app, "queued")
         // A second queued message, then the composer put away.
         input.tap()
         input.typeText("And link the docs, with a much longer follow-up line that has to wrap or fade somewhere.")
-        app.buttons["Queue message"].tap()
+        app.buttons["composer-send"].press(forDuration: 0.8)
+        app.buttons["Queue for next turn"].tap()
         // Regression: a long queued message pushed its row's buttons off the card.
         let second = app.buttons.matching(NSPredicate(format: "label == 'More queue actions'")).element(boundBy: 1)
         XCTAssertTrue(second.waitForExistence(timeout: 5))
@@ -742,7 +752,9 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["Stop response"].waitForExistence(timeout: 5))
         input.tap()
         input.typeText("Then add a TL;DR.")
-        app.buttons["Queue message"].tap()
+        // Send steers while working; queue explicitly from the long-press menu.
+        app.buttons["composer-send"].press(forDuration: 0.8)
+        app.buttons["Queue for next turn"].tap()
         XCTAssertTrue(app.buttons["More queue actions"].waitForExistence(timeout: 5))
         app.navigationBars.buttons.element(boundBy: 0).tap()
         let accessory = app.buttons["new-session"]

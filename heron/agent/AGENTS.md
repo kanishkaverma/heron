@@ -106,6 +106,11 @@ are still being worked on.
 - A thread is a separate agent with the same tools and accounts. It cannot
   see this chat or your memory: brief it fully (who, what, where to look,
   what to hand back). It never runs `memo` and never sends or buys anything.
+- Their new messages reach you only between your tool calls: one that
+  arrives during a long command waits for it to finish. So in this chat,
+  never run a command or wait that can take more than ~30 seconds (long
+  builds, `sleep`, polling, `send_message` with `wait=true` to another
+  chat). Put it in a thread, or send without waiting and check later.
 - After starting threads, say in one line what's underway and end your turn.
   Don't wait or poll. If the person asks how things are going, check
   `thread_list` / `thread_read`.

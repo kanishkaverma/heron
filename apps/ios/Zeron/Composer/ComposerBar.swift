@@ -92,6 +92,11 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     private let placeholderLabel = UILabel()
     private let attachButton = UIButton(type: .system)
     private let actionButton = UIButton(type: .system)
+    private let dictationButton = UIButton(type: .system)
+    private let inlineDictation = InlineDictationBar()
+    private var dictationSession: DictationSession?
+    private var dictationWasFocused = false
+    private var lastDictationError: String?
     private let thumbs = UIStackView()
     private let thumbsScroll = FadingScrollView()
     private let toolbar = UIView()
@@ -202,6 +207,19 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
         actionButton.setContentHuggingPriority(.required, for: .horizontal)
         content.addSubview(actionButton)
 
+        dictationButton.translatesAutoresizingMaskIntoConstraints = false
+        dictationButton.setImage(UIImage(systemName: "mic", withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .medium)), for: .normal)
+        dictationButton.tintColor = Palette.text
+        dictationButton.accessibilityLabel = "Dictate message"
+        dictationButton.accessibilityIdentifier = "composer-dictation"
+        dictationButton.accessibilityHint = "Records speech into your draft. Touch and hold for Voice to Text settings."
+        dictationButton.addAction(UIAction { [weak self] _ in self?.openDictation() }, for: .touchUpInside)
+        // Touch and hold: settings (the Heron app has no Settings tab).
+        dictationButton.menu = UIMenu(children: [UIAction(title: "Voice to Text Settings", image: UIImage(systemName: "gearshape")) { [weak self] _ in
+            self?.presentDictationSettings()
+        }])
+        content.addSubview(dictationButton)
+
         let c = Self.control
         textHeight = textView.heightAnchor.constraint(equalToConstant: Self.compactHeight)
         thumbsHeight = thumbsScroll.heightAnchor.constraint(equalToConstant: 0)
@@ -240,7 +258,11 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
             actionButton.widthAnchor.constraint(greaterThanOrEqualToConstant: c),
 
             chipScroll.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
-            chipScroll.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -8),
+            dictationButton.widthAnchor.constraint(equalToConstant: c),
+            dictationButton.heightAnchor.constraint(equalToConstant: c),
+            dictationButton.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -6),
+            dictationButton.centerYAnchor.constraint(equalTo: actionButton.centerYAnchor),
+            chipScroll.trailingAnchor.constraint(equalTo: dictationButton.leadingAnchor, constant: -8),
             chipScroll.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
             chipScroll.heightAnchor.constraint(equalToConstant: c),
             chipStrip.topAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.topAnchor),
@@ -256,7 +278,7 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
             actionButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -8),
             actionButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
             textView.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 10),
-            textView.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -8),
+            textView.trailingAnchor.constraint(equalTo: dictationButton.leadingAnchor, constant: -8),
         ]
         // Card: full-width text, controls in the toolbar row.
         cardConstraints = [
@@ -272,6 +294,18 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
         suggestions.isHidden = true
         suggestions.translatesAutoresizingMaskIntoConstraints = false
         suggestions.onPick = { [weak self] file in self?.insertMention(file) }
+        inlineDictation.translatesAutoresizingMaskIntoConstraints = false
+        inlineDictation.isHidden = true
+        inlineDictation.onCancel = { [weak self] in self?.endInlineDictation(restoreFocus: true) }
+        inlineDictation.onStop = { [weak self] in self?.dictationSession?.togglePause() }
+        inlineDictation.onTranscribe = { [weak self] in self?.dictationSession?.transcribe() }
+        addSubview(inlineDictation)
+        NSLayoutConstraint.activate([
+            inlineDictation.topAnchor.constraint(equalTo: topAnchor),
+            inlineDictation.bottomAnchor.constraint(equalTo: bottomAnchor),
+            inlineDictation.leadingAnchor.constraint(equalTo: leadingAnchor),
+            inlineDictation.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
         refreshAction(animated: false)
     }
 
@@ -287,6 +321,7 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     }
 
     @objc private func focusFromTap() {
+        guard dictationSession == nil else { return }
         if !textView.isFirstResponder { textView.becomeFirstResponder() }
     }
 
@@ -294,6 +329,10 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     /// the screen's root view (ancestors would otherwise swallow their taps).
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        if window == nil, dictationSession != nil { endInlineDictation() }
+        #if DEBUG
+        if window != nil { runDictationLaunchSeam() }
+        #endif
         guard let root = findViewController()?.view, suggestions.superview !== root else { return }
         root.addSubview(suggestions)
         NSLayoutConstraint.activate([
@@ -308,7 +347,7 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     /// The card is for composing: focused, holding photos, or pinned open
     /// (new-session canvas). An unfocused draft rests as the capsule.
     private var wantsCard: Bool {
-        chipsAlwaysVisible || textView.isFirstResponder || !images.isEmpty
+        dictationSession == nil && (chipsAlwaysVisible || textView.isFirstResponder || !images.isEmpty)
     }
 
     private func updateMode(animated: Bool) {
@@ -404,7 +443,7 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     // MARK: Focus & chips
 
     @discardableResult
-    override func becomeFirstResponder() -> Bool { textView.becomeFirstResponder() }
+    override func becomeFirstResponder() -> Bool { dictationSession == nil && textView.becomeFirstResponder() }
 
     @discardableResult
     override func resignFirstResponder() -> Bool { textView.resignFirstResponder() }
@@ -512,7 +551,7 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
             ])
             thumbs.addArrangedSubview(iv)
         }
-        thumbsHeight.constant = images.isEmpty ? 0 : 68
+        thumbsHeight.constant = dictationSession != nil || images.isEmpty ? 0 : 68
         thumbs.layoutMargins = UIEdgeInsets(top: 12, left: 0, bottom: 0, right: 0)
         thumbs.isLayoutMarginsRelativeArrangement = true
         onHeightChange?()
@@ -531,6 +570,11 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     }
 
     private func recomputeTextHeight() {
+        if dictationSession != nil {
+            textHeight.constant = 62
+            textView.isScrollEnabled = false
+            return
+        }
         // At rest a draft is a preview: whole lines ending in "…", never a
         // scrolled view whose next line bleeds into the bottom inset.
         let preview = !isCard
@@ -638,7 +682,135 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
         }
     }
 
+    #if DEBUG
+    private static var dictationSeamRan = false
+    /// Screenshot rigs (`-dictate-on-open [-dictate-transcribe-after <s>]`,
+    /// `-dictate-settings`): the simulator's XCUITest runner can't always attach.
+    private func runDictationLaunchSeam() {
+        let args = ProcessInfo.processInfo.arguments
+        guard !Self.dictationSeamRan, args.contains("-dictate-on-open") || args.contains("-dictate-settings") else { return }
+        Self.dictationSeamRan = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self else { return }
+            if args.contains("-dictate-settings") { return self.presentDictationSettings() }
+            if let i = args.firstIndex(of: "-dictate-draft"), i + 1 < args.count { self.text = args[i + 1] }
+            self.openDictation()
+            if let i = args.firstIndex(of: "-dictate-transcribe-after"), i + 1 < args.count, let delay = Double(args[i + 1]) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.dictationSession?.transcribe() }
+            }
+        }
+    }
+    #endif
+
+    private func presentDictationSettings() {
+        guard let presenter = findViewController(), presenter.presentedViewController == nil else { return }
+        let settings = DictationSettingsViewController()
+        settings.navigationItem.rightBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { [weak presenter] _ in presenter?.dismiss(animated: true) })
+        presenter.present(UINavigationController(rootViewController: settings), animated: true)
+    }
+
+    private func openDictation() {
+        guard let presenter = findViewController(), presenter.presentedViewController == nil else { return }
+        // On-device transcription needs no key; only a phone without it needs setup.
+        if DictationSession.groqKey.isEmpty && !OnDeviceTranscription.isAvailable {
+            let alert = UIAlertController(title: "Set up Voice to Text", message: "This iPhone can't transcribe on the device. Add a Groq API key to transcribe speech into your draft.", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "Not Now", style: .cancel))
+            alert.addAction(UIAlertAction(title: "Set Up", style: .default) { [weak self] _ in self?.presentDictationSettings() })
+            presenter.present(alert, animated: true)
+            return
+        }
+        guard dictationSession == nil else { return }
+        let originalDraft = text
+        let insertionPoint = textView.selectedRange
+        dictationWasFocused = textView.isFirstResponder
+        let session = DictationSession()
+        dictationSession = session
+        lastDictationError = nil
+        inlineDictation.reset()
+        session.onUpdate = { [weak self, weak session] in
+            guard let self, let session, self.dictationSession === session else { return }
+            self.inlineDictation.render(session)
+            if let message = session.message, self.lastDictationError != message {
+                self.lastDictationError = message
+                self.showDictationError(message + "\n\nRecording kept. Tap ↑ to retry or ✕ to discard.")
+            }
+        }
+        session.onTranscript = { [weak self, weak session] transcript in
+            guard let self, let session, self.dictationSession === session else { return }
+            self.endInlineDictation()
+            self.textView.selectedRange = self.text == originalDraft ? insertionPoint : NSRange(location: (self.text as NSString).length, length: 0)
+            self.insertTranscript(transcript)
+            self.textView.becomeFirstResponder()
+        }
+        session.onFailure = { [weak self] message in
+            self?.endInlineDictation()
+            self?.showDictationError(message)
+        }
+        setSuggestionsVisible(false)
+        textView.resignFirstResponder()
+        glass.isHidden = true
+        inlineDictation.isHidden = false
+        inlineDictation.render(session)
+        updateMode(animated: false)
+        thumbsHeight.constant = 0
+        toolbarHeight.constant = 0
+        recomputeTextHeight()
+        animateDictationLayout()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        session.start()
+    }
+
+    private func endInlineDictation(restoreFocus: Bool = false) {
+        guard let session = dictationSession else { return }
+        dictationSession = nil
+        session.cancel()
+        inlineDictation.isHidden = true
+        glass.isHidden = false
+        thumbsHeight.constant = images.isEmpty ? 0 : 68
+        updateMode(animated: false)
+        toolbarHeight.constant = isCard ? 50 : 0
+        recomputeTextHeight()
+        animateDictationLayout()
+        if restoreFocus, dictationWasFocused, window != nil { textView.becomeFirstResponder() }
+    }
+
+    private func animateDictationLayout() {
+        onHeightChange?()
+        let layout: () -> Void = { self.superview?.layoutIfNeeded() }
+        if UIAccessibility.isReduceMotionEnabled { layout() }
+        else { UIView.animate(withDuration: 0.24, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction], animations: layout) }
+    }
+
+    private func showDictationError(_ message: String) {
+        guard window != nil, let presenter = findViewController(), presenter.presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "Voice to Text", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        presenter.present(alert, animated: true)
+    }
+
+    deinit { dictationSession?.cancel() }
+
+    /// Dictation edits the draft only; it never invokes any send callback.
+    func insertTranscript(_ transcript: String) {
+        let transcript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transcript.isEmpty else { return }
+        let draft = textView.text ?? ""
+        let ns = draft as NSString
+        let selection = textView.selectedRange
+        let range = selection.location <= ns.length && NSMaxRange(selection) <= ns.length ? selection : NSRange(location: ns.length, length: 0)
+        let before = ns.substring(to: range.location)
+        let after = ns.substring(from: NSMaxRange(range))
+        let prefix = before.last.map { $0.isWhitespace ? "" : " " } ?? ""
+        let suffix = after.first.map { $0.isWhitespace ? "" : " " } ?? ""
+        let inserted = prefix + transcript + suffix
+        textView.text = ns.replacingCharacters(in: range, with: inserted)
+        textView.selectedRange = NSRange(location: range.location + (inserted as NSString).length, length: 0)
+        styleMentions()
+        textChanged()
+    }
+
     private func primaryAction() {
+        guard dictationSession == nil else { return }
         switch currentAction {
         case .stop:
             UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
@@ -651,7 +823,7 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     }
 
     private func send(_ mode: DeliveryMode) {
-        guard hasContent else { return }
+        guard dictationSession == nil, hasContent else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         let body = mentions.encode(textView.text.trimmingCharacters(in: .whitespacesAndNewlines))
         let staged = images

@@ -217,6 +217,8 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             s.appendSections(["Voice"])
             s.appendItems([Row(id: "voice", title: "Voice", subtitle: app.voice.selectedStyle.map { "Codex voice · \($0.capitalized)" } ?? "Codex voice device and style", symbol: "waveform")])
         }
+        s.appendSections(["Voice to Text"])
+        s.appendItems([Row(id: "dictation", title: "Voice to Text", subtitle: "Groq Whisper Large v3, or on this iPhone", symbol: "mic")])
         s.appendSections(["Notifications"])
         s.appendItems(notificationRows())
         s.appendSections(["Appearance"])
@@ -258,6 +260,7 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         collectionView.deselectItem(at: path, animated: true)
         guard let row = dataSource.itemIdentifier(for: path) else { return }
         switch row.id {
+        case "dictation": navigationController?.pushViewController(DictationSettingsViewController(), animated: true)
         case "voice": navigationController?.pushViewController(VoiceViewController(app: app), animated: true)
         case "activity": navigationController?.pushViewController(ActivitySettingsViewController(app: app), animated: true)
         case "providers":

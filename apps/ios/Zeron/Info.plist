@@ -43,7 +43,9 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Terminals connect straight to your computer on the same network, so typing shows up without a round trip through the cloud.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Voice messages you record are transcribed for Heron.</string>
+	<string>Dictate into your message draft, and talk to Heron in voice calls. Dictated text is never sent until you press Send.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Turn what you dictate into text in your message draft, on this iPhone.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Attach photos to messages.</string>
 	<key>NSSupportsLiveActivities</key>
